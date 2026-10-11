@@ -465,8 +465,9 @@ async def test_daily_cadence_due_after_one_day(mongo_db):
     assert daily in {r["mandate_id"] for r in await service.list_cadence_due(now)}
 
     shift = ShiftDoc(workspace="w1", mandate_id=daily, no=1, state="done")
-    shift.createdAt = now - timedelta(hours=6)
     await shift.insert()
+    # Backdate AFTER insert: the insert hook stamps createdAt with the wall clock.
+    await shift.set({ShiftDoc.createdAt: now - timedelta(hours=6)})
     assert daily not in {r["mandate_id"] for r in await service.list_cadence_due(now)}
     later = now + timedelta(days=1)
     assert daily in {r["mandate_id"] for r in await service.list_cadence_due(later)}
