@@ -501,9 +501,35 @@ async def test_list_runs_shape_and_status_derivation(store):
         "base_branch",
         "created_at",
         "correlation_id",
+        "files_changed",
+        "error",
     ):
         assert key in row
     assert row["correlation_id"] == "corr-123"
+    # A failed run says why; a run that hasn't failed carries no error.
+    assert by_task["t-failed"]["error"] == "apply conflict"
+    assert row["error"] is None
+
+
+async def test_a_headless_run_reads_running_at_its_live_stage(store):
+    """A queued station run reads ``queued`` at ``station`` until a develop
+    starts it (``headless_state`` "queued" = handed over, not started), then
+    ``running`` at the stage its ``headless_state`` names."""
+    from pocketpaw_ee.cloud.belt.service import list_runs
+
+    run = await _propose_run(store, task="t-live", base_branch="", diff="")
+    params = dict(run.parameters)
+    for state, want in (
+        (None, ("queued", "station")),
+        ("queued", ("queued", "station")),
+        ("develop", ("running", "develop")),
+        ("review", ("running", "review")),
+    ):
+        blob = {**params["_code_change"], "station_pending": True, "headless_state": state}
+        await store.update_parameters(run.id, {**params, "_code_change": blob})
+        row = (await list_runs("w1"))["runs"][0]
+        assert (row["status"], row["stage"]) == want, state
+        assert row["headless_state"] == state
 
 
 async def test_list_runs_newest_first(store):
@@ -753,6 +779,8 @@ async def test_executor_emits_landed_and_persists_pr_result(
     assert blob["pr_url"] == "https://github.com/acme/repo/pull/7"
     assert blob["branch"].startswith("feat/belt-")
     assert blob["files_changed"] == 1
+    # The event names the landing branch, so the run chip updates without a refetch.
+    assert landed[0]["branch"] == blob["branch"]
 
 
 async def test_executor_local_only_emits_landed_without_pr_url(
@@ -826,6 +854,7 @@ async def test_executor_local_only_emits_landed_without_pr_url(
     assert blob["commit_sha"]
     assert "pr_url" not in blob or blob["pr_url"] is None
     assert blob["files_changed"] == 1
+    assert landed[0]["branch"] == blob["branch"]
 
 
 async def test_executor_emits_failed_on_apply_conflict(monkeypatch, recording_bus, sse, tmp_path):

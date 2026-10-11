@@ -1,69 +1,52 @@
-# ee/pocketpaw_ee/cloud/belt/service.py
-# Updated: 2026-06-11 (feat/belt-autopilot) — the runs read model now renders a
-#   QUEUED STATION RUN. A pending ``code_change`` Action whose blob carries
-#   ``station_pending=True`` (filed by the mandate ``StationTaskDispatcher`` with
-#   the task text but no diff yet) derives status ``queued`` / stage ``station``
-#   instead of ``proposed`` / ``gate``, so the console shows it as waiting for a
-#   human to open the develop station (one click) rather than sitting at the
-#   approve gate.
-# Created: 2026-06-10 (feat/belt-console-backend, SC-1 + SC-2) — the Belt &
-# Pulley console read/write service. Powers the /belt page's three needs the
-# first live runs exposed: (1) DISCOVER repos so the user can bind one up front
-# instead of the agent asking, (2) ADD a new repo root durably (admin-gated),
-# (3) read STATION RUNS + a run's diff so the page can show status/output.
+# ee/pocketpaw_ee/cloud/belt/service.py — the Belt console read/write service.
 #
-# Updated: 2026-06-11 (feat/belt-repo-init) — added ``init_repo``: create a
-# brand-new git REPOSITORY under an allowlisted root (admin-gated, same RBAC +
-# realpath discipline as add_repo), seed a README + initial commit so it has a
-# HEAD and a default branch, register it via the same persistence add_repo uses,
-# and (optionally) create the GitHub remote via the injectable ``RepoCreator``
-# (default ``GhCliRepoCreator`` shells ``gh repo create --private --source --push``,
-# mirroring the executor's ``GhCliPrOpener`` injectable). A remote-creation
-# failure KEEPS the local repo and returns a ``remote_error`` message — the local
-# init is never rolled back. The runs read model (_run_summary) now also surfaces
-# ``commit_sha`` for local-only (no-origin) landings, where ``pr_url`` is None.
+# Powers the /belt page: discover repos under the allowlist roots, add a repo
+# root or init a brand-new repo (admin-gated), and read station RUNS + a run's
+# diff. It also owns ``emit_belt_run_updated``, the run feed's realtime event.
 #
-# What lives here:
-#   * ``resolve_allowlist_roots(workspace_id)`` — the union of
-#     ``settings.belt_repo_allowlist`` and the per-workspace persisted extension
-#     (``BeltWorkspaceConfig.allowlist_roots``), each realpath-resolved. This is
-#     the single source of truth the discovery + add paths share; the MCP
-#     resolver keeps its own settings-only view (defense in depth at propose /
-#     execute time — the console extension is additive, never a replacement).
-#   * ``discover_repos(workspace_id)`` — one-level-deep scan of every allowlist
-#     root for git repos (a root that IS a git repo counts too). Returns the
-#     wire shape {path, name, current_branch, branches[]}.
-#   * ``add_repo(workspace_id, path)`` — validate the path is an existing git
-#     repo, realpath-resolve it, and APPEND it to the workspace's persisted
-#     allowlist extension. Returns the same repo shape or a typed error.
-#   * ``list_runs(workspace_id)`` / ``get_run(workspace_id, action_id)`` — the
-#     runs read model over the belt code-change Instinct Actions (kind=
-#     code_change), newest-first, with status/stage derived from the Action
-#     lifecycle and pr_url/branch read STRUCTURALLY off the blob (the executor
-#     back-writes them on success — no free-text parsing).
+#   * ``resolve_allowlist_roots`` — ``settings.belt_repo_allowlist`` plus the
+#     workspace's persisted extension, realpath-resolved; the one source the
+#     discover / add / init paths share (the MCP resolver keeps its own
+#     settings-only view as defense in depth).
+#   * ``discover_repos`` / ``add_repo`` / ``init_repo`` — one-level repo scan,
+#     validate-then-persist a root, and git-init a new repo with a seed commit
+#     (optionally a GitHub remote via the injectable ``RepoCreator``; a remote
+#     failure keeps the local repo and returns ``remote_error``).
+#   * ``list_runs`` / ``get_run`` — the runs read model over ``code_change``
+#     Instinct Actions, newest-first. Status/stage derive from the Action
+#     lifecycle (a pending ``station_pending`` blob reads ``queued``/``station``,
+#     or ``running``/<stage> once ``mark_run_stage`` names a develop's stage);
+#     ``title``, ``files_changed``, landing fields (``pr_url`` / ``branch`` /
+#     ``commit_sha``) and mandate provenance (``mandate_id`` / ``shift_no`` /
+#     ``headless_error`` / ``headless_state`` / ``redevelop``) are read
+#     STRUCTURALLY off the blob; ``error`` is the failure reason (``Action.error``, else
+#     ``headless_error``). The mandates digest reads this same list.
+#   * ``save_run_feed`` / ``get_run_feed`` — a run stage's step feed (what one
+#     station step did), one ``BeltRunFeed`` row per (workspace, run, stage),
+#     kept out of the Action blob that ``list_runs`` reads in bulk. The read
+#     shares ``get_run``'s tenancy 404 and returns chat-shaped steps.
+#   * ``open_run_stream`` — the same feed live: the run's stream as SSE, the
+#     newest attempt replayed from its start, same tenancy 404.
+#   * ``get_run_blueprint`` — the bound repo's C4 model as committed where the
+#     run starts, its mandate's line or its base (``git cat-file``, nothing from
+#     the repo runs), and the run's touched files joined to its components by
+#     their ``paths`` globs. ``default_base`` is the station's default base (the
+#     repo's checked-out branch), which a mandate run is queued on.
 #
-# Security:
-#   * git introspection runs through ``asyncio.create_subprocess_exec`` with an
-#     ARG LIST — never ``shell=True``, never string-interpolated input. Reuses
-#     the executor's ``_run`` chokepoint.
-#   * a submitted add-repo path is realpath-resolved and confirmed to be a git
-#     repo BEFORE it is persisted; a non-existent / non-git / unresolvable path
-#     is refused. The path itself is NOT echoed into logs (only the workspace id
-#     + a generic reason) so a path probe can't leak via logs.
-#   * the diff text on a run detail is capped (~200 KB) so a giant blob can't be
-#     pulled whole through the read API.
+# Security: git runs through ``create_subprocess_exec`` with argv lists; a
+# submitted path is realpath-resolved and confirmed to be a git repo before it
+# is persisted and is never echoed into logs; a run's diff is capped at ~200 KB.
 #
-# SSE / realtime (SC-2): ``emit_belt_run_updated`` publishes on the WORKSPACE
-# REALTIME BUS (``_core.realtime.emit`` → the ``belt_run_updated`` audience
-# branch fans out to every workspace member), with an additional best-effort
-# per-stream ``push_sse_event`` for in-turn freshness. The bus is the required
-# path because approve / executed / failed fire after the chat turn's SSE drain
-# is gone — the per-session push alone would never reach the page.
+# Realtime: ``emit_belt_run_updated`` publishes on the workspace bus (the
+# required path — approve/executed/failed fire after the chat turn's SSE drain
+# is gone) plus a best-effort per-stream ``push_sse_event``; a landing names
+# its ``branch`` (a mandate run's line).
 
 from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -99,8 +82,11 @@ async def emit_belt_run_updated(
     status: str,
     stage: str,
     pr_url: str | None = None,
+    branch: str | None = None,
 ) -> None:
-    """Publish ``belt_run_updated`` for a station run lifecycle change.
+    """Publish ``belt_run_updated`` for a station run lifecycle change. A
+    landing carries ``branch`` (a mandate run's line, ``belt/line/<id>``) and,
+    with a remote, ``pr_url``, so the page patches its chip without a refetch.
 
     PRIMARY path — the WORKSPACE REALTIME BUS (``_core.realtime.emit``), the same
     path Tray / Mission Control / pocket events ride. This is REQUIRED because a
@@ -127,6 +113,8 @@ async def emit_belt_run_updated(
     }
     if pr_url:
         data["pr_url"] = pr_url
+    if branch:
+        data["branch"] = branch
 
     # PRIMARY — workspace realtime bus (async fan-out to every workspace member).
     try:
@@ -144,6 +132,27 @@ async def emit_belt_run_updated(
         push_sse_event("belt_run_updated", dict(data))
     except Exception:  # noqa: BLE001 — SSE push must never break a lifecycle path
         logger.debug("belt: belt_run_updated SSE push failed (non-fatal)", exc_info=True)
+
+
+async def mark_run_stage(workspace_id: str, action_id: str, stage: str) -> None:
+    """A headless develop started ``stage`` on the run: its blob's
+    ``headless_state`` names the stage (so the runs list reads it ``running``
+    there) and ``belt_run_updated`` says so. Best-effort; never raises."""
+    from pocketpaw.stores import get_instinct_store
+
+    try:
+        store = get_instinct_store(workspace_id=workspace_id or None)
+        action = await store.get_action(action_id)
+        params = dict(getattr(action, "parameters", None) or {})
+        blob = params.get(_CODE_CHANGE_PARAM_KEY)
+        if isinstance(blob, dict):
+            params[_CODE_CHANGE_PARAM_KEY] = {**blob, "headless_state": stage}
+            await store.update_parameters(action_id, params)
+    except Exception:  # noqa: BLE001 — the live stage is a view; never fail the run
+        logger.debug("belt: could not mark run %s at %s", action_id, stage, exc_info=True)
+    await emit_belt_run_updated(
+        workspace_id=workspace_id, action_id=action_id, status="running", stage=stage
+    )
 
 
 class BeltConsoleError(Exception):
@@ -254,6 +263,23 @@ async def _current_branch(path: Path) -> str:
     if code != 0:
         return ""
     return out.strip()
+
+
+async def default_base(repo: str) -> str:
+    """The develop station's default base for ``repo``: its checked-out
+    branch, re-resolved inside the allowlist. "" for a detached HEAD, a repo
+    outside the allowlist or a failed read (the station then decides, and
+    refuses a detached HEAD itself)."""
+    from pocketpaw_ee.cloud.belt.executor import _re_resolve_repo
+
+    path, _err = _re_resolve_repo(repo)
+    if path is None:
+        return ""
+    try:
+        branch = await _current_branch(path)
+    except (OSError, RuntimeError):  # git missing, or the 120 s timeout
+        return ""
+    return "" if branch == "HEAD" else branch
 
 
 async def _branches(path: Path) -> list[str]:
@@ -659,7 +685,9 @@ def _derive_status_stage(action: Any, blob: dict[str, Any] | None = None) -> tup
     A QUEUED STATION RUN — a pending ``code_change`` Action whose blob carries
     ``station_pending=True`` (filed by the mandate ``StationTaskDispatcher`` with
     no diff yet) — reads as ``("queued", "station")`` so the console shows it as
-    waiting for a human to open the develop station, not sitting at the gate."""
+    waiting for a station, not sitting at the gate. Once a headless develop
+    starts a stage (``headless_state`` names it; "queued" = handed over, not
+    started) it reads as ``("running", <that stage>)``."""
     if blob is not None and blob.get("station_pending"):
         raw = getattr(getattr(action, "status", None), "value", None) or str(
             getattr(action, "status", "")
@@ -667,7 +695,8 @@ def _derive_status_stage(action: Any, blob: dict[str, Any] | None = None) -> tup
         # Only a still-pending queued run reads as "queued"; once the human drives
         # the station and a diff is proposed, a fresh non-pending row supersedes it.
         if raw == "pending":
-            return ("queued", "station")
+            live = str(blob.get("headless_state") or "")
+            return ("running", live) if live and live != "queued" else ("queued", "station")
     raw = getattr(getattr(action, "status", None), "value", None) or str(
         getattr(action, "status", "")
     )
@@ -695,6 +724,8 @@ def _run_summary(action: Any, blob: dict[str, Any]) -> dict[str, Any]:
     repo_path = str(blob.get("repo") or "")
     return {
         "action_id": str(getattr(action, "id", "")),
+        # The short label: a mandate task's title (None on a hand-driven run).
+        "title": str(blob.get("title") or "") or None,
         "task": str(blob.get("task") or ""),
         "summary": str(blob.get("summary") or ""),
         "status": status,
@@ -705,8 +736,26 @@ def _run_summary(action: Any, blob: dict[str, Any]) -> dict[str, Any]:
         "branch": blob.get("branch") or None,
         "pr_url": blob.get("pr_url") or None,
         "commit_sha": blob.get("commit_sha") or None,
+        # Counted from the diff when the station attaches it; the real staged
+        # count replaces it on landing.
+        "files_changed": blob.get("files_changed"),
+        # Why the run failed: the executor's reason, else a failed develop's.
+        "error": str(getattr(action, "error", None) or blob.get("headless_error") or "") or None,
         "created_at": created.isoformat() if hasattr(created, "isoformat") else None,
         "correlation_id": str(blob.get("correlation_id") or "") or None,
+        # Mandate provenance (None on a hand-driven run).
+        "mandate_id": str(blob.get("mandate_id") or "") or None,
+        "shift_no": blob.get("shift_no"),
+        # Which plan task this run works (1-based into the plan's tasks): the
+        # foreman's backlog joins on it to read the task's evidence refs.
+        "plan_action_id": str(blob.get("plan_action_id") or "") or None,
+        "task_index": blob.get("task_index"),
+        "headless_error": str(blob.get("headless_error") or "") or None,
+        # "queued" once handed to a background develop, then the live stage;
+        # left behind = orphan.
+        "headless_state": str(blob.get("headless_state") or "") or None,
+        # How many times the executor sent it back to re-develop on a moved base.
+        "redevelop": int(blob.get("redevelop") or 0),
     }
 
 
@@ -733,15 +782,12 @@ async def list_runs(workspace_id: str) -> dict[str, Any]:
     return {"runs": runs}
 
 
-async def get_run(workspace_id: str, action_id: str) -> dict[str, Any]:
-    """Return a single run + its proposed diff (capped at ~200 KB).
+async def _owned_run(workspace_id: str, action_id: str) -> tuple[Any, dict[str, Any]]:
+    """The run's Action and its ``_code_change`` blob, or a 404.
 
-    Tenancy: the Action must carry a ``_code_change`` blob whose ``workspace_id``
-    matches the caller's workspace — a foreign or non-belt Action is a 404 (we
-    never confirm a cross-tenant Action exists). The diff is read off the blob
-    and truncated to ``MAX_DIFF_BYTES``; a ``diff_truncated`` flag tells the UI
-    when it was cut.
-    """
+    Tenancy: the blob's ``workspace_id`` must match the caller's workspace — a
+    foreign or non-belt Action is a 404 (we never confirm a cross-tenant Action
+    exists)."""
     from pocketpaw.stores import get_instinct_store
 
     # ISO: HTTP console path (no ``current_workspace`` ContextVar) — scope the
@@ -755,7 +801,17 @@ async def get_run(workspace_id: str, action_id: str) -> dict[str, Any]:
     if str(blob.get("workspace_id") or "") != workspace_id:
         # Don't distinguish "wrong workspace" from "missing" — same 404.
         raise BeltConsoleError(404, "Run not found.")
+    return action, blob
 
+
+async def get_run(workspace_id: str, action_id: str) -> dict[str, Any]:
+    """Return a single run + its proposed diff (capped at ~200 KB).
+
+    A foreign or non-belt Action is a 404 (``_owned_run``). The diff is read off
+    the blob and truncated to ``MAX_DIFF_BYTES``; a ``diff_truncated`` flag tells
+    the UI when it was cut.
+    """
+    action, blob = await _owned_run(workspace_id, action_id)
     summary = _run_summary(action, blob)
     diff = blob.get("diff")
     diff_text = diff if isinstance(diff, str) else ""
@@ -769,6 +825,213 @@ async def get_run(workspace_id: str, action_id: str) -> dict[str, Any]:
     return summary
 
 
+# ---------------------------------------------------------------------------
+# run feeds — what a station step did, stored beside (not in) the run blob
+# ---------------------------------------------------------------------------
+
+
+async def save_run_feed(
+    workspace_id: str,
+    action_id: str,
+    stage: str,
+    steps: list[dict[str, Any]],
+    steps_omitted: int = 0,
+) -> None:
+    """Store one run stage's steps (already scrubbed and capped by
+    ``belt/feed.py``), replacing that stage's previous feed: a re-develop shows
+    its latest attempt. Raises on a Mongo failure; the station treats the save
+    as best-effort. Only this module reads/writes ``BeltRunFeed``. One atomic
+    upsert on the unique (workspace, run, stage) key, so two writers never race
+    into a duplicate-key error (the raw update skips Beanie's timestamp hooks,
+    hence the explicit ``updatedAt`` / ``createdAt``)."""
+    from datetime import UTC, datetime
+
+    from pocketpaw_ee.cloud.models.belt_run_feed import BeltRunFeed
+
+    now = datetime.now(UTC)
+    await BeltRunFeed.get_pymongo_collection().update_one(
+        {"workspace": workspace_id, "action_id": action_id, "stage": stage},
+        {
+            "$set": {"steps": steps, "steps_omitted": steps_omitted, "updatedAt": now},
+            "$setOnInsert": {"createdAt": now},
+        },
+        upsert=True,
+    )
+    # no-event: live frames ride the run stream (``belt/feed.RunFeed``); this row is the record.
+
+
+async def get_run_feed(workspace_id: str, action_id: str, stage: str) -> dict[str, Any]:
+    """One run stage's feed: ``{action_id, stage, steps?, stepsOmitted?}``,
+    steps in the chat history wire shape (``steps_wire_fields``), so the UI maps
+    them with the same code. A run with no feed yet returns no ``steps`` key; a
+    foreign or non-belt run is a 404, same as ``get_run``."""
+    from pocketpaw_ee.cloud.chat.runs.steps import steps_wire_fields
+    from pocketpaw_ee.cloud.models.belt_run_feed import BeltRunFeed
+
+    await _owned_run(workspace_id, action_id)
+    doc = await BeltRunFeed.find_one(
+        BeltRunFeed.workspace == workspace_id,
+        BeltRunFeed.action_id == action_id,
+        BeltRunFeed.stage == stage,
+    )
+    out: dict[str, Any] = {"action_id": action_id, "stage": stage}
+    if doc is not None:
+        out.update(steps_wire_fields(doc.steps, doc.steps_omitted))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the run's blueprint — the bound repo's C4 model where the run starts, files joined
+# ---------------------------------------------------------------------------
+
+_MODEL_PATH = "docs/c4/model.json"
+MAX_MODEL_BYTES = 1_000_000
+# A base branch as git would accept it, never an option (no leading ``-``).
+_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
+# A file a unified diff touches: its ``+++ b/`` line, or the ``diff --git``
+# header (a binary patch or a pure mode change has no ``+++``).
+_DIFF_FILE_RE = re.compile(r"^(?:\+\+\+ b/|diff --git a/.* b/)(.+)$", re.MULTILINE)
+# Station git: no fsmonitor command, no hooks.
+_READ_GIT = ("git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+
+
+async def _base_model(blob: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    """``(ref, model)``: the bound repo's ``docs/c4/model.json`` as committed
+    where the run starts: its mandate's line when the local line ref exists
+    (the station moves it to the run's start), else ``origin/<base>`` when it
+    exists, else ``<base>`` (the station's rule, without its fetch). Read with
+    ``git cat-file`` (no textconv, no filters), nothing from the repo runs.
+    ``(None, None)`` for a repo outside the allowlist or a base git would read
+    as an option; the ref with ``None`` when it has no readable model (over
+    ``MAX_MODEL_BYTES`` counts as unreadable)."""
+    from pocketpaw_ee.cloud.belt.executor import _re_resolve_repo, _run, line_branch
+    from pocketpaw_ee.cloud.belt.orient import load_model
+
+    base = str(blob.get("base_branch") or "")
+    repo, _err = _re_resolve_repo(str(blob.get("repo") or ""))
+    if repo is None or not _REF_RE.fullmatch(base) or ".." in base:
+        return None, None
+    line = line_branch(str(blob.get("mandate_id") or ""))
+    refs = [(line, f"refs/heads/{line}")] if line else []
+    refs += [(f"origin/{base}", f"origin/{base}"), (base, base)]
+    try:
+        for ref, rev in refs:
+            argv = [*_READ_GIT, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"]
+            code, sha, _ = await _run(argv, cwd=repo)
+            if code == 0:
+                break
+        else:
+            return None, None
+        argv = [*_READ_GIT, "cat-file", "blob", f"{sha.strip()}:{_MODEL_PATH}"]
+        code, text, _ = await _run(argv, cwd=repo)
+    except (OSError, RuntimeError):  # git missing, or the 120 s timeout
+        logger.debug("belt: could not read the blueprint", exc_info=True)
+        return None, None
+    if code != 0 or len(text.encode("utf-8")) > MAX_MODEL_BYTES:
+        return ref, None
+    return ref, load_model(text)
+
+
+async def _touched_files(workspace_id: str, action_id: str, blob: dict[str, Any]) -> list[str]:
+    """The run's files, first touch first: every Edit/Write/MultiEdit its
+    develop and fix seats stored, then every file its diff writes (a recipe
+    edits through ``Bash``, so only the diff names its files). Repo-relative;
+    a path outside the repo is dropped."""
+    from pocketpaw_ee.cloud.belt.feed import EDIT_TOOLS
+    from pocketpaw_ee.cloud.belt.orient import repo_path
+    from pocketpaw_ee.cloud.models.belt_run_feed import BeltRunFeed
+
+    raw: list[str] = []
+    for stage in ("develop", "fix"):
+        doc = await BeltRunFeed.find_one(
+            BeltRunFeed.workspace == workspace_id,
+            BeltRunFeed.action_id == action_id,
+            BeltRunFeed.stage == stage,
+        )
+        for step in doc.steps if doc is not None else []:
+            tool_input = step.get("input")
+            if step.get("tool") in EDIT_TOOLS and isinstance(tool_input, dict):
+                raw.append(str(tool_input.get("file_path") or ""))
+    diff = blob.get("diff")
+    raw += _DIFF_FILE_RE.findall(diff if isinstance(diff, str) else "")
+    return list(dict.fromkeys(p for r in raw if (p := repo_path(r))))
+
+
+async def get_run_blueprint(workspace_id: str, action_id: str) -> dict[str, Any]:
+    """The run on its line's blueprint: ``{action_id, ref, model, files}``.
+    ``model`` is ``{scope, model}`` from the bound repo's C4 model where the
+    run starts (``_base_model``; ``None`` without one), ``paths`` globs included;
+    ``files`` is ``[{path, component}]`` (``_touched_files``, each joined by
+    ``orient.component_for``; ``None`` when no glob owns it). The same tenancy
+    404 as ``get_run``."""
+    from pocketpaw_ee.cloud.belt.orient import component_for, path_index
+
+    _action, blob = await _owned_run(workspace_id, action_id)
+    ref, model = await _base_model(blob)
+    index = path_index(model)
+    files = await _touched_files(workspace_id, action_id, blob)
+    return {
+        "action_id": action_id,
+        "ref": ref,
+        "model": {"scope": model.get("scope"), "model": model["model"]} if model else None,
+        "files": [{"path": p, "component": component_for(p, index)} for p in files],
+    }
+
+
+# How long one scan read waits for more entries: the scan only walks what is
+# already on the stream, so it must never park (``XREAD BLOCK 0`` is forever).
+_SCAN_BLOCK_MS = 5
+
+
+async def _attempt_cursor(transport: Any, sid: str) -> str:
+    """The cursor just before the run stream's newest ``start`` frame (``"0"``
+    when it is the first). A re-developed run holds one attempt after another,
+    each ending in a terminal ``stream_end``, and a read stops at a terminal,
+    so the scan re-reads from each cursor until a read brings nothing."""
+    cursor = start = "0"
+    while True:
+        moved = False
+        async for ev in transport.read_events(sid, after=cursor, block_ms=_SCAN_BLOCK_MS):
+            if ev.event == "start":
+                start = cursor
+            cursor = ev.entry_id
+            moved = True
+        if not moved:
+            return start
+
+
+async def open_run_stream(workspace_id: str, action_id: str, after: str = "0") -> Any:
+    """A run's live feed as SSE bytes (an async iterator), for
+    ``GET /belt/runs/{id}/stream``. The tenancy 404 is raised HERE, before any
+    response starts (``_owned_run``, same as ``get_run``).
+
+    ``after="0"`` replays the newest attempt from its ``start`` frame, so a
+    reload shows what a viewer saw live; a client cursor resumes after it. A
+    run with no stream that is not being developed (no ``headless_state``)
+    gets one ``stream_end {from_history: true}``: its stored stage rows
+    (``GET /feed?stage=``) are the record. A run being developed whose stream
+    does not exist yet is waited on. Tail, heartbeat and lifetime are the chat
+    run stream's (``transport.sse_tail``)."""
+    from pocketpaw_ee.cloud.belt.feed import stream_id
+    from pocketpaw_ee.cloud.chat.runs.domain import stream_max_lifetime_seconds
+    from pocketpaw_ee.cloud.chat.runs.transport import get_stream_transport, sse_frame, sse_tail
+
+    _action, blob = await _owned_run(workspace_id, action_id)
+    transport = get_stream_transport()
+    sid = stream_id(action_id)
+    exists = await transport.stream_exists(sid)
+    if not exists and not blob.get("headless_state"):
+
+        async def history() -> Any:
+            yield sse_frame("0-0", "stream_end", {"from_history": True})
+
+        return history()
+    if exists and after in ("", "0"):
+        after = await _attempt_cursor(transport, sid)
+    deadline = time.monotonic() + stream_max_lifetime_seconds()
+    return sse_tail(transport, sid, after, deadline)
+
+
 __all__ = [
     "BeltConsoleError",
     "GhCliRepoCreator",
@@ -776,10 +1039,15 @@ __all__ = [
     "MAX_DIFF_BYTES",
     "RepoCreator",
     "add_repo",
+    "default_base",
     "discover_repos",
     "emit_belt_run_updated",
     "get_run",
+    "get_run_blueprint",
+    "get_run_feed",
     "init_repo",
     "list_runs",
+    "open_run_stream",
     "resolve_allowlist_roots",
+    "save_run_feed",
 ]
