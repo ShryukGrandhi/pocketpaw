@@ -29,17 +29,16 @@
 # OWNER (session-authed; reads gate on ``paw_bar.read``, mutations on
 # ``paw_bar.manage``, both bound to the session workspace; another workspace's id is a
 # 404): /paw-bar/admin/site/{id}/ settings (partial PATCH of the concierge_* switches,
-# guided fields and visitor options; hiding the "Powered by" line is a 402 unless the
-# site is entitled to remove branding; ``embed_snippet`` and ``actions_snippet`` only to
-# a caller who can read the site's pocket), concierge create/delete (the only path that
-# creates one), overview, stats (runs priced at the time they ran, via metering),
-# conversations (list, transcript, PATCH, reply = type-to-takeover), decisions,
-# handoffs, knowledge read/sync, preview-frame, preview-config (a draft rendered to the
-# frame config, writes nothing) and widget spec; plus the bulk POST
-# /paw-bar/admin/sites/conversations. Tenancy runs at two gates: the Site is loaded
-# workspace-scoped, then its widget is resolved from ``Site.pocket_id`` (an empty
-# pocket_id resolves none). Widget CRUD (/paw-bar/widgets...) takes the same role gates
-# or the widget's owner token; list/read return ``PawBarWidgetPublic``.
+# guided fields and visitor options; the ripple profile, a store URL and a raised
+# spend cap are ops-site only (403); hiding "Powered by" is a 402 unless entitled;
+# ``embed_snippet`` / ``actions_snippet`` only to a reader of the site's pocket),
+# concierge create/delete (the only path that creates one), overview, stats (priced
+# via metering), conversations (list, transcript, PATCH, reply = type-to-takeover),
+# decisions, handoffs, knowledge read/sync, preview-frame, preview-config (writes
+# nothing), widget spec, and the bulk POST /paw-bar/admin/sites/conversations. The
+# Site is loaded workspace-scoped, then its widget resolved from ``Site.pocket_id``
+# (an empty one resolves none). Widget CRUD (/paw-bar/widgets...) takes the same role
+# gates or the widget's owner token; list/read return ``PawBarWidgetPublic``.
 #
 # Invariants: one definition of "this visitor's turns" (``_concierge_runs_for_visitor``)
 # and of which conversation a run belongs to (``_conversation_of_run`` /
@@ -65,13 +64,13 @@ from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, StrictInt, field_validator
 
 from pocketpaw.money import (
     DEFAULT_EXPONENT,
@@ -111,6 +110,10 @@ from pocketpaw.security.rate_limiter import RateLimiter
 from pocketpaw.sites_capture.ingest import interpolate
 from pocketpaw_ee.cloud._core.deps import current_workspace_id, require_action
 from pocketpaw_ee.cloud._core.rate_limit import _client_ip
+from pocketpaw_ee.cloud.models.site import (
+    CONCIERGE_KNOWLEDGE_CHARS_MAX,
+    CONCIERGE_KNOWLEDGE_CHARS_MIN,
+)
 from pocketpaw_ee.paw_bar.admit import admit as admit_event
 from pocketpaw_ee.paw_bar.handoff import PAW_HANDOFFS_TYPE
 
@@ -1707,6 +1710,38 @@ async def list_events(
 # ---------------------------------------------------------------------------
 
 
+# The v2 concierge's knowledge budget, in characters (``Site.concierge_knowledge_chars``).
+ConciergeKnowledgeChars = Annotated[
+    StrictInt, Field(ge=CONCIERGE_KNOWLEDGE_CHARS_MIN, le=CONCIERGE_KNOWLEDGE_CHARS_MAX)
+]
+
+
+# The most a site's own daily concierge spend cap may be, in USD.
+CONCIERGE_DAILY_SPEND_CAP_MAX = 100.0
+ConciergeDailySpendCap = Annotated[
+    float, Field(ge=0, le=CONCIERGE_DAILY_SPEND_CAP_MAX, allow_inf_nan=False)
+]
+
+
+def _store_url(value: str | None) -> str | None:
+    """A store base URL: https, a public host, no credentials, query or fragment
+    (``validate_external_url_strict``); "" clears it. Stored without a trailing /."""
+    from urllib.parse import urlsplit
+
+    from pocketpaw.security.url_validators import validate_external_url_strict
+
+    if value is None or not value.strip():
+        return None
+    url = validate_external_url_strict(value.strip())
+    parts = urlsplit(url)
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise ValueError("a store URL takes no credentials, query or fragment")
+    return url.rstrip("/")
+
+
+ConciergeStoreUrl = Annotated[str, Field(max_length=500), AfterValidator(_store_url)]
+
+
 class ConciergeSettingsUpdate(BaseModel):
     """Partial update of a Site's concierge settings (D1).
 
@@ -1740,6 +1775,21 @@ class ConciergeSettingsUpdate(BaseModel):
     # "Guide visitors around your site": on, the v2 concierge may suggest one
     # page action per reply (``paw_bar.action_spec``). Default off.
     concierge_page_actions: bool | None = None
+    # The v2 concierge's per-turn knowledge budget in characters, 4,000..60,000
+    # (out of range is a 422). Unlike the other fields an explicit null is a
+    # write: it clears the value back to the default (12,000).
+    concierge_knowledge_chars: ConciergeKnowledgeChars | None = None
+    # Which cards the v2 concierge may write: "pawbar" or "ripple" (anything else
+    # is a 422). null means "not sent".
+    concierge_ui_profile: Literal["pawbar", "ripple"] | None = None
+    # The store a ripple concierge orders and books against (https, public host;
+    # anything else is a 422). Ops sites on the ripple profile only (403
+    # ``ops_only_setting``). An explicit null or "" clears it.
+    concierge_store_url: ConciergeStoreUrl | None = None
+    # The site's daily spend cap in USD, 0..100 (out of range is a 422; 0 pauses
+    # the concierge). Like the knowledge budget, an explicit null is a write: it
+    # clears the cap back to the global one.
+    concierge_daily_spend_cap: ConciergeDailySpendCap | None = None
     # CR-4 (2026-09-28): the guided fields. Caps and shapes are in
     # ``pocketpaw.paw_bar.concierge_fields``; each value is normalized (one line,
     # no control characters) and refused with a 422 past its cap. Clear a text
@@ -1841,6 +1891,13 @@ class ConciergeSettingsResponse(BaseModel):
     concierge_allow_doc_code: bool = False
     concierge_lead_capture: bool = True
     concierge_page_actions: bool = False
+    # None means the default budget (12,000 characters).
+    concierge_knowledge_chars: int | None = None
+    concierge_ui_profile: Literal["pawbar", "ripple"] = "pawbar"
+    # None means no store.
+    concierge_store_url: str | None = None
+    # None means the global daily cap.
+    concierge_daily_spend_cap: float | None = None
     # CR-4 guided fields. "", None and [] mean unset (nothing is rendered).
     concierge_name: str = ""
     concierge_tone: ConciergeTone | None = None
@@ -1956,6 +2013,17 @@ async def _site_embed_snippet(site: Any, workspace_id: str, user_id: str) -> str
         return ""
 
 
+def _stored_knowledge_chars(site: Any) -> int | None:
+    """The site's knowledge budget as stored, or None (the default) for an old
+    row or anything that is not an int in range."""
+    value = getattr(site, "concierge_knowledge_chars", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if not CONCIERGE_KNOWLEDGE_CHARS_MIN <= value <= CONCIERGE_KNOWLEDGE_CHARS_MAX:
+        return None
+    return value
+
+
 def _actions_snippet() -> str:
     """The page-actions tag on the public API base ``_site_embed_snippet`` uses."""
     from pocketpaw_ee.paw_bar.embed import build_actions_snippet
@@ -1996,6 +2064,13 @@ async def _concierge_settings_response(
         concierge_lead_capture=getattr(site, "concierge_lead_capture", True) is not False,
         # Only an explicit True turns it on (a row older than the field reads off).
         concierge_page_actions=getattr(site, "concierge_page_actions", False) is True,
+        concierge_knowledge_chars=_stored_knowledge_chars(site),
+        # Only an explicit "ripple" is ripple (a row older than the field is pawbar).
+        concierge_ui_profile="ripple"
+        if getattr(site, "concierge_ui_profile", "pawbar") == "ripple"
+        else "pawbar",
+        concierge_store_url=getattr(site, "concierge_store_url", None) or None,
+        concierge_daily_spend_cap=getattr(site, "concierge_daily_spend_cap", None),
         # getattr again: rows older than the guided fields read as unset.
         concierge_name=getattr(site, "concierge_name", "") or "",
         concierge_tone=getattr(site, "concierge_tone", None),
@@ -2094,6 +2169,31 @@ async def update_site_concierge_settings(
 
         if not await badge_removal_entitled(site):
             raise HTTPException(status_code=402, detail="branding_not_entitled")
+    # The ripple profile, a store URL and a daily cap above the global one are
+    # for the sites the platform runs itself; a store URL also needs the ripple
+    # profile (stored or in this PATCH). Any other site may only lower the cap or
+    # clear the URL. Nothing in the PATCH is written. The runtime holds stored
+    # values to the same rule.
+    if {
+        "concierge_ui_profile",
+        "concierge_daily_spend_cap",
+        "concierge_store_url",
+    } & req.model_fields_set:
+        from pocketpaw_ee.paw_bar import concierge_runtime
+
+        settings = concierge_runtime._settings()
+        ops = concierge_runtime.is_ops_site(site, settings)
+        if not ops:
+            ceiling = float(settings.pawbar_concierge_daily_spend_cap)
+            cap = req.concierge_daily_spend_cap
+            if req.concierge_ui_profile == "ripple" or (
+                cap is not None and ceiling > 0 and cap > ceiling
+            ):
+                raise HTTPException(status_code=403, detail="ops_only_setting")
+        if req.concierge_store_url is not None:
+            profile = req.concierge_ui_profile or getattr(site, "concierge_ui_profile", None)
+            if not ops or profile != "ripple":
+                raise HTTPException(status_code=403, detail="ops_only_setting")
     # Writes the switch and nothing else (CR-12). This PATCH used to provision an
     # agent whenever it set concierge_enabled=true; turning a switch on is not
     # creating a concierge, and on a site with none the switch stays inert
@@ -2101,7 +2201,11 @@ async def update_site_concierge_settings(
     previous_name = getattr(site, "concierge_name", "") or ""
     for name in req.model_fields_set:
         value = getattr(req, name)
-        if value is not None:
+        if value is not None or name in (
+            "concierge_knowledge_chars",
+            "concierge_daily_spend_cap",
+            "concierge_store_url",
+        ):
             setattr(site, name, value)
     await site.save()
     # A legacy concierge answers through its dedicated agent: carry a new name
@@ -2704,6 +2808,10 @@ class SiteOverviewResponse(BaseModel):
     # The dashboard picks the create empty state off ``concierge_exists``.
     concierge_exists: bool = False
     concierge_runtime: Literal["legacy", "v2"] = "legacy"
+    # v2 only: the ``provider:model`` visitors are answered with right now (the
+    # concierge agent's model, else the deployment's), so the owner never has to
+    # guess. "" on legacy, where the agent's own run answers.
+    answer_model: str = ""
     # The third owner setting, alongside ``enabled`` and ``greeting``: whether the
     # visitor's own messages are stored. Carried here so the dashboard renders all
     # three from the one call it already makes rather than a second round trip for
@@ -3184,13 +3292,20 @@ async def get_site_overview(
     # Conversations are pocket-scoped (a Site is 1:1 with its pocket), so the
     # count stands even when the widget row is absent.
     counts.conversations = await _count_conversations(site.pocket_id, workspace_id)
+    from pocketpaw_ee.paw_bar import concierge_runtime as v2_runtime
+
+    runtime = _site_concierge_runtime(site)
+    answer_model = (
+        await v2_runtime.answer_model(widget, site, workspace_id) if runtime == "v2" else ""
+    )
 
     return SiteOverviewResponse(
         widget=widget_view,
         enabled=site.concierge_enabled,
         greeting=site.concierge_greeting,
         concierge_exists=getattr(site, "concierge_created_at", None) is not None,
-        concierge_runtime=_site_concierge_runtime(site),
+        concierge_runtime=runtime,
+        answer_model=answer_model,
         store_transcripts=site.concierge_store_transcripts,
         counts=counts,
     )

@@ -597,10 +597,11 @@ async def test_react_create_states_the_prerender_rule() -> None:
 
 
 async def test_react_create_names_the_reserved_build_shell() -> None:
-    """The generator owns index.html / package.json / vite.config.ts /
-    paw-prerender.mjs and the src/paw/ namespace, and REJECTS a source map that
-    writes one. A preamble that doesn't say so sends the agent into a create error
-    it cannot predict — and those files are what hold the prerender contract."""
+    """The generator owns index.html / paw-prerender.mjs and the src/paw/
+    namespace, and REJECTS a source map that writes one (package.json and
+    vite.config.* are the author's since 2026-10-07, and the preamble says so). A
+    preamble that doesn't say so sends the agent into a create error it cannot
+    predict — and those files are what hold the prerender contract."""
     preamble = (
         await sites_handler.build_preamble(
             WORKSPACE, USER, SurfaceMeta(route_path="/sites", engine="react")
@@ -608,9 +609,10 @@ async def test_react_create_names_the_reserved_build_shell() -> None:
     ).text
 
     assert "src/App.tsx" in preamble
-    for reserved in ("index.html", "package.json", "vite.config.ts", "paw-prerender.mjs"):
+    for reserved in ("index.html", "paw-prerender.mjs"):
         assert reserved in preamble, f"the preamble does not name the reserved {reserved}"
     assert "src/paw/" in preamble
+    assert "package.json and vite.config.* are yours" in preamble
 
 
 async def test_react_create_does_not_promise_a_submit_route() -> None:
@@ -1443,8 +1445,9 @@ async def test_react_refine_carries_the_prerender_and_write_scope_rules(mongo_db
     # And that the edit is a DRAFT, so the agent does not announce a live change.
     assert "draft" in lower
     assert "nothing goes live" in lower
-    # And that "ready" waits on the verify verdict.
-    assert "verification.status" in preamble
+    # And that "ready" waits on ONE verify_site at the end of the turn's edits.
+    assert "VERIFY ONCE PER TURN, AT THE END" in preamble
+    assert "previous_verification" in preamble
 
 
 async def test_ripple_refine_keeps_the_rippleSpec_merge(mongo_db: object) -> None:
@@ -1847,10 +1850,15 @@ async def test_every_refine_branch_keeps_what_transfers(engine: str | None) -> N
     # cannot name its pocket cannot act on it.
     assert REFINE_POCKET in preamble
     assert 'mode="refine"' in preamble
-    # ASK-DON'T-ASSUME and its mechanism (refine keeps ripple_mode="on" on every
-    # engine, so the widget is real here).
+    # ASK-DON'T-ASSUME and its mechanism, which follows the profile's ripple mode:
+    # the widget on a ripple (or unknown-engine) refine, the ask_user tool on the
+    # source engines, whose refine runs with inline ripple OFF.
     assert "ask, don't assume" in lower
-    assert "ask-user-questions" in preamble
+    if engine in ("html", "svelte", "react"):
+        assert "mcp__pocketpaw_ask__ask_user" in preamble
+        assert "ask-user-questions" not in preamble
+    else:
+        assert "ask-user-questions" in preamble
     assert "fabricate" in lower
     # The funnel, real copy, anchor CTAs, and the flat lead form.
     assert "hero" in lower
@@ -1891,9 +1899,10 @@ async def test_svelte_refine_names_its_own_tool_and_calls_the_edit_a_draft() -> 
     assert "not a deploy" in lower
     assert "the live page is unchanged" in lower
     assert "republish" not in lower
-    # PP-3: a failed static/build check rolls the edit back; ready waits on passed.
+    # A failed STATIC check rolls the edit back; ready waits on one verify at the end.
     assert "rolled_back" in preamble
-    assert "verification.status" in preamble
+    assert "failed the static check" in preamble
+    assert "VERIFY ONCE PER TURN, AT THE END" in preamble
     # Both edit shapes, so the agent prefers the diff over a whole-file rewrite.
     assert "old_string" in preamble
     assert "new_source" in preamble
@@ -2361,6 +2370,103 @@ async def test_a_create_preamble_carries_refero_when_configured(monkeypatch) -> 
     _with_refero_token(monkeypatch, "rf_test")
     for engine in (None, "svelte", "react"):
         assert _REFERO_STYLES in await _preamble_for(engine), f"{engine} create lost Refero"
+
+
+# ---------------------------------------------------------------------------
+# fix/sites-design-research: research is a REQUIRED gate, not a suggestion.
+#
+# Sites kept shipping a generic look while the reference tools sat unused: the
+# step said "keep it proportionate" and "if the tools return nothing, say nothing
+# and proceed", which an agent read as permission to skip. Now every create track
+# carries a hard gate, a look-changing refine carries a short version, and a copy
+# tweak stays lean.
+# ---------------------------------------------------------------------------
+
+_CREATE_ENGINES = (None, "html", "ripple", "svelte", "react", "project")
+
+
+async def test_every_create_track_carries_the_required_research_gate(monkeypatch) -> None:
+    """THE MUTATION THAT BREAKS THIS: put the "proportionate / say nothing and
+    proceed" escape back. Run: the agent skips research and ships its default look."""
+    for token in (None, "rf_test"):
+        _with_refero_token(monkeypatch, token)
+        for engine in _CREATE_ENGINES:
+            preamble = await _preamble_for(engine)
+            assert "REQUIRED GATE" in preamble, f"{engine} token={token!r}"
+            assert "at least TWICE" in preamble, f"{engine} token={token!r}"
+            assert "about 3" in preamble, f"{engine} token={token!r}"
+            assert "Always fetch it" in preamble, f"{engine} token={token!r}"
+            assert "palette" in preamble and "type pairing" in preamble
+            assert "layout idea" in preamble
+            assert "proportionate" not in preamble, f"{engine} kept the escape"
+            assert "say nothing about it" not in preamble, f"{engine} kept the escape"
+            # The gate lands before any tokens get written.
+            assert preamble.index("REQUIRED GATE") < preamble.index("TOKENS FIRST")
+
+
+async def test_with_refero_the_gate_requires_a_screen_search(monkeypatch) -> None:
+    _with_refero_token(monkeypatch, "rf_test")
+    step = sites_handler._design_research_step()
+    assert "search screens at least ONCE" in step
+    assert "mcp__pocketpaw_refero__get_style" in step
+
+
+async def test_the_only_exemption_is_an_empty_or_erroring_result() -> None:
+    lower = sites_handler._design_research_step().lower()
+    assert "one exemption" in lower
+    assert "error or come back empty" in lower
+
+
+@pytest.mark.parametrize("engine", ALL_REFINE_ENGINES + ("project",))
+async def test_refine_researches_before_a_new_section_or_restyle(engine, monkeypatch) -> None:
+    """Refine has no intent signal, so the gate is conditional: a new section, page
+    or restyle researches; a copy tweak or bug fix skips it and stays fast."""
+    for token, tool in ((None, _INSPO_RESEARCH), ("rf_test", _REFERO_STYLES)):
+        _with_refero_token(monkeypatch, token)
+        text = sites_handler._refine_preamble(_refine_meta(), engine)
+        assert "RESEARCH BEFORE A NEW SECTION, PAGE OR RESTYLE" in text
+        assert tool in text, f"{engine} token={token!r}"
+        assert "A copy tweak, a fact change or a bug fix skips this" in text
+        # The short version, not the create gate.
+        assert "REQUIRED GATE" not in text
+
+
+async def test_refine_research_names_only_tools_sites_can_reach(monkeypatch) -> None:
+    from pocketpaw_ee.cloud.surface.domain import SurfaceKind
+    from pocketpaw_ee.cloud.surface.service import resolve_profile
+
+    allow = set(
+        resolve_profile(SurfaceKind.SITES, _refine_meta(engine="html")).allow_mcp_tool_ids or ()
+    )
+    for token in (None, "rf_test"):
+        _with_refero_token(monkeypatch, token)
+        named = set(
+            re.findall(
+                r"mcp__pocketpaw_(?:inspo|refero)__\w+", sites_handler._refine_research_step()
+            )
+        )
+        assert named and not (named - allow), f"token={token!r}: {sorted(named - allow)}"
+
+
+async def test_design_taste_triggers_on_create_and_on_a_look_changing_refine() -> None:
+    names = sites_handler.create_design_skill_names()
+    assert "pocketpaw-design-taste" in names
+    for mode in ("create", "refine"):
+        note = sites_handler._design_skills_note(mode)
+        assert "`pocketpaw-design-taste`" in note, mode
+        assert "Before the first UI file on create" in note, mode
+
+
+async def test_setting_the_refero_token_moves_the_create_cache_key(monkeypatch) -> None:
+    """The create preamble names different research tools with and without the
+    token, so a cached preamble from before the token was set must not be served."""
+    meta = SurfaceMeta(route_path="/sites", engine="html")
+    _with_refero_token(monkeypatch, None)
+    without = await sites_handler.build_preamble(WORKSPACE, USER, meta)
+    _with_refero_token(monkeypatch, "rf_test")
+    with_token = await sites_handler.build_preamble(WORKSPACE, USER, meta)
+    assert without.cache_key != with_token.cache_key
+    assert _REFERO_STYLES in with_token.text and _REFERO_STYLES not in without.text
 
 
 # ---------------------------------------------------------------------------

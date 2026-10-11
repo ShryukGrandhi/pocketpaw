@@ -1,19 +1,8 @@
 # ee/pocketpaw_ee/sites/delete_cascade.py — the ordered, idempotent teardown of one
-# published site.
-#
-# Created 2026-09-09 (sites lifecycle wave 1 chunk 3, feat/sites-delete-cascade).
-#
-# Updated 2026-10-02 (feat/partners-commissions, PH-13): the client-paid partner
-# rail (``"client"``, a one-time payment) stops cleanly like credits and plan,
-# instead of being reported as a legacy gateway rail an operator must close.
-#
-# Updated 2026-09-23 (VS-1, feat/sites-worker-name-decouple): the ``workers``-target
-# script delete now names the Worker through ``workers_deploy.site_worker_name``. It
-# used to pass ``script_name``, which is the site id, while the Worker a ``workers``
-# deploy creates is ``paw-site-<id>`` -- so the account-level delete asked for a script
-# that never existed, got the 404 this module counts as success, and recorded a
-# teardown over a Worker that kept serving. The ``wfp`` delete is unchanged: a
-# dispatch-namespace script IS named by the site id.
+# published site. Billing rails that stop locally: credits, plan and the one-time
+# client rail. The script delete names the Worker the deploy target actually created
+# (a dispatch script is the site id, an account Worker ``site_worker_name``), since a
+# delete aimed at the wrong name 404s, and a 404 counts as success here.
 #
 # THE ORDER IS THE DESIGN. Every step here can fail, and the sequence is chosen so
 # that a failure at ANY point leaves the site LESS live than before and never still
@@ -23,10 +12,13 @@
 #   2. auth off      — the signed key dies next, at near-zero cost and before
 #                      anything irreversible, so lead ingest and the concierge stop
 #                      even if every later step fails;
-#   3. serving off   — routes, hostnames, then the Worker script itself;
-#   4. reclaim       — D1, R2, artifacts: the things that cost money once nothing
+#   3. serving off   — routes, hostnames, the script's Durable Objects (tombstone,
+#                      forced delete, verify; best effort), then the Worker script;
+#   4. reclaim       — D1, the bundle-deploy KV namespaces and R2 buckets, the
+#                      pocket's draft Worker and draft data, the public-asset R2
+#                      prefix, artifacts: the things that cost money once nothing
 #                      serves;
-#   5. records       — the dependent rows;
+#   5. records       — the dependent rows, then the site's secrets (best effort);
 #   6. the Site doc  — LAST, and not by convention.
 #
 # The Site document carries the ledger (``delete_ledger``), so it is the only thing
@@ -57,8 +49,11 @@ STEP_BILLING = "billing"
 STEP_REVOKE = "revoke"
 STEP_ROUTES = "routes"
 STEP_HOSTNAMES = "hostnames"
+STEP_DO = "do"
 STEP_SCRIPT = "script"
 STEP_D1 = "d1"
+STEP_BINDINGS = "bindings"
+STEP_DRAFTS = "drafts"
 STEP_R2 = "r2"
 STEP_RECORDS = "records"
 
@@ -67,8 +62,11 @@ CASCADE_STEPS: tuple[str, ...] = (
     STEP_REVOKE,
     STEP_ROUTES,
     STEP_HOSTNAMES,
+    STEP_DO,
     STEP_SCRIPT,
     STEP_D1,
+    STEP_BINDINGS,
+    STEP_DRAFTS,
     STEP_R2,
     STEP_RECORDS,
 )
@@ -87,6 +85,11 @@ OUTCOME_SKIPPED = "nothing-to-do"
 # over a charge this code could not stop either way, and leaving it silent would
 # bill them for a site that no longer exists.
 OUTCOME_LEGACY_RAIL = "legacy-rail-needs-operator"
+# The bindings step is best effort: a KV namespace or R2 bucket it could not remove
+# (Cloudflare error, or a bucket that still holds objects) is logged with its name
+# and the cascade moves on rather than trapping the site. Recorded distinctly so an
+# operator reading the ledger knows something was left behind.
+OUTCOME_PARTIAL = "partial-needs-operator"
 
 
 class CascadeStepFailed(Exception):
@@ -175,10 +178,16 @@ async def _run_step(step: str, *, site: Any, deps: Any) -> str:
         return await _delete_routes(site=site, deps=deps)
     if step == STEP_HOSTNAMES:
         return await _delete_hostnames(site=site, deps=deps)
+    if step == STEP_DO:
+        return await _delete_durable_objects(site=site, deps=deps)
     if step == STEP_SCRIPT:
         return await _delete_script(site=site, deps=deps)
     if step == STEP_D1:
         return await _delete_d1(site=site, deps=deps)
+    if step == STEP_BINDINGS:
+        return await _delete_bindings(site=site, deps=deps)
+    if step == STEP_DRAFTS:
+        return await _delete_drafts(site=site, deps=deps)
     if step == STEP_R2:
         return await _purge_assets(site=site, deps=deps)
     if step == STEP_RECORDS:
@@ -257,6 +266,68 @@ async def _delete_hostnames(*, site: Any, deps: Any) -> str:
     return OUTCOME_DONE
 
 
+def _script_ref(site: Any) -> tuple[str, str]:
+    """``(script name, durable_objects target)`` of the site's Worker, "" when none."""
+    script = (getattr(site, "script_name", "") or "").strip()
+    target = (getattr(site, "deploy_target", "") or "").strip()
+    if not script or target in ("", "local"):
+        return "", ""
+    if target == "wfp":
+        return script, "dispatch"
+    from pocketpaw_ee.sites.workers_deploy import site_worker_name
+
+    return site_worker_name(site), "account"
+
+
+async def _delete_durable_objects(*, site: Any, deps: Any) -> str:
+    """The script's Durable Objects and their data (``durable_objects.teardown_script``:
+    tombstone upload, forced delete, namespace-list check). Best effort and never
+    raises: a teardown that cannot finish is recorded as partial, queued for
+    ``do_metering.sweep_do_teardowns``, and the script step still runs (forced). A
+    cascade resumed past the script step only re-checks the namespace list; it never
+    uploads a stub to a deleted script."""
+    classes = list(getattr(site, "do_classes", None) or [])
+    script, target = _script_ref(site)
+    if not classes or not script:
+        return OUTCOME_SKIPPED
+    from pocketpaw_ee.sites import durable_objects
+
+    tags = list(getattr(site, "do_migration_tags", None) or [])
+    out = await durable_objects.teardown_script(
+        deps.cloudflare,
+        script,
+        target=target,
+        classes=classes,
+        migration_tag=tags[-1] if tags else None,
+        delete=STEP_SCRIPT not in (site.delete_ledger or {}),
+    )
+    if not out.ok:
+        logger.warning(
+            "sites.delete: site %s Durable Objects not torn down yet (%s); queued a retry",
+            getattr(site, "id", "?"),
+            out.error,
+        )
+        # The Site doc goes at the end of the cascade, so the retry needs its own row
+        # (``do_metering.sweep_do_teardowns``). Best effort: never fails the delete.
+        record = getattr(deps, "record_do_teardown", None)
+        if record is None:
+            from pocketpaw_ee.sites.do_metering import record_do_teardown as record
+        try:
+            await record(
+                site_id=str(getattr(site, "id", "")),
+                workspace=str(getattr(site, "workspace", "") or ""),
+                script=script,
+                target=target,
+                classes=classes,
+                migration_tag=tags[-1] if tags else None,
+                error=out.error,
+            )
+        except Exception:  # noqa: BLE001 - logged; the ledger still says partial
+            logger.warning("sites.delete: could not queue the DO teardown retry", exc_info=True)
+        return OUTCOME_PARTIAL
+    return OUTCOME_DONE
+
+
 async def _delete_script(*, site: Any, deps: Any) -> str:
     """THE STEP THAT ACTUALLY STOPS THE PAGE BEING SERVED.
 
@@ -272,14 +343,16 @@ async def _delete_script(*, site: Any, deps: Any) -> str:
         # Never deployed, or deployed to the local static server, which owns no
         # Cloudflare Worker to remove.
         return OUTCOME_SKIPPED
+    # A script that held Durable Objects only deletes with force.
+    force = {"force": True} if getattr(site, "do_classes", None) else {}
     if target == "wfp":
-        await deps.cloudflare.delete_worker(script)
+        await deps.cloudflare.delete_worker(script, **force)
     else:
         # The account-level Worker a ``workers`` deploy created, by the name it was
-        # deployed under -- not ``script_name``, which is the site id (VS-1).
+        # deployed under -- not ``script_name``, which is the site id.
         from pocketpaw_ee.sites.workers_deploy import site_worker_name
 
-        await deps.cloudflare.delete_account_script(site_worker_name(site))
+        await deps.cloudflare.delete_account_script(site_worker_name(site), **force)
     return OUTCOME_DONE
 
 
@@ -294,6 +367,52 @@ async def _delete_d1(*, site: Any, deps: Any) -> str:
         return OUTCOME_SKIPPED
     await deps.cloudflare.delete_database(db_id)
     return OUTCOME_DONE
+
+
+async def _delete_bindings(*, site: Any, deps: Any) -> str:
+    """The KV namespaces and R2 buckets ``binding_provisioner`` created for bundle
+    deploys. Best effort and never raises: failures are logged per resource by
+    ``teardown_bindings`` and summarised here, because the site doc (the only record
+    of these names) is about to go and a stuck cascade would not bring them back."""
+    if not (getattr(site, "kv_namespaces", None) or getattr(site, "r2_buckets", None)):
+        return OUTCOME_SKIPPED
+    from pocketpaw_ee.sites.binding_provisioner import teardown_bindings
+
+    failed = await teardown_bindings(site, cloudflare=deps.cloudflare)
+    if failed:
+        logger.warning(
+            "sites.delete: site %s left bindings behind for an operator: %s",
+            getattr(site, "id", "?"),
+            ", ".join(failed),
+        )
+        return OUTCOME_PARTIAL
+    return OUTCOME_DONE
+
+
+async def _delete_drafts(*, site: Any, deps: Any) -> str:
+    """The pocket's draft Worker, its draft-only D1 / KV / R2 and its preview tokens
+    (``draft_worker``, behind ``PAW_SITES_DRAFT_WORKERS``). Best effort and never
+    raises: what is left stays on the draft registry, which the draft sweeper retries,
+    so a stuck draft never traps a site delete."""
+    from pocketpaw_ee.sites import draft_worker
+
+    pocket_id = getattr(site, "pocket_id", "") or ""
+    if not pocket_id or not draft_worker.enabled():
+        return OUTCOME_SKIPPED
+    try:
+        done = await draft_worker.purge_pocket_drafts(
+            pocket_id,
+            workspace_id=str(getattr(site, "workspace", "") or ""),
+            reason="site_deleted",
+            forget=True,
+            cf=deps.cloudflare,
+        )
+    except Exception as exc:  # noqa: BLE001 - best effort, logged
+        logger.warning(
+            "sites.delete: site %s draft cleanup failed: %s", getattr(site, "id", "?"), exc
+        )
+        return OUTCOME_PARTIAL
+    return OUTCOME_DONE if done else OUTCOME_PARTIAL
 
 
 async def _purge_assets(*, site: Any, deps: Any) -> str:
@@ -332,4 +451,25 @@ async def _purge_records(*, site: Any, deps: Any) -> str:
     ledger survives every step it records.
     """
     await deps.purge_records(workspace_id=site.workspace, site_id=str(site.id))
+    await _purge_secrets(site)
     return OUTCOME_DONE
+
+
+async def _purge_secrets(site: Any) -> None:
+    """The site's encrypted secrets and pending secret requests. Best effort: a
+    failure is logged and the cascade goes on, since the rows are useless without a
+    site to deploy them to and a stuck delete would not make them less so."""
+    try:
+        from pocketpaw_ee.sites import site_secrets
+
+        removed = await site_secrets.purge_for_pocket(
+            workspace_id=site.workspace, pocket_id=site.pocket_id
+        )
+        if removed:
+            logger.info("sites.delete: site %s removed %d secret(s)", site.id, removed)
+    except Exception:  # noqa: BLE001 - best effort, logged
+        logger.warning(
+            "sites.delete: site %s could not remove its secrets",
+            getattr(site, "id", "?"),
+            exc_info=True,
+        )

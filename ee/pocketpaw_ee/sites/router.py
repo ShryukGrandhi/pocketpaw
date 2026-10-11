@@ -65,6 +65,8 @@ from pocketpaw_ee.sites.dto import (
     SiteAssetListResponse,
     SiteAssetResponse,
     SiteBrandingUpdate,
+    SiteBuildLogResponse,
+    SiteBuildResponse,
     SiteClientResponse,
     SiteClientUpdate,
     SiteDataRowsResponse,
@@ -129,6 +131,27 @@ async def _may_buy_site_plan(user: object, workspace_id: str) -> bool:
     return True
 
 
+async def _require_data_loss_confirmer(user: object, workspace_id: str, classes: list[str]) -> None:
+    """A publish that confirms Durable Object data loss needs a workspace admin
+    (``sites.confirm_data_loss``). Raises ``Forbidden`` with
+    ``sites.data_loss_confirm_forbidden`` for anyone else; a publish confirming
+    nothing is not asked."""
+    if not classes:
+        return
+    from pocketpaw_ee.cloud._core.errors import Forbidden as CloudForbidden
+    from pocketpaw_ee.guards.deps import check_workspace_action
+    from pocketpaw_ee.guards.rbac import Forbidden as GuardForbidden
+
+    try:
+        await check_workspace_action(user, workspace_id, "sites.confirm_data_loss")
+    except GuardForbidden as exc:
+        raise CloudForbidden(
+            exc.code,
+            "Only a workspace owner or admin can confirm deleting a site's Durable Object "
+            f"data ({', '.join(sorted(classes))}). Ask one to publish this change.",
+        ) from exc
+
+
 @router.post("/sites/publish", response_model=SiteResponse)
 async def publish_site(
     body: PublishRequest,
@@ -152,6 +175,7 @@ async def publish_site(
     # never matches the view's, and every view is a cold miss. This does NOT arm the
     # PUBLIC deploy (builder_origin stays unset here — the public site stays plain); it
     # only steers the pre-warmed armed artifact the native editor consumes.
+    await _require_data_loss_confirmer(user, ctx.workspace_id, list(body.confirm_do_data_loss))
     doc = await sites_service.publish_pocket(
         workspace_id=ctx.workspace_id,
         user_id=ctx.user_id,
@@ -159,6 +183,8 @@ async def publish_site(
         site_plan_key=body.site_plan_key,
         purchase_authorized=await _may_buy_site_plan(user, ctx.workspace_id),
         prewarm_origin=request.headers.get("origin") or None,
+        confirm_destructive_migrations=body.confirm_destructive_migrations,
+        confirm_do_data_loss=list(body.confirm_do_data_loss),
     )
     return sites_service._to_response(doc)
 
@@ -399,10 +425,15 @@ async def native_artifact_by_pocket(
     needs to stamp data-uid + the manifest — is resolved from the request's ``Origin``
     header, with the service applying the ``PAW_SITES_BUILDER_ORIGIN`` env fallback when
     it is absent (the same precedence as ``/editable`` / ``/dev-preview``), so the call
-    works with no header. A pocket with no native edit lane is a 422 — svelte and
-    react are armable, html (served straight from its source) and ripple are not;
+    works with no header. A pocket with no native edit lane is a 422 — svelte, react
+    and html are served, ripple is not;
     a missing / access-denied pocket surfaces as a 404 / 403 (the pockets service
-    raises it inside the service)."""
+    raises it inside the service).
+
+    DRAFT PREVIEW ORIGIN: every engine, html included, also answers ``preview_url`` —
+    the draft's site root on the cookieless preview host (``preview_origin.py``),
+    ``None`` while a build is pending or failed. html never builds, so it is always
+    ``build_status="none"`` with a URL and empty body/css. Ripple still 422s."""
     # Mirror /editable + /dev-preview origin resolution: the request Origin header
     # here; the service applies the PAW_SITES_BUILDER_ORIGIN env fallback when blank.
     builder_origin = request.headers.get("origin") or ""
@@ -587,6 +618,41 @@ async def dev_preview_by_pocket(
         pocket_id=pocket_id,
         builder_origin=builder_origin,
     )
+
+
+@router.get("/sites/by-pocket/{pocket_id}/builds/latest", response_model=SiteBuildResponse)
+async def latest_build_by_pocket(
+    pocket_id: str,
+    ctx: RequestContext = Depends(request_context),
+    _: object = Depends(require_action_any_workspace("fabric.write")),
+) -> SiteBuildResponse:
+    """A project pocket's newest draft build (job id, status, ``preview_mode``), for
+    polling: no realtime event exists for site builds. 404 when it never built, 422
+    for a non-project pocket, the pockets service's 404 / 403 for no access."""
+    result = await sites_service.project_latest_build(
+        workspace_id=ctx.workspace_id, user_id=ctx.user_id, pocket_id=pocket_id
+    )
+    return SiteBuildResponse(**result)
+
+
+@router.get(
+    "/sites/by-pocket/{pocket_id}/builds/{job_id}/log",
+    response_model=SiteBuildLogResponse,
+)
+async def build_log_by_pocket(
+    pocket_id: str,
+    job_id: str,
+    ctx: RequestContext = Depends(request_context),
+    _: object = Depends(require_action_any_workspace("fabric.write")),
+) -> SiteBuildLogResponse:
+    """One project build's log (install, build and wrangler dry-run output), redacted
+    and capped by the worker before it was stored. Owner/editor only, like the other
+    by-pocket write routes: the log is the author's own build output. A job id that is
+    not this pocket's is a 404."""
+    result = await sites_service.project_build_log(
+        workspace_id=ctx.workspace_id, user_id=ctx.user_id, pocket_id=pocket_id, job_id=job_id
+    )
+    return SiteBuildLogResponse(**result)
 
 
 @router.get("/sites/by-pocket/{pocket_id}/status", response_model=SiteStatusResponse)
@@ -1500,6 +1566,9 @@ async def verify_site_origin(
     unreachable domain — is an error response and writes nothing at all.
     """
     claim = await ownership.verify_origin(workspace_id=ctx.workspace_id, host=body.host)
+    # A fresh proof is what lets a connected site's card read the customer's page,
+    # so every connected site on this host refreshes its title, icon and picture.
+    await sites_service.schedule_connected_cards_for_origin(ctx.workspace_id, claim.host)
     return OriginVerificationResponse(
         host=claim.host,
         status=claim.status,

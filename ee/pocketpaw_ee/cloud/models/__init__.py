@@ -291,6 +291,7 @@ from pocketpaw_ee.cloud.models.notification_outbox import (
     NotificationOutboxItem,
     NotificationRateMarker,
 )
+from pocketpaw_ee.cloud.models.partner_application import PartnerApplication
 from pocketpaw_ee.cloud.models.payment import Payment
 from pocketpaw_ee.cloud.models.planner import PlanSession, PlanSessionAgentGap
 from pocketpaw_ee.cloud.models.platform_audit import PlatformAuditEvent
@@ -309,10 +310,15 @@ from pocketpaw_ee.cloud.models.session_transcript import SessionTranscriptDoc
 from pocketpaw_ee.cloud.models.ship import ShipApp, ShipBox, ShipDeploy
 from pocketpaw_ee.cloud.models.site import Site, SiteDomain
 from pocketpaw_ee.cloud.models.site_design_brief import SiteDesignBrief
+from pocketpaw_ee.cloud.models.site_do_teardown import SiteDoTeardown
+from pocketpaw_ee.cloud.models.site_draft_worker import SiteDraftWorker
 from pocketpaw_ee.cloud.models.site_export import SiteExport
 from pocketpaw_ee.cloud.models.site_origin_claim import SiteOriginClaim
 from pocketpaw_ee.cloud.models.site_rate_counter import SiteRateCounter
+from pocketpaw_ee.cloud.models.site_secret import SiteSecret
 from pocketpaw_ee.cloud.models.site_template import SiteTemplate
+from pocketpaw_ee.cloud.models.social_idea import SocialIdea
+from pocketpaw_ee.cloud.models.social_profile import SocialProfile
 from pocketpaw_ee.cloud.models.spend_reconciliation import SpendReconciliation
 from pocketpaw_ee.cloud.models.studio_generation import StudioGeneration
 from pocketpaw_ee.cloud.models.studio_template import StudioTemplate
@@ -495,10 +501,13 @@ __all__ = [
     "AgentSessionRuntimeDoc",
     "Site",
     "SiteDesignBrief",
+    "SiteDoTeardown",
+    "SiteDraftWorker",
     "SiteExport",
     "SiteDomain",
     "SiteOriginClaim",
     "SiteRateCounter",
+    "SiteSecret",
     "SiteTemplate",
     "StudioTemplate",
     "DiscoverListing",
@@ -654,6 +663,9 @@ def get_all_documents():
         # Discover index (DS-1): one public card per source item. Only
         # ``ee.cloud.discover.service`` / ``service_admin`` write it.
         DiscoverListing,
+        # Public partner applications, reviewed by operators. Only
+        # ``ee.cloud.partners.service_admin`` reads or writes it.
+        PartnerApplication,
         # Studio generations published as templates. Only
         # ``ee.cloud.studio_templates.service`` / ``service_admin`` write it.
         StudioTemplate,
@@ -667,6 +679,13 @@ def get_all_documents():
         # concierge crawl reads it before fetching anyone's pages.
         SiteOriginClaim,
         SiteRateCounter,
+        # Per-site secrets (encrypted at rest). Only ``sites.site_secrets`` touches it.
+        SiteSecret,
+        # Draft Workers of site pockets. Only ``sites.draft_worker`` touches it.
+        SiteDraftWorker,
+        # Durable Object teardowns a site delete could not finish, retried by
+        # ``sites.do_metering.sweep_do_teardowns``. Only that module touches it.
+        SiteDoTeardown,
         # VS-4 — an address a renamed site gave up, held 30 days for its old
         # workspace. Only ``pocketpaw_ee.sites.service`` reads/writes it.
         ReleasedSlug,
@@ -687,6 +706,10 @@ def get_all_documents():
         # a workspace wants, and the cadence the discovery cron runs it on.
         # Same import boundary as Prospect / Draft / MessageLog.
         Icp,
+        # Growth › Social — the per-workspace company profile and its post
+        # ideas. Only ``ee.cloud.growth.social.service`` imports these.
+        SocialProfile,
+        SocialIdea,
         PushSubscription,
         VapidKeypair,
         WorkspaceSensePreference,

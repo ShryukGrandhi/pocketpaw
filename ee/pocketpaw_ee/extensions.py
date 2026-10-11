@@ -101,11 +101,20 @@ def _sweeps() -> tuple[list[Any], list[Any]]:
     - ``run_cutover_sweep``: WU-F per-tenant LiteLLM spend (off/shadow/live).
     - ``sweep_pending_sites``: log paid sites stuck pending (visibility only).
     - ``sweep_site_renewals``: charge wallet-paid site plans that came due; an
-      unaffordable site drops to the free floor and stays live.
+      unaffordable site drops to the free floor and stays live. Also releases
+      plan-carried sites past the workspace's current site allowance.
     - ``sweep_partner_tiers``: PH-15 monthly Paw Partners tier review (lowers a
       tier the active sold sites no longer earn); acts once per partner per month.
       After the renewals, so a site that just lapsed no longer counts.
     - ``sweep_subscription_grace``: M5 dunning, revoke plans held past grace.
+    - ``sweep_draft_workers``: retry pending site-draft cleanups, reap draft Workers
+      idle past their TTL, delete unregistered ``paw-draft-*`` scripts (no-op unless
+      PAW_SITES_DRAFT_WORKERS is on).
+    - ``sweep_do_usage``: daily Durable Object usage per site from Cloudflare GraphQL
+      analytics; flips ``do_throttled`` past the plan's ceiling. Fails open; at most
+      once an interval; no-op unless PAW_SITES_DURABLE_OBJECTS is on.
+    - ``sweep_do_teardowns``: retry DO teardowns a site delete could not finish, with
+      backoff, then hand them to an operator (same flag).
     - ``backfill_tenant_keys`` (tick only): mint LiteLLM tenant keys for up to 50
       live workspaces with none, since workspace create never retries a failed
       mint. Skipped on the boot pass, where a down proxy would hold startup.
@@ -119,6 +128,8 @@ def _sweeps() -> tuple[list[Any], list[Any]]:
     from pocketpaw_ee.cloud.llm_provisioning.service import backfill_tenant_keys
     from pocketpaw_ee.cloud.metering.sweeper import sweep_unbilled_runs
     from pocketpaw_ee.cloud.partners.service import sweep_partner_tiers
+    from pocketpaw_ee.sites.do_metering import sweep_do_teardowns, sweep_do_usage
+    from pocketpaw_ee.sites.draft_worker import sweep_draft_workers
     from pocketpaw_ee.sites.pending_sweeper import sweep_pending_sites
     from pocketpaw_ee.sites.renewal_sweeper import sweep_site_renewals
 
@@ -130,6 +141,9 @@ def _sweeps() -> tuple[list[Any], list[Any]]:
         sweep_site_renewals,
         sweep_partner_tiers,
         sweep_subscription_grace,
+        sweep_draft_workers,
+        sweep_do_usage,
+        sweep_do_teardowns,
         backfill_tenant_keys,
     ]
     return cluster, [sweep_agent_jails]

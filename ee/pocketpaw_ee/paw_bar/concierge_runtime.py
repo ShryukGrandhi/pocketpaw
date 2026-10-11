@@ -2,44 +2,45 @@
 #
 # A site whose ``Site.concierge_runtime`` is "v2" answers visitors here. POST
 # /paw-bar/chat runs every public gate first, then ``run_concierge_v2`` writes the
-# turn's ``ChatRunDoc``, retrieves knowledge and makes ONE streamed pydantic_ai
-# call with NO tools, toolsets or capabilities, relaying ``chunk`` / ``sources`` /
+# turn's ``ChatRunDoc``, retrieves knowledge and makes ONE streamed pydantic_ai call
+# with NO tools, toolsets or capabilities, relaying ``chunk`` / ``sources`` /
 # ``stream_end`` / ``error`` frames as the legacy relay does, plus at most one
 # ``action`` frame ({do, to?, target?, name?, args?, label}) before ``stream_end``.
 #
-# Instructions: one of eight constants picked by ``frame_for(site)`` (doc-code
-# rule 2, lead rule and page-action rule in rule 5), the cache-stable prefix;
-# nothing an owner or visitor writes reaches them. Data (``build_prompt``):
-# <owner-settings>, <page>, <knowledge>, <catalog>, <site-pages> (page actions on:
-# the fence forms, the pages ``navigate`` may name, and the tool rule when the
-# page declared a valid tool), <page-tools> (page actions on and at least one of
-# the request's ``page.tools`` through ``action_spec.valid_tools``), <history>,
-# <visitor-message>. Those tags are neutralized inside every block.
+# Instructions: one of the frame constants picked by ``frame_for(site)`` (the
+# cache-stable prefix; no owner or visitor text reaches it). Data (``build_prompt``):
+# <owner-settings>, <page>, <knowledge>, <catalog>, <store-menu>, <site-pages>,
+# <page-tools>, <history>, <visitor-message>, with our tags neutralized inside each.
+# Model (``_turn_model_spec``): the provider + model the owner picked on the
+# concierge agent, else ``pawbar_concierge_model``, else the backend default; never
+# the agent's runtime, so the call stays tool-free.
 #
-# Knowledge (``retrieve`` is a FROZEN SEAM) is pinned FAQs, then the visitor's
-# page article, then KB hits, in one budget (``select_knowledge``). A KB hit's
-# body comes from kb-go's context entries, at most ``_ITEM_CHARS`` each.
-# ``resolve_page`` accepts the request's page only on an allowed origin;
-# ``with_page_product`` finds its catalog item. <catalog> comes per turn from
-# ``catalog_for_turn``: a small catalog whole, else the page's product plus FTS
-# hits, with a fallback when the search is weak.
+# Knowledge (``retrieve`` is a FROZEN SEAM) fills one per-site budget
+# (``knowledge_chars``, ``select_knowledge``): pinned FAQs, the visitor's page
+# article (or, when a hit off that page carries the message's own words, that
+# page first: ``_with_page_siblings``), then KB hits, each cut to what is left.
+# ``resolve_page`` accepts the request's page only on an allowed origin; <catalog>
+# comes per turn from ``catalog_for_turn`` (small catalogs whole, else FTS hits).
 #
-# Output passes ``FenceFilter``: a ```pawbar-card is validated and hydrated from
-# the catalog store; any other code fence becomes ``CODE_REPLACEMENT`` unless doc
-# code is allowed and ``is_grounded_code`` finds it in this turn's knowledge. The
-# first ```pawbar-action goes through ``action_spec.render_action`` (known pages,
-# bounded targets, a ``tool`` only by a declared name with schema-checked args)
-# into the ``action`` frame; others, and all with page actions off, are dropped.
-# The model only writes a fence; the page runs a declared tool, after the
-# visitor's confirm in the bar unless the page opted out.
+# Output passes ``FenceFilter``: a ```pawbar-card is validated and hydrated
+# (``card_spec.render_card``); any other code fence becomes ``CODE_REPLACEMENT``
+# unless doc code is allowed and ``is_grounded_code`` finds it in this turn's
+# knowledge; the first ```pawbar-action goes through ``action_spec.render_action``.
+# A reply cut off at ``pawbar_concierge_max_tokens`` keeps what streamed; a visitor
+# asking for a person always gets a route to the team (``contact_route``); a
+# transient failure before any text is retried once; an unanswerable turn (spend
+# cap, quota, provider error) ends with ``degrade_reply``. A site's
+# ``concierge_daily_spend_cap`` only lowers the global cap, except on an ops site
+# (``is_ops_site``: ``pawbar_ops_site_ids``), where it replaces it.
 #
-# A reply cut off at ``pawbar_concierge_max_tokens`` keeps what streamed. A
-# visitor asking for a person always gets a route to the team
-# (``contact_route.contact_reply``) when the reply has no valid lead card or the
-# model failed. A transient failure before any text is retried once; a turn that
-# still cannot be answered (spend cap, quota, provider error) ends with
-# ``degrade_reply`` (one ``unavailable`` frame, then ``stream_end``). The owner
-# hears about the daily cap once per site per UTC day.
+# Card profile (``ui_profile``, read every turn): "ripple" counts only on an ops
+# site. It uses ``card_spec.RIPPLE_PROFILE``, raises the reply cap to
+# ``_RIPPLE_MAX_TOKENS``, always writes the Ripple cards paragraph, streams each card
+# as ``card.*`` frames (``FenceFilter(stream_cards=True)``) and uses ``FRAME_DEMO``.
+# A ripple site with a ``concierge_store_url`` gets its store read once per turn
+# (``storefront_for_turn``, ``concierge_store``, cached per site) alongside
+# retrieval: its menu becomes <store-menu> and the same data fills menu-order,
+# booking and comparison cards in ``card.final``.
 
 from __future__ import annotations
 
@@ -48,6 +49,7 @@ import html
 import json
 import logging
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -166,6 +168,65 @@ _FRAMES: dict[tuple[bool, bool, bool], str] = {
     (True, True, True): FRAME_DOC_CODE_LEADS_ACTIONS,
 }
 
+# The demo frame, for a site on the ripple card profile (``ui_profile``: ops
+# sites only), which is the Ripple landing: its concierge shows what Ripple does
+# by building a small card for an everyday ask, where FRAME's rules 1 and 2 would
+# refuse anything off the site. FRAME with the opening and rules 1, 2 and 6
+# swapped; rules 3, 4 and 5 stay word for word. A constant, picked by ``frame_for``.
+_OPENING = (
+    "You are the assistant in the chat widget on one business's website, answering "
+    "an anonymous visitor on its pages. Your name, tone and manner come from the "
+    "<owner-settings> block when there is one: introduce yourself by the name it "
+    "gives you. When it gives no name, call yourself the site's assistant.\n"
+)
+_RULE_1 = (
+    "1. Answer only about this site, and only from the facts in the <page>, "
+    "<knowledge> and <catalog> blocks. If they do not contain the answer, say briefly "
+    "that you don't have that information and offer what you can help with instead. "
+    "Never guess, and never invent products, prices, policies, people or links. Offer "
+    "a way to reach the business only when the visitor asks for a person, contact "
+    "details or a callback, or the request needs the business itself (an existing "
+    "order, a complaint, a custom quote); otherwise never add contact details or offer "
+    "to pass the message on.\n"
+)
+_RULE_6 = (
+    "6. Keep answers short: a few sentences of plain text, plus a product card when "
+    "you show products, in the visitor's language unless <owner-settings> says "
+    "otherwise."
+)
+_OPENING_DEMO = (
+    "You are the demo assistant on the Ripple website, talking with an anonymous "
+    "visitor. Ripple turns a model's answer into a live interface, and you show that "
+    "by building one.\n"
+)
+_RULE_1_DEMO = (
+    "1. When the visitor asks for something a small interface can do (a calculator, "
+    "a planner, a tracker, a comparison, a checklist, a summary or a report), build "
+    "it as ONE ```pawbar-card block after a sentence or two of text, as the <catalog> "
+    "block describes. Use the visitor's own numbers. Where you need data you do not "
+    "have, use made-up sample data and say once that it is sample data. Answer "
+    "questions about Ripple itself from the <knowledge> block.\n"
+)
+_RULE_2_DEMO = (
+    "2. Never write code, scripts, markup, configuration or commands outside the "
+    "card, and never write long prose (essays, stories, homework). Never give "
+    "medical, legal or financial advice: a health or money card shows sample data "
+    "and says it is not advice.\n"
+)
+_RULE_6_DEMO = (
+    "6. Keep the text short: one or two sentences, then the card, in the visitor's language."
+)
+FRAME_DEMO = FRAME
+for _old, _new in (
+    (_OPENING, _OPENING_DEMO),
+    (_RULE_1, _RULE_1_DEMO),
+    (_RULE_2, _RULE_2_DEMO),
+    (_RULE_6, _RULE_6_DEMO),
+):
+    if FRAME.count(_old) != 1:
+        raise RuntimeError("FRAME changed; update the FRAME_DEMO sources to match it")
+    FRAME_DEMO = FRAME_DEMO.replace(_old, _new)
+
 
 def page_actions_on(site: Any) -> bool:
     """The owner's "Guide visitors around your site" switch; only an explicit
@@ -179,9 +240,54 @@ def lead_capture_on(site: Any) -> bool:
     return getattr(site, "concierge_lead_capture", True) is not False
 
 
-def frame_for(site: Any) -> str:
-    """The frame constant for this site's doc-code, lead-capture and page-action
-    switches."""
+def is_ops_site(site: Any, settings: Any = None) -> bool:
+    """Whether ``site`` is one the platform runs itself (its id is on the
+    comma-separated ``pawbar_ops_site_ids``). Only those may use the ripple
+    profile or a daily cap above the global one."""
+    settings = settings if settings is not None else _settings()
+    raw = str(getattr(settings, "pawbar_ops_site_ids", "") or "")
+    site_id = str(getattr(site, "id", "") or "")
+    return bool(site_id) and site_id in {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def ui_profile(site: Any, settings: Any = None) -> Any:
+    """The site's ``card_spec.CardProfile``: RIPPLE_PROFILE only for an explicit
+    "ripple" on an ops site (``is_ops_site``), read every turn so a stored value
+    off the list never counts; anything else is PAWBAR_PROFILE."""
+    from pocketpaw_ee.paw_bar.card_spec import PAWBAR_PROFILE, RIPPLE_PROFILE
+
+    if getattr(site, "concierge_ui_profile", None) == "ripple" and is_ops_site(site, settings):
+        return RIPPLE_PROFILE
+    return PAWBAR_PROFILE
+
+
+async def storefront_for_turn(site: Any, settings: Any = None, *, fetch: Any = None) -> Any:
+    """The site's store (``concierge_store.StoreData``, cached per site) when it is
+    on the ripple profile (``ui_profile``: ops sites only, read every turn) and
+    names a ``concierge_store_url``; else None. ``fetch`` is for a local harness
+    only (the runtime passes none, so the pinned public-only fetch is used)."""
+    from pocketpaw_ee.paw_bar.card_spec import RIPPLE_PROFILE
+
+    url = getattr(site, "concierge_store_url", None)
+    if not isinstance(url, str) or not url or ui_profile(site, settings) is not RIPPLE_PROFILE:
+        return None
+    from pocketpaw_ee.paw_bar.concierge_store import cached_store
+
+    try:
+        return await cached_store(str(getattr(site, "id", "")), url, fetch=fetch)
+    except Exception as exc:  # noqa: BLE001 — no store is a turn without one
+        logger.warning("concierge: the store could not be read (%s)", type(exc).__name__)
+        return None
+
+
+def frame_for(site: Any, settings: Any = None) -> str:
+    """The frame constant for this site: ``FRAME_DEMO`` on the ripple profile
+    (``ui_profile``, ops sites only), whatever its doc-code, lead-capture and
+    page-action switches say; otherwise the constant for those switches."""
+    from pocketpaw_ee.paw_bar.card_spec import RIPPLE_PROFILE
+
+    if ui_profile(site, settings) is RIPPLE_PROFILE:
+        return FRAME_DEMO
     doc_code = getattr(site, "concierge_allow_doc_code", False) is True
     return _FRAMES[(doc_code, lead_capture_on(site), page_actions_on(site))]
 
@@ -203,6 +309,21 @@ _PATH_SAFE = "/-._~!$&'()*+,;=:@"
 # words can miss ("shoe" vs a "Footwear" section).
 _ITEM_CHARS = 4_000
 _KNOWLEDGE_CHARS = 12_000
+# The budget is per site (``knowledge_chars``: ``Site.concierge_knowledge_chars``,
+# 4,000..60,000). Items take it in rank order, each up to min(``_ITEM_CHARS``,
+# what is left); a remainder under ``_MIN_ITEM_CHARS`` ends the list, since a
+# sliver of an article answers nothing. The search goes deeper on a bigger
+# budget: one hit per ``_TOP_K_ITEM_CHARS`` (a typical compiled section),
+# never under ``_TOP_K`` nor over ``_MAX_TOP_K``. No model context window is
+# read here: settings carry none, and 60,000 characters (about 15,000 tokens)
+# is well inside any model the concierge runs on.
+_MIN_ITEM_CHARS = 500
+_TOP_K_ITEM_CHARS = 2_000
+_MAX_TOP_K = 20
+# A sectioned page: at most this many of its sections are read per turn, and its
+# sections share at most ``_page_chars(budget)`` of the budget.
+_PAGE_SECTIONS_READ = 12
+_PAGE_READ_CONCURRENCY = 4
 # History: the most recent messages of THIS conversation, clipped newest-first.
 _HISTORY_MESSAGES = 8
 _HISTORY_CHARS = 4_000
@@ -212,6 +333,9 @@ _BACKEND = "pawbar_concierge_v2"
 # The reply's output-token cap when settings give none. A reasoning model's
 # thinking counts against it, so it has to fit thinking plus a card.
 _MAX_TOKENS = 2_000
+# The output cap for a site on the "ripple" card profile: a full-catalog spec
+# runs to thousands of tokens.
+_RIPPLE_MAX_TOKENS = 8_000
 # The provider's per-request timeout (ModelSettings ``timeout``). A stalled
 # provider becomes the ``unavailable`` frame instead of a widget spinning forever.
 _PROVIDER_TIMEOUT_S = 30.0
@@ -433,8 +557,11 @@ class PageContext:
     site's allowed origins. ``indexed`` — the path is in the site's crawl index:
     ``title`` is then the indexed article title and ``article_id`` its kb id, and
     ``_with_page_article`` fills ``summary`` and ``chunk`` (the article as a
-    knowledge item). Not indexed: ``title`` is the browser's, one line, at most
-    ``_PAGE_TITLE_CHARS``, and unverified. ``product`` — the widget's catalog item
+    knowledge item). A long page is several articles (``section_ids``, page
+    order, ``article_id`` the first): ``chunk`` is then the section that best
+    matches the turn and ``extra_chunks`` the others that fit. Not indexed:
+    ``title`` is the browser's, one line, at most ``_PAGE_TITLE_CHARS``, and
+    unverified. ``product`` — the widget's catalog item
     whose url is this page, if any (``with_page_product`` fills it). ``host`` and
     ``key`` — the url's host and ``page_key``, for that lookup.
     """
@@ -448,6 +575,11 @@ class PageContext:
     product: Any = None
     host: str = ""
     key: str = ""
+    section_ids: tuple[str, ...] = ()
+    extra_chunks: tuple[KnowledgeItem, ...] = ()
+    # The page's sections were chosen because they match the turn (not the
+    # first-section fallback).
+    page_matched: bool = False
 
 
 def resolve_page(widget: Any, page: Any, *, site: Any) -> PageContext | None:
@@ -472,6 +604,7 @@ def _resolve_page(widget: Any, page: Any, site: Any) -> PageContext | None:
     from pocketpaw.paw_bar.concierge_fields import one_line
     from pocketpaw.sites_capture.ingest import origin_allowed
     from pocketpaw_ee.sites.kb_ingest import page_key
+    from pocketpaw_ee.sites.page_sections import index_sections
 
     if not isinstance(page, dict):
         page = {"url": getattr(page, "url", None), "title": getattr(page, "title", None)}
@@ -491,9 +624,17 @@ def _resolve_page(widget: Any, page: Any, site: Any) -> PageContext | None:
     where = {"host": host.lower(), "key": key}
 
     entry = (getattr(site, "kb_page_index", None) or {}).get(key)
-    if isinstance(entry, dict) and entry.get("id"):
+    sections = index_sections(entry)
+    if sections:
         title = one_line(str(entry.get("title") or ""))[:_PAGE_TITLE_CHARS]
-        return PageContext(url=url, title=title, indexed=True, article_id=str(entry["id"]), **where)
+        return PageContext(
+            url=url,
+            title=title,
+            indexed=True,
+            article_id=sections[0]["id"],
+            section_ids=tuple(s["id"] for s in sections),
+            **where,
+        )
     title = one_line(raw_title if isinstance(raw_title, str) else "")[:_PAGE_TITLE_CHARS]
     return PageContext(url=url, title=title, **where)
 
@@ -563,12 +704,21 @@ def catalog_rows(items: Sequence[Any]) -> list[dict[str, Any]]:
     ]
 
 
-async def _with_page_article(page: PageContext | None, site: Any) -> PageContext | None:
+async def _with_page_article(
+    page: PageContext | None,
+    site: Any,
+    *,
+    query: str = "",
+    budget: int = _KNOWLEDGE_CHARS,
+) -> PageContext | None:
     """An indexed page with its article read (``kb show``): the summary for the
-    <page> block and the article as a knowledge item. Fail-soft under the search
+    <page> block and the article as a knowledge item. A sectioned page has its
+    sections read instead (``_page_sections``). Fail-soft under the search
     timeout: the page keeps its indexed title and goes without the article."""
     if page is None or not page.article_id:
         return page
+    if len(page.section_ids) > 1:
+        return await _page_sections(page, site, query, budget)
     from dataclasses import replace
 
     from pocketpaw.paw_bar.concierge_fields import one_line
@@ -598,6 +748,209 @@ async def _with_page_article(page: PageContext | None, site: Any) -> PageContext
     return replace(page, title=title, summary=summary, chunk=chunk)
 
 
+def _page_chars(budget: int) -> int:
+    """The share of a turn's knowledge budget the visitor's page sections may
+    take: half of it, and never less than one whole item."""
+    return max(_ITEM_CHARS, budget // 2)
+
+
+async def _page_sections(page: PageContext, site: Any, query: str, budget: int) -> PageContext:
+    """A sectioned page's knowledge for this turn.
+
+    Reads up to ``_PAGE_SECTIONS_READ`` sections (``_read_sections``). The
+    sections that match the query (``_section_scores``: only words that set a
+    section apart count) go in, best first, while they fit
+    ``_page_chars(budget)``; when none matches, the page's first section goes in
+    alone. The first chosen is ``chunk`` (cut to one item if it is bigger), the
+    rest ``extra_chunks``. The <page> summary is the page's first readable
+    section's. A failed or timed-out read leaves the page without knowledge."""
+    from dataclasses import replace
+
+    scope = f"pocket:{getattr(site, 'pocket_id', '') or ''}"
+    found = await _read_sections(scope, page.section_ids, fallback_title=page.title)
+    if not found:
+        return page
+    scores = _section_scores(query, [text for _id, text, _s in found])
+    matched = sorted((i for i in range(len(found)) if scores[i] > 0), key=lambda i: -scores[i])
+    allowance = _page_chars(budget)
+    chosen: list[KnowledgeItem] = []
+    for i in matched or [0]:
+        article_id, text, _summary = found[i]
+        if not chosen:
+            text = _clip(text, _ITEM_CHARS)
+        elif len(text) > min(allowance, _ITEM_CHARS):
+            continue
+        allowance -= len(text)
+        chosen.append(KnowledgeItem(id=article_id, source=scope, text=text, score=1.0))
+    return replace(
+        page,
+        summary=found[0][2],
+        chunk=chosen[0],
+        extra_chunks=tuple(chosen[1:]),
+        page_matched=bool(matched),
+    )
+
+
+async def _read_sections(
+    scope: str, ids: Sequence[str], *, fallback_title: str = ""
+) -> list[tuple[str, str, str]]:
+    """``(id, "## title\\nbody", summary)`` for each of the first
+    ``_PAGE_SECTIONS_READ`` ``ids`` that ``kb show`` returns with a body, in the
+    given order. A few reads at a time, all under the search timeout; a section
+    that fails to read is skipped, and a timeout returns nothing."""
+    from pocketpaw.paw_bar.concierge_fields import one_line
+    from pocketpaw_ee.cloud.agents.knowledge import KnowledgeService
+    from pocketpaw_ee.cloud.chat.agent_service import _KB_SEARCH_TIMEOUT_SECONDS
+
+    gate = asyncio.Semaphore(_PAGE_READ_CONCURRENCY)
+
+    async def _read(article_id: str) -> Any:
+        async with gate:
+            return await KnowledgeService.get_article_for_scope(scope, article_id)
+
+    wanted = list(ids)[:_PAGE_SECTIONS_READ]
+    try:
+        read = await asyncio.wait_for(
+            asyncio.gather(*(_read(i) for i in wanted), return_exceptions=True),
+            timeout=_KB_SEARCH_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 — timeout: the turn goes on without these
+        logger.warning("concierge v2: could not read page sections in %s", scope)
+        return []
+    found: list[tuple[str, str, str]] = []
+    for article_id, article in zip(wanted, read, strict=True):
+        if not isinstance(article, dict):
+            continue
+        body = str(article.get("content") or article.get("summary") or "").strip()
+        if not body:
+            continue
+        heading = one_line(str(article.get("title") or "")) or fallback_title
+        summary = one_line(str(article.get("summary") or ""))[:_PAGE_SUMMARY_CHARS]
+        found.append((article_id, f"## {heading}\n{body}".strip(), summary))
+    return found
+
+
+def _message_terms(message: str, page: PageContext | None) -> set[str]:
+    """The visitor's own words worth matching (``_query_terms``), less the page
+    title's: the title rides in the search query, so it cannot say what the
+    visitor asked about."""
+    title = _query_terms(page.title) if page is not None else set()
+    return _query_terms(message) - title
+
+
+async def _with_page_siblings(
+    items: Sequence[KnowledgeItem],
+    site: Any,
+    page: PageContext | None,
+    *,
+    budget: int,
+    message: str = "",
+) -> tuple[list[KnowledgeItem], tuple[int, int] | None]:
+    """The KB hits with the lead hit's page filled in, and where the lead sits.
+
+    The lead is the first hit that is off the visitor's page and carries one of
+    the message's own words (``_message_terms``); a message with no such words
+    ("how much is this?") has no lead, and the visitor's page keeps first place
+    (``select_knowledge``). kb ranks by the whole query, page title included, so
+    on a sectioned page its rank alone would let the page's title win.
+
+    A section is found by the words it shares with the question, and a question
+    can miss the words of the section that answers it ("shoe sizes" against a
+    "Footwear" table, when every section of the size guide says "size"). So a
+    lead that is a section of a sectioned page brings that page's other
+    sections, read with ``_read_sections`` and inserted right after it in page
+    order, while they fit ``_page_chars(budget)`` together with the lead.
+
+    Returns ``(items, (start, end))``, ``items[start:end]`` being the lead and
+    its siblings, or ``(items, None)`` without a lead. Fail-soft: a failed read
+    leaves the lead alone."""
+    from pocketpaw_ee.sites.page_sections import index_sections
+
+    items = list(items)
+    terms = _message_terms(message, page)
+    if not terms:
+        return items, None
+    scope = f"pocket:{getattr(site, 'pocket_id', '') or ''}"
+    on_page: set[str] = set()
+    if page is not None and page.indexed:
+        on_page = set(page.section_ids or (page.article_id,))
+    lead = next(
+        (
+            n
+            for n, hit in enumerate(items)
+            if hit.source != "faq"
+            and not (hit.source == scope and hit.id in on_page)
+            and any(term in hit.text.lower() for term in terms)
+        ),
+        None,
+    )
+    if lead is None:
+        return items, None
+    hit = items[lead]
+    ids: list[str] = []
+    index = getattr(site, "kb_page_index", None) or {}
+    for entry in index.values() if isinstance(index, dict) and hit.source == scope else []:
+        sections = [s["id"] for s in index_sections(entry)]
+        if len(sections) > 1 and hit.id in sections:
+            ids = sections
+            break
+    present = {i.id for i in items if i.source == scope}
+    wanted = [i for i in ids if i not in present]
+    found = await _read_sections(scope, wanted) if wanted else []
+    allowance = _page_chars(budget) - len(hit.text)
+    siblings: list[KnowledgeItem] = []
+    for article_id, text, _summary in found:
+        if len(text) > min(allowance, _ITEM_CHARS):
+            continue
+        allowance -= len(text)
+        siblings.append(KnowledgeItem(id=article_id, source=scope, text=text, score=hit.score))
+    out = [*items[: lead + 1], *siblings, *items[lead + 1 :]]
+    return out, (lead, lead + 1 + len(siblings))
+
+
+_WORD_RE = re.compile(r"[^\W_]+")
+# Words too common in a question to say which section it is about.
+_QUERY_STOPWORDS = frozenset(
+    "the and for with this that what how are you your can does from have tell about "
+    "there which when where who why any all our get got need want please show give".split()
+)
+
+
+def _query_terms(query: str) -> set[str]:
+    """The query's words worth matching: lowercased, 3+ letters, stopwords out,
+    a plural's trailing "s" dropped so "sizes" finds "size"."""
+    terms = set()
+    for word in _WORD_RE.findall((query or "").lower()):
+        if len(word) < 3 or word in _QUERY_STOPWORDS:
+            continue
+        terms.add(word[:-1] if len(word) > 4 and word.endswith("s") else word)
+    return terms
+
+
+def _section_scores(query: str, texts: Sequence[str]) -> list[float]:
+    """Each text's match to ``query``: the sum, over the query terms it contains,
+    of log(1 + n / df), where df is how many of the n texts contain the term. A
+    term every text contains (the page title in each section's breadcrumb) sets
+    none apart and counts for nothing."""
+    import math
+
+    terms = _query_terms(query)
+    lowered = [t.lower() for t in texts]
+    n = len(texts)
+    df = {term: sum(term in t for t in lowered) for term in terms}
+    useful = [term for term in terms if 0 < df[term] < n]
+    return [sum(math.log(1 + n / df[term]) for term in useful if term in t) for t in lowered]
+
+
+def _clip(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` characters, at a line end when one falls
+    in the second half of the limit."""
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    return text[: cut if cut >= limit // 2 else limit]
+
+
 def _retrieval_query(
     message: str, history: Sequence[dict[str, str]], page: PageContext | None
 ) -> str:
@@ -623,12 +976,18 @@ def _source_items(
     listed by id with both empty, so no private file name leaves the server."""
     from urllib.parse import quote, urlsplit
 
+    from pocketpaw_ee.sites.page_sections import index_sections
+
     scope = f"pocket:{getattr(site, 'pocket_id', '') or ''}"
-    pages = {
-        str(entry["id"]): (key, str(entry.get("title") or "").strip())
-        for key, entry in (getattr(site, "kb_page_index", None) or {}).items()
-        if isinstance(entry, dict) and entry.get("id")
-    }
+    # Every article of every page: a sectioned page cites the section's own
+    # breadcrumb title and its heading's anchor; a one-article page its title.
+    pages: dict[str, tuple[str, str, str]] = {}
+    for key, entry in (getattr(site, "kb_page_index", None) or {}).items():
+        sections = index_sections(entry)
+        page_title = str(entry.get("title") or "").strip() if sections else ""
+        for section in sections:
+            title = section["title"].strip() if len(sections) > 1 else ""
+            pages.setdefault(section["id"], (key, title or page_title, section["anchor"]))
     base = str(getattr(site, "url", "") or "").strip().rstrip("/")
     if not base and page is not None:
         parts = urlsplit(page.url)
@@ -639,13 +998,14 @@ def _source_items(
         if hit is None or not base:
             out.append({"id": item.id, "title": "", "url": ""})
             continue
-        key, title = hit
+        key, title, anchor = hit
         heading = item.text.split("\n", 1)[0].removeprefix("## ").strip()
+        fragment = f"#{quote(anchor, safe=_PATH_SAFE)}" if anchor else ""
         out.append(
             {
                 "id": item.id,
                 "title": title or heading,
-                "url": f"{base}/{quote(key, safe=_PATH_SAFE)}",
+                "url": f"{base}/{quote(key, safe=_PATH_SAFE)}{fragment}",
             }
         )
     return out
@@ -659,7 +1019,7 @@ def _source_items(
 # a catalog name or the visitor cannot close a block early and write "outside" it.
 _BLOCK_TAG_RE = re.compile(
     r"<\s*/?\s*(knowledge|item|catalog|history|visitor-message|owner-settings|site-pages|"
-    r"page-tools|page)\b",
+    r"page-tools|store-menu|page)\b",
     re.IGNORECASE,
 )
 
@@ -668,42 +1028,98 @@ def _data(text: str) -> str:
     return _BLOCK_TAG_RE.sub(lambda m: "‹" + m.group(0)[1:], text or "")
 
 
-def _within_budget(items: Sequence[KnowledgeItem]) -> list[KnowledgeItem]:
-    """The leading items that fit ``_KNOWLEDGE_CHARS`` (~3,000 tokens), in order;
-    the first one that does not fit ends the list."""
+def _within_budget(
+    items: Sequence[KnowledgeItem], budget: int = _KNOWLEDGE_CHARS
+) -> list[KnowledgeItem]:
+    """The items that fit ``budget``, in order (rank order: the caller's), each
+    cut to min(``_ITEM_CHARS``, what is left). The top hits arrive whole; the
+    first that does not fit is cut to the remainder instead of dropped, and a
+    remainder under ``_MIN_ITEM_CHARS`` ends the list. Deterministic, and a
+    second pass over its own output changes nothing. (``_data`` keeps lengths:
+    it swaps one character for one.)"""
+    from dataclasses import replace
+
     kept: list[KnowledgeItem] = []
-    budget = _KNOWLEDGE_CHARS
+    remaining = budget
     for item in items:
-        size = len(_data(item.text))
-        if size > budget:
-            break
-        budget -= size
+        cap = min(_ITEM_CHARS, remaining)
+        if len(item.text) > cap:
+            if cap < _MIN_ITEM_CHARS:
+                break
+            item = replace(item, text=_clip(item.text, cap))
+        remaining -= len(item.text)
         kept.append(item)
     return kept
 
 
+def knowledge_chars(site: Any) -> int:
+    """The site's per-turn knowledge budget: ``Site.concierge_knowledge_chars``
+    clamped to its bounds, or the default when unset or not a number."""
+    from pocketpaw_ee.cloud.models.site import (
+        CONCIERGE_KNOWLEDGE_CHARS_DEFAULT,
+        CONCIERGE_KNOWLEDGE_CHARS_MAX,
+        CONCIERGE_KNOWLEDGE_CHARS_MIN,
+    )
+
+    value = getattr(site, "concierge_knowledge_chars", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return CONCIERGE_KNOWLEDGE_CHARS_DEFAULT
+    return max(CONCIERGE_KNOWLEDGE_CHARS_MIN, min(CONCIERGE_KNOWLEDGE_CHARS_MAX, value))
+
+
+def _top_k(budget: int) -> int:
+    """How many hits to search for a ``budget`` (see ``_TOP_K_ITEM_CHARS``)."""
+    return max(_TOP_K, min(_MAX_TOP_K, budget // _TOP_K_ITEM_CHARS))
+
+
 def select_knowledge(
-    items: Sequence[KnowledgeItem], page: PageContext | None = None
+    items: Sequence[KnowledgeItem],
+    page: PageContext | None = None,
+    *,
+    budget: int = _KNOWLEDGE_CHARS,
+    lead: tuple[int, int] | None = None,
 ) -> list[KnowledgeItem]:
-    """The knowledge a turn is given, cut to the budget: the owner's pinned FAQs
-    first (they are authoritative), then the visitor's page's own article (when
-    the page is indexed and its article was read), then the retrieved KB hits
-    without it. The prompt, the code-grounding check and the ``sources`` event all
-    read this one list, so a source is always something the model saw."""
-    chunk = page.chunk if page is not None else None
+    """The knowledge a turn is given, in this order, cut to ``budget``
+    (``knowledge_chars``, see ``_within_budget``):
+
+    1. the owner's pinned FAQs (they are authoritative);
+    2. on a sectioned visitor page with a ``lead`` (``_with_page_siblings``:
+       a hit off the page carrying the message's own words), the lead and its
+       page's other sections; then the visitor's page sections, only when they
+       matched the turn, in at most a quarter of the budget; then the other
+       hits, without the visitor page's own (unmatched) sections;
+    3. otherwise (no lead, a one-article page, no page) the visitor's page
+       article or sections, then the hits. A one-article page is at most a
+       quarter of the default budget and is what "how much is this?" on a
+       product page needs, so it keeps first place.
+
+    The prompt, the code-grounding check and the ``sources`` event all read
+    this one list, so a source is always something the model saw."""
+    page_items: list[KnowledgeItem] = []
+    if page is not None and page.chunk is not None:
+        page_items = [page.chunk, *page.extra_chunks]
     faqs = [i for i in items if i.source == "faq"]
-    ordered = faqs + ([chunk] if chunk is not None else [])
-    ordered += [
+    sectioned = page is not None and len(page.section_ids) > 1
+    if lead is None or not sectioned or not page_items:
+        seen = {(i.id, i.source) for i in page_items}
+        ordered = faqs + page_items
+        ordered += [i for i in items if i.source != "faq" and (i.id, i.source) not in seen]
+        return _within_budget(ordered, budget)
+    head = [i for i in items[lead[0] : lead[1]] if i.source != "faq"]
+    on_page = {(i.source, s) for i in page_items for s in page.section_ids}
+    page_part = _within_budget(page_items, budget // 4) if page.page_matched else []
+    taken = {(i.id, i.source) for i in head + page_part}
+    rest = [
         i
         for i in items
-        if i.source != "faq" and (chunk is None or (i.id, i.source) != (chunk.id, chunk.source))
+        if i.source != "faq" and (i.id, i.source) not in taken and (i.source, i.id) not in on_page
     ]
-    return _within_budget(ordered)
+    return _within_budget(faqs + head + page_part + rest, budget)
 
 
-def _knowledge_block(items: Sequence[KnowledgeItem]) -> str:
+def _knowledge_block(items: Sequence[KnowledgeItem], budget: int = _KNOWLEDGE_CHARS) -> str:
     lines = ["<knowledge>"]
-    for item in _within_budget(items):
+    for item in _within_budget(items, budget):
         text = _data(item.text)
         ident = html.escape(item.id, quote=True)
         source = html.escape(item.source, quote=True)
@@ -715,7 +1131,11 @@ def _knowledge_block(items: Sequence[KnowledgeItem]) -> str:
 
 
 def _catalog_and_actions_block(
-    widget: Any, catalog_items: Sequence[Any] = (), *, lead_capture: bool = False
+    widget: Any,
+    catalog_items: Sequence[Any] = (),
+    *,
+    lead_capture: bool = False,
+    profile: Any = None,
 ) -> str:
     """This turn's catalog items (``catalog_for_turn``) and the widget's declared
     actions, as data.
@@ -727,7 +1147,8 @@ def _catalog_and_actions_block(
     as plain data instead; the widget's own buttons and forms trigger them. Cards
     are taught by ``_cards_paragraph`` (the vendored paw-bar manifest). With
     ``lead_capture`` the block is written even with no catalog and no actions,
-    since the lead card is a card every such site can offer.
+    since the lead card is a card every such site can offer, and on the ripple
+    ``profile``, whose cards need no catalog.
     """
     from pocketpaw_ee.cloud.surface.handlers.concierge import _catalog_block
 
@@ -737,7 +1158,8 @@ def _catalog_and_actions_block(
         {"verb": a.verb, "policy": a.policy, "args": dict(a.args), "label": a.label}
         for a in (getattr(spec, "actions", None) or [])
     ]
-    if not catalog and not declared and not lead_capture:
+    ripple = getattr(profile, "name", "") == "ripple"
+    if not catalog and not declared and not lead_capture and not ripple:
         return ""
     parts = ["<catalog>"]
     products = _catalog_block(catalog)
@@ -756,13 +1178,370 @@ def _catalog_and_actions_block(
                 else "sent to the business for a person to approve"
             )
             parts.append(f"   - {a['verb']} ({label}): {behavior}.")
-    parts.append(_cards_paragraph(declared, has_catalog=bool(catalog), lead_capture=lead_capture))
+    parts.append(
+        _cards_paragraph(
+            declared, has_catalog=bool(catalog), lead_capture=lead_capture, profile=profile
+        )
+    )
     parts.append("</catalog>")
     return _data_block(parts)
 
 
+# One good ripple card, the last authoring rule: a fictional project status
+# summary (entity-detail with kpis and meta; tiles, a chart, a table, a timeline,
+# facts and a takeaway in its children). The ripple profile's validator must
+# accept it whole (pinned in tests/cloud/test_paw_bar_ripple_profile.py), and it
+# stays ASCII, link-free and clear of the landing's demo topics.
+_RIPPLE_EXAMPLE: dict[str, Any] = {
+    "ui": {
+        "type": "entity-detail",
+        "props": {
+            "eyebrow": "Project status",
+            "title": "Volunteer app rebuild",
+            "status": {"label": "At risk", "variant": "warning"},
+            "kpis": [
+                {"label": "Complete", "value": "64%", "delta": "+9 pts", "trend": "up"},
+                {"label": "Days to launch", "value": 21},
+            ],
+            "meta": [
+                {"label": "Lead", "value": "Sam O."},
+                {"label": "Launch", "value": "Nov 14"},
+            ],
+        },
+        "children": [
+            {
+                "type": "alert",
+                "props": {
+                    "variant": "warning",
+                    "title": "Mobile is 2 weeks behind",
+                    "description": "Older phones show layout bugs.",
+                },
+            },
+            {
+                "type": "grid",
+                "props": {"columns": "repeat(auto-fit, minmax(150px, 1fr))", "gap": 12},
+                "children": [
+                    {
+                        "type": "stat",
+                        "props": {
+                            "label": "Tasks closed",
+                            "value": 14,
+                            "delta": 4,
+                            "direction": "up-good",
+                        },
+                    },
+                    {
+                        "type": "stat",
+                        "props": {
+                            "label": "Open bugs",
+                            "value": 7,
+                            "delta": -3,
+                            "direction": "down-good",
+                        },
+                    },
+                    {
+                        "type": "stat",
+                        "props": {"label": "Review wait (days)", "value": 2.5, "format": "number"},
+                    },
+                ],
+            },
+            {
+                "type": "card",
+                "props": {"title": "Open tasks by week"},
+                "children": [
+                    {
+                        "type": "chart",
+                        "props": {
+                            "type": "line",
+                            "data": [
+                                {"label": f"W{i}", "value": v}
+                                for i, v in enumerate((52, 41, 25, 18), start=1)
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "type": "card",
+                "props": {"title": "Workstreams"},
+                "children": [
+                    {
+                        "type": "flex",
+                        "props": {"direction": "row", "gap": 8, "wrap": True},
+                        "children": [
+                            {"type": "badge", "props": {"text": t, "variant": v}}
+                            for t, v in (
+                                ("Design done", "success"),
+                                ("Mobile behind", "warning"),
+                                ("QA blocked", "destructive"),
+                            )
+                        ],
+                    },
+                    {
+                        "type": "table",
+                        "props": {
+                            "columns": [
+                                {"header": "Workstream", "accessorKey": "name"},
+                                {"header": "Owner", "accessorKey": "owner"},
+                                {"header": "Done", "accessorKey": "done"},
+                            ],
+                            "rows": [
+                                {"name": n, "owner": o, "done": d}
+                                for n, o, d in (
+                                    ("Design", "Ana", "100%"),
+                                    ("Mobile", "Raj", "40%"),
+                                    ("QA", "Kim", "20%"),
+                                )
+                            ],
+                        },
+                    },
+                ],
+            },
+            {
+                "type": "grid",
+                "props": {"columns": "repeat(auto-fit, minmax(260px, 1fr))", "gap": 12},
+                "children": [
+                    {
+                        "type": "card",
+                        "props": {"title": "Milestones"},
+                        "children": [
+                            {
+                                "type": "timeline",
+                                "props": {
+                                    "density": "compact",
+                                    "events": [
+                                        {
+                                            "date": "Sep 2",
+                                            "title": "Designs signed off",
+                                            "type": "success",
+                                        },
+                                        {
+                                            "date": "Oct 27",
+                                            "title": "Mobile beta",
+                                            "type": "warning",
+                                        },
+                                        {"date": "Nov 14", "title": "Launch"},
+                                    ],
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "type": "card",
+                        "props": {"title": "Facts"},
+                        "children": [
+                            {
+                                "type": "kv-table",
+                                "props": {
+                                    "rows": [
+                                        {"key": "Sprint length", "value": "2 weeks"},
+                                        {"key": "Platforms", "value": "Web and mobile"},
+                                    ]
+                                },
+                            }
+                        ],
+                    },
+                ],
+            },
+            {
+                "type": "callout",
+                "props": {
+                    "variant": "insight",
+                    "title": "Takeaway",
+                    "text": "Launch holds if mobile fixes land by Oct 27.",
+                },
+            },
+        ],
+    },
+    "state": {},
+}
+
+# The flow card the rules show (card_spec ``_flow_steps``): two pick steps the
+# browser runs with no model call, then one fixed chat message. Ripple's runner
+# hands the host only what each step's button emitted (``<flowId>_selection``,
+# ``<flowId>_formData``); the landing appends those answers to the message.
+_RIPPLE_FLOW_EXAMPLE: dict[str, Any] = {
+    "ui": {
+        "flowId": "trip_style",
+        "intent": "select",
+        "title": "What kind of trip?",
+        "ui": {
+            "type": "flex",
+            "children": [
+                {
+                    "type": "button",
+                    "props": {"label": "Food"},
+                    "on_click": {
+                        "action": "emit",
+                        "target": "flow.next",
+                        "value": {"selection": {"id": "food", "label": "Food"}},
+                    },
+                },
+                {
+                    "type": "button",
+                    "props": {"label": "Culture"},
+                    "on_click": {
+                        "action": "emit",
+                        "target": "flow.next",
+                        "value": {"selection": {"id": "culture", "label": "Culture"}},
+                    },
+                },
+            ],
+        },
+        "chain": {
+            "flowId": "trip_days",
+            "intent": "select",
+            "title": "How many days?",
+            "ui": {
+                "type": "flex",
+                "children": [
+                    {
+                        "type": "button",
+                        "props": {"label": "3 days"},
+                        "on_click": {
+                            "action": "emit",
+                            "target": "flow.submit",
+                            "value": {"selection": {"id": "3", "label": "3 days"}},
+                        },
+                    },
+                    {
+                        "type": "button",
+                        "props": {"label": "A week"},
+                        "on_click": {
+                            "action": "emit",
+                            "target": "flow.submit",
+                            "value": {"selection": {"id": "7", "label": "A week"}},
+                        },
+                    },
+                ],
+            },
+            "onComplete": {"kind": "chat", "message": "Plan a trip for me with these answers."},
+        },
+    },
+}
+# The ``ask`` host event the rules show: a click sends this text as the visitor.
+_RIPPLE_ASK: dict[str, Any] = {
+    "action": "emit",
+    "target": "ask",
+    "value": {"text": "Tell me more about the 5-day plan"},
+}
+
+# How to write a good Ripple card, ported from ripple's record-scenario system
+# prompt (the rules that hold for an answer in a chat card) and sized for the
+# ripple landing's chat column (about 720px, still readable at 360px). The
+# actions named are card_spec.RIPPLE_ACTIONS; the flow and ask rules carry
+# _RIPPLE_FLOW_EXAMPLE and _RIPPLE_ASK; the last line is _RIPPLE_EXAMPLE.
+_RIPPLE_RULES = (
+    "   Authoring rules:",
+    "   - Write every node's keys in this order: type, props, then bind and handlers, "
+    "then children. Seed state with the visitor's own numbers; keep numbers as numbers.",
+    "   - Make it interactive: bind inputs (number-input, slider, segmented, "
+    'switch, checkbox) to state with "bind": "{state.path}" and derive every output from '
+    'state with expressions, e.g. "{state.total / state.people}". Never hardcode a '
+    "copy of a state value: write state.items.length, not 4.",
+    "   - The only actions are set, toggle, push, remove, open, toast, validate, flow "
+    "(steps run in order) and branch (if, then, else), and emit of add_to_cart, "
+    "checkout, ask or, in a flow card, flow.next, flow.back and flow.submit (both "
+    "below). There is no api, navigate, confirm, delay or other action; one drops the "
+    "card, even as a step. A handler may be a list of actions.",
+    "   - Links and images use same-site paths only (/page, #section); never a full "
+    "URL, an expression or a CSS url().",
+    '   - Inside each (items "{state.list}"), bind a row field as "list.{index}.field" '
+    'and remove a row with {"action":"remove","target":"list","value":"{item}"}. '
+    'A data row never has a "type" naming a widget (text, number, date, image, '
+    'color, rating, icon): call that field "kind".',
+    "   - When a number depends on a list (its count or sum), keep it in state and "
+    "refresh it with a set whose value is the expression, e.g. "
+    "\"{state.items.sum('price')}\", after every push or remove and in the on_change "
+    "of any input that edits a row; refresh every number an edit feeds. Seed each "
+    "kept number with exactly what its expression gives for the seeded list.",
+    "   - Expressions: state paths, + - * / % with parentheses, comparisons, || and ??, "
+    "and a ternary only as the whole expression. There is no exponent operator (no ** "
+    "or ^) and no Math functions: write compound growth as repeated multiplication. "
+    "Division by zero gives 0.",
+    "   - Show a number with decimals (a division, a rate, money) in a stat (format "
+    '"number", "currency" or "percent"), never in a text template.',
+    "   - The card is about 720px wide on a desktop and must still read on a 360px "
+    'phone. For a row of tiles give the grid "columns": "repeat(auto-fit, '
+    'minmax(150px, 1fr))" so it wraps (260px for cards side by side); otherwise at '
+    "most 2 fixed grid columns. Put number inputs and sliders "
+    'on a full-width row or a 2-column grid, and set "wrap": true on a flex row with '
+    "more than two children. Aim for about 25 to 90 nodes when building from "
+    "primitives.",
+    "   - Match the card to the answer. When a data widget fits, the card is that one "
+    "widget holding only data. A trip "
+    "is an itinerary. A menu or an order is a menu-order: items by product_id from the "
+    "store-menu block (and name); the server fills the rest. A booking is a booking. "
+    "A meal plan is a meal-plan, one dish a recipe, a workout an "
+    "interval-workout, study cards a flashcard-deck. Savings or growth is a "
+    "growth-projection. Sales or report "
+    "data is an exec-dashboard with the raw rows. A choice "
+    "between options is a comparison-layout with a winner. Splitting a bill or a tip "
+    "between people is a bill-split (never seed its bind key in state). Each data "
+    "widget also "
+    "takes title? (a recipe: name), subtitle?, verdict? {text, status?: "
+    "good|warn|bad|info|neutral} (the answer in one sentence, at most 140 chars, "
+    "shown first) and, with money, currency? (an ISO code; never a symbol in a "
+    "number). Never write on_checkout or on_book, or an image. "
+    "A game is a memory-match, word-guess or quiz; tic-tac-toe or connect four "
+    "against the computer, a board-game (game, difficulty). Tracking habits is a "
+    "habit-tracker; a focus or pomodoro timer, a focus-timer. A small tool (a converter) "
+    "binds primitives to state as above. A summary of one thing (a person, an "
+    "account, a project) starts with entity-detail (title, status, kpis, meta). Any "
+    "other report leads with 3 or 4 stat tiles in a grid, then a chart, then a table. "
+    "Dated events go in a timeline, plain facts in a kv-table (its columns is 1 or 2), "
+    "a warning in an alert, the one takeaway in a callout. Put each section in a card "
+    "with a short title, the most important thing first, and colour status with "
+    "badge variants (success, warning, destructive, secondary, outline, default).",
+    "   - A 1-based position or counter never runs past its total.",
+    "   - Never attach a price, rating, opening hours or any other claim to a real "
+    "named business, venue or brand; a named real place costs 0, any cost goes on "
+    "a separate unnamed item with a round estimate. Placeholders are generic words, "
+    "never brands; no lorem ipsum.",
+    '   - Flow cards: when the visitor wants to be guided ("step by step", "ask me '
+    'first") or you need 2 to 4 of their choices to answer well (never '
+    "for a one-shot answer), write a flow: steps the browser runs with "
+    'no reply between them. The card\'s ui is step 1, {"flowId", "intent": "select", '
+    '"title", "ui": <node>, "chain": <step 2>}; "chain_map": {<option id>: <step>} '
+    "branches on the pick instead. Give every step its own snake_case flowId and a "
+    "clear title, and every input a clear label (they name the answers). At "
+    "most 8 steps, sharing the 400 nodes. A flow's top-level state never reaches its "
+    "steps: prefer option buttons, and put an input's starting value in its own props. "
+    "Only what a button emits is collected (a set into state is lost): an option "
+    'emits flow.next with value {"selection": {"id", "label"}}. Choice buttons: label '
+    "at most 18 chars, an optional plain description hint up to 60; icons are picked "
+    'from the label. Typed answers go out as value {"formData": {"days": '
+    '"{state.days}"}}. The last step\'s buttons emit flow.submit and it has '
+    '"onComplete": {"kind": "chat", "message": ...}: one fixed sentence (plain text, '
+    "no {expressions}, at most 500 characters). The browser appends each answer to it "
+    "and sends it as the visitor; answer that with the matching data widget (an "
+    "itinerary, a comparison-layout with a winner). A flow "
+    "(copy its shape): " + json.dumps(_RIPPLE_FLOW_EXAMPLE, separators=(",", ":")),
+    "   - A click can send a follow-up as the visitor: "
+    + json.dumps(_RIPPLE_ASK, separators=(",", ":"))
+    + " (plain text, at most 500 characters, no {expressions}) "
+    "on a button's on_click, or in a comparison item's actions list.",
+    "   - When a small picture or diagram helps explain (how something works, a "
+    "process), add an illustration. "
+    "Put SVG attributes in single quotes (no JSON escaping): "
+    "<svg viewBox='0 0 200 120'>...</svg>. Under 24,000 characters and 400 elements, "
+    "every dur 0.5s or more. No {expressions}; a gradient is fill='url(#id)'. The card "
+    "may be dark or light: write text with fill='currentColor', never dark or black. "
+    "Reuse a shape with use href='#id' (plain href, never xlink:href), at most 40 uses, "
+    "none pointing at a use. Up to 8 annotations [{id, label (at most 40 chars), note "
+    "(at most 280), target}] number notes on parts of the drawing: give each drawing "
+    "part an id and point at it.",
+    "   - A good summary card (copy its shape, never its data): "
+    + json.dumps(_RIPPLE_EXAMPLE, separators=(",", ":")),
+)
+
+
 def _cards_paragraph(
-    declared: Sequence[dict[str, Any]], *, has_catalog: bool = False, lead_capture: bool = False
+    declared: Sequence[dict[str, Any]],
+    *,
+    has_catalog: bool = False,
+    lead_capture: bool = False,
+    profile: Any = None,
 ) -> str:
     """How to write a ```pawbar-card: the compact manifest (one line per widget),
     the host events a button may emit, and each gated verb's form fields. With a
@@ -774,12 +1553,31 @@ def _cards_paragraph(
     prefilled from the conversation); without it, it says not to offer one.
 
     This replaces the legacy ``_form_block``, which teaches the old
-    ``{"kind": "form"}`` card and tells the model to call an action tool."""
+    ``{"kind": "form"}`` card and tells the model to call an action tool.
+
+    On the ripple ``profile`` the head is the Ripple catalog (compact) and
+    ``_RIPPLE_RULES`` instead, with no product-card line; the lead and gated
+    form lines are the same."""
     from pocketpaw_ee.paw_bar.card_spec import (
         MAX_SPEC_DEPTH,
         MAX_SPEC_NODES,
         compact_manifest,
     )
+
+    if getattr(profile, "name", "") == "ripple":
+        lines = [
+            "   Cards: when a small tool (a calculator, a planner, a checklist), a trip, a "
+            "menu, a booking, a game, a summary or a report answers the visitor better "
+            "than prose, write ONE "
+            "```pawbar-card block after a sentence or two of text, holding "
+            '{"ui": <node>, "state": {...}}. A node is {"type": ..., "props": {...}, '
+            '"bind"?: ..., "on_*"?: ..., "children"?: [...]}, at most '
+            f"{profile.max_nodes} nodes and {profile.max_depth} levels deep, built only "
+            "from these widgets:",
+            *(f"   {line}" for line in compact_manifest(profile).splitlines()),
+            *_RIPPLE_RULES,
+        ]
+        return "\n".join(lines + _form_lines(declared, lead_capture))
 
     lines = [
         "   Cards: to show products, a form or a short layout, write ONE ```pawbar-card "
@@ -801,6 +1599,13 @@ def _cards_paragraph(
             "When the <page> block names this page's product and the visitor asks "
             'about "this", answer about that product; a card for it is fine.'
         )
+    return "\n".join(lines + _form_lines(declared, lead_capture))
+
+
+def _form_lines(declared: Sequence[dict[str, Any]], lead_capture: bool) -> list[str]:
+    """The cards paragraph's form lines: the lead card (or that there is none)
+    and each gated verb's fields."""
+    lines: list[str] = []
     gated = [
         a
         for a in declared
@@ -825,7 +1630,7 @@ def _cards_paragraph(
         for a in gated:
             args = ", ".join(f"{name} ({typ})" for name, typ in a["args"].items())
             lines.append(f"     - {a['verb']}: {args}")
-    return "\n".join(lines)
+    return lines
 
 
 def _data_block(parts: list[str]) -> str:
@@ -1001,6 +1806,28 @@ def _page_block(page: PageContext) -> str:
     return _data_block(lines)
 
 
+def _store_menu_block(storefront: Any) -> str:
+    """The store's menu as data, one product per line (id: name, price, kind,
+    tags; no photos or options), plus today's date in the store's timezone when it
+    takes bookings, so the model can write product_ids and a preferred date."""
+    products = getattr(storefront, "products", None)
+    if not products:
+        return ""
+    lines = [
+        "<store-menu>",
+        f"The store's menu (prices in {storefront.currency}). Write these product ids in "
+        "a menu-order or comparison-layout; the server fills prices, photos and options.",
+    ]
+    for pid, item in products.items():
+        facts = [f"{item['price']:.2f}", item.get("kind", ""), *item.get("tags", ())]
+        lines.append(f"- {pid}: {item['name']}, {', '.join(f for f in facts if f)}")
+    if storefront.services:
+        zone = f" ({storefront.tz})" if storefront.tz else ""
+        lines.append(f"Bookings: today is {storefront.today}{zone}; slots for the next 7 days.")
+    lines.append("</store-menu>")
+    return _data_block(lines)
+
+
 def build_prompt(
     items: Sequence[KnowledgeItem],
     widget: Any,
@@ -1011,6 +1838,8 @@ def build_prompt(
     page: PageContext | None = None,
     catalog: Sequence[Any] = (),
     tools: Sequence[Any] = (),
+    profile: Any = None,
+    storefront: Any = None,
 ) -> str:
     """The user half of the request: the owner's guided fields (when any are set),
     then tagged data blocks in the PRD's fixed order (page, knowledge, catalog and
@@ -1020,19 +1849,29 @@ def build_prompt(
     the turn's ``catalog_for_turn`` items. A site with page actions on also gets
     the <site-pages> block, after the catalog, and, when ``tools`` (the request's
     ``page.tools``) has a tool ``action_spec.valid_tools`` keeps, <page-tools>
-    after it."""
+    after it. ``profile`` is the turn's ``ui_profile`` (else read from ``site``).
+    A ``storefront`` (``storefront_for_turn``) whose menu answered adds
+    <store-menu> right after the catalog."""
     from pocketpaw_ee.paw_bar.concierge_prompt import render_owner_block
 
     owner = render_owner_block(site) if site is not None else ""
     blocks = [owner] if owner else []
     if page is not None:
         blocks.append(_page_block(page))
-    blocks.append(_knowledge_block(items))
+    blocks.append(
+        _knowledge_block(items, knowledge_chars(site) if site is not None else _KNOWLEDGE_CHARS)
+    )
     catalog_block = _catalog_and_actions_block(
-        widget, catalog, lead_capture=site is not None and lead_capture_on(site)
+        widget,
+        catalog,
+        lead_capture=site is not None and lead_capture_on(site),
+        profile=profile or ui_profile(site),
     )
     if catalog_block:
         blocks.append(catalog_block)
+    menu = _store_menu_block(storefront)
+    if menu:
+        blocks.append(menu)
     if site is not None and page_actions_on(site):
         from pocketpaw_ee.paw_bar.action_spec import valid_tools
 
@@ -1076,17 +1915,158 @@ def _builder(settings: Any) -> Any:
 
 
 def _model_spec(settings: Any) -> str | None:
+    """The deployment's ``pawbar_concierge_model``; None leaves the backend default."""
     return (getattr(settings, "pawbar_concierge_model", "") or "").strip() or None
 
 
-def _build_model(settings: Any) -> Any:
-    """The pydantic_ai model for ``pawbar_concierge_model`` (the backend's own
-    resolution when that is empty). The test seam for the model call."""
-    return _builder(settings)._build_model(_model_spec(settings))
+# The concierge agent's model, memoized per (workspace, bound agent, site) so a
+# visitor turn does not read Mongo every time. An owner's change shows within the
+# TTL; ``forget_agent_model`` drops it at once.
+_AGENT_MODEL_TTL_S = 30.0
+_AGENT_MODEL_MEMO_MAX = 2_048
+_AGENT_MODELS: dict[tuple[str, str, str], tuple[float, str, str | None]] = {}
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def forget_agent_model(agent_id: str | None = None) -> None:
+    """Drop the memoized model of ``agent_id`` (every entry when None)."""
+    if agent_id is None:
+        _AGENT_MODELS.clear()
+        return
+    for key in [k for k, v in _AGENT_MODELS.items() if agent_id in (k[1], v[1])]:
+        _AGENT_MODELS.pop(key, None)
+
+
+def _agent_spec(settings: Any, backend: str, model: str) -> str | None:
+    """The pydantic_ai ``provider:model`` spec for an agent's backend + model, or
+    None when it has no model or names one pydantic_ai cannot serve.
+
+    A pydantic_ai agent's model already is a spec; a blank one is None. On any
+    other backend a blank model means that backend's default, so it resolves the
+    way the agent itself would run: the backend's settings field, then
+    ``resolve_model``'s provider chain (a Claude Agent SDK agent on anthropic
+    gets the anthropic default, never the deployment's concierge model). Any
+    other backend's model is
+    read the way the pool routes it (``route_model``'s ``_BACKEND_MODEL_ATTR``
+    table, legacy names resolved first) and paired with that backend's own
+    ``<backend>_provider`` setting; a backend without one (``deep_agents``)
+    carries ``provider:model`` in the model itself. Only a provider pydantic_ai
+    knows is accepted, so a Codex, opencode, Copilot or Google ADK model falls
+    back instead of reaching a provider that cannot serve it."""
+    from pocketpaw.agents.pydantic_ai import _KNOWN_PROVIDERS
+    from pocketpaw.agents.registry import _LEGACY_BACKENDS
+    from pocketpaw.llm.providers.base import (
+        _BACKEND_MODEL_ATTR,
+        _BACKEND_MODEL_ATTR_ALIASES,
+        resolve_model,
+    )
+
+    model = (model or "").strip()
+    backend = _LEGACY_BACKENDS.get(backend, backend)
+    if backend == "pydantic_ai":
+        return model or None
+    attr = _BACKEND_MODEL_ATTR.get(backend) or _BACKEND_MODEL_ATTR_ALIASES.get(backend)
+    if not attr:
+        return None
+    provider_field = attr.removesuffix("_model") + "_provider"
+    provider = str(getattr(settings, provider_field, "") or "").strip()
+    if not model:
+        model = str(getattr(settings, attr, "") or "").strip()
+        model = model or str(resolve_model(settings, backend, provider) or "").strip()
+    if not model:
+        return None
+    spec = f"{provider}:{model}" if provider else model
+    head, sep, _rest = spec.partition(":")
+    return spec if sep and head in _KNOWN_PROVIDERS else None
+
+
+async def _concierge_agent(workspace_id: str, bound: str, site_id: str) -> Any | None:
+    """The agent the concierge belongs to: the widget's bound agent when it is live
+    and in this workspace, else the site's dedicated ``concierge-<site_id>``."""
+    from pocketpaw_ee.cloud.agents import service as agents_service
+    from pocketpaw_ee.paw_bar.agent_provisioning import concierge_slug
+
+    if bound:
+        try:
+            agent = await agents_service.get(bound)
+        except Exception:  # noqa: BLE001 — a missing agent falls through
+            agent = None
+        if agent is not None and agent.workspace_id == workspace_id and not agent.disabled:
+            return agent
+    if not (workspace_id and site_id):
+        return None
+    try:
+        agent = await agents_service.get_by_slug(workspace_id, concierge_slug(site_id))
+    except Exception:  # noqa: BLE001 — no dedicated agent: the deployment model
+        return None
+    return None if agent.disabled else agent
+
+
+async def _turn_model_spec(settings: Any, widget: Any, site: Any, workspace_id: str) -> str | None:
+    """The spec this turn answers with: the concierge agent's model when pydantic_ai
+    can serve it, else ``pawbar_concierge_model``, else None (backend default).
+    Only the model is followed; the turn never runs on the agent's backend."""
+    bound = str(getattr(widget, "agent_id", "") or "").strip()
+    key = (workspace_id, bound, str(getattr(site, "id", "") or ""))
+    now = _now()
+    hit = _AGENT_MODELS.get(key)
+    if hit is not None and hit[0] > now:
+        agent_id, spec = hit[1], hit[2]
+    else:
+        agent_id, spec = "", None
+        try:
+            agent = await _concierge_agent(*key)
+            if agent is not None:
+                agent_id = str(agent.id)
+                spec = _agent_spec(settings, agent.config.backend, agent.config.model)
+        except Exception:  # noqa: BLE001 — the model choice never fails a turn
+            logger.debug("concierge v2: agent model lookup failed", exc_info=True)
+        if len(_AGENT_MODELS) >= _AGENT_MODEL_MEMO_MAX:
+            for stale in [k for k, v in _AGENT_MODELS.items() if v[0] <= now]:
+                _AGENT_MODELS.pop(stale, None)
+            if len(_AGENT_MODELS) >= _AGENT_MODEL_MEMO_MAX:
+                _AGENT_MODELS.clear()
+        _AGENT_MODELS[key] = (now + _AGENT_MODEL_TTL_S, agent_id, spec)
+    if spec:
+        logger.debug("concierge v2 model: %s from agent %s", spec, agent_id)
+        return spec
+    fallback = _model_spec(settings)
+    logger.debug(
+        "concierge v2 model: %s",
+        f"{fallback} from pawbar_concierge_model" if fallback else "the backend default",
+    )
+    return fallback
+
+
+async def answer_model(widget: Any, site: Any, workspace_id: str) -> str:
+    """The ``provider:model`` a v2 turn on ``widget`` answers with now, for the
+    owner's dashboard: the same resolution a turn makes. '' when it can't be told."""
+    settings = _settings()
+    try:
+        spec = await _turn_model_spec(settings, widget, site, workspace_id)
+        provider, model = _builder(settings)._parse_provider_model(spec)
+    except Exception:  # noqa: BLE001 — a label never fails the overview
+        logger.debug("concierge v2: answer model lookup failed", exc_info=True)
+        return ""
+    return f"{provider}:{model}" if provider and model else (model or "")
+
+
+def _build_model(settings: Any, spec: str | None) -> Any:
+    """The pydantic_ai model for ``spec`` (the backend's own resolution when None).
+    The test seam for the model call."""
+    return _builder(settings)._build_model(spec)
 
 
 def _model_settings(
-    settings: Any, workspace_id: str, *, tags: Sequence[str] = ()
+    settings: Any,
+    spec: str | None,
+    workspace_id: str,
+    *,
+    tags: Sequence[str] = (),
+    profile: Any = None,
 ) -> dict[str, Any]:
     """Fixed output cap, temperature and timeout, the optional reasoning effort,
     plus spend attribution on the proxy.
@@ -1097,11 +2077,16 @@ def _model_settings(
 
     ``tags`` (the site and the widget) ride LiteLLM's ``metadata.tags``, which the
     proxy stores on the spend row as ``request_tags``. Proxy providers only: a
-    direct provider rejects a body field it does not know."""
+    direct provider rejects a body field it does not know. The provider is the
+    one ``spec`` (this turn's resolved model) names. The ripple ``profile`` sets
+    the output cap to ``_RIPPLE_MAX_TOKENS``."""
     from pocketpaw.agents.spend_attribution import is_proxy_provider
 
+    max_tokens = int(getattr(settings, "pawbar_concierge_max_tokens", 0) or _MAX_TOKENS)
+    if getattr(profile, "name", "") == "ripple":
+        max_tokens = _RIPPLE_MAX_TOKENS
     out: dict[str, Any] = {
-        "max_tokens": int(getattr(settings, "pawbar_concierge_max_tokens", 0) or _MAX_TOKENS),
+        "max_tokens": max_tokens,
         "temperature": _TEMPERATURE,
         "timeout": _PROVIDER_TIMEOUT_S,
     }
@@ -1112,7 +2097,7 @@ def _model_settings(
     if effort:
         out["openai_reasoning_effort"] = effort
     try:
-        provider, _model = _builder(settings)._parse_provider_model(_model_spec(settings))
+        provider, _model = _builder(settings)._parse_provider_model(spec)
     except Exception:  # noqa: BLE001 — attribution must never break the reply
         provider = ""
     if workspace_id and is_proxy_provider(provider):
@@ -1122,13 +2107,16 @@ def _model_settings(
     return out
 
 
-def _usage(settings: Any, result: Any) -> dict[str, Any]:
-    """The run's usage in the shape the meter reads (the backend's own builder)."""
+def _usage(settings: Any, result: Any, spec: str | None) -> dict[str, Any]:
+    """The run's usage in the shape the meter reads (the backend's own builder),
+    priced as the model the response names, else the model ``spec`` resolved to."""
     try:
         run_usage = result.usage
         if callable(run_usage):
             run_usage = run_usage()
         model_name = getattr(getattr(result, "response", None), "model_name", None)
+        if not model_name:
+            model_name = _builder(settings)._parse_provider_model(spec)[1] or None
         event = _builder(settings)._usage_event_from(run_usage, model_name=model_name)
         usage = dict(event.metadata or {})
     except Exception:  # noqa: BLE001 — usage is bookkeeping, never the reply
@@ -1182,6 +2170,50 @@ def is_grounded_code(body: str, knowledge: Sequence[KnowledgeItem]) -> bool:
     return found * 100 >= _GROUNDED_PERCENT * len(lines)
 
 
+@dataclass(frozen=True)
+class CardEvent:
+    """A ``card.*`` SSE frame from a ``stream_cards`` filter. ``text`` is what the
+    transcript keeps for it: the validated fence on ``card.final``, else ""."""
+
+    event: str
+    data: dict[str, Any]
+    text: str = ""
+
+
+_CARD_HEAD = f"{_TICKS}{_CARD_LANG}\n"
+# A line of visible text that starts like a card spec: stripped up to its fence.
+_BARE_SPEC = '{"ui":'
+
+
+def _bare_spec_at(text: str, line_start: bool) -> int:
+    """Where a line of ``text`` starts with ``_BARE_SPEC``, or -1. ``line_start``:
+    the text before ``text`` ended a line."""
+    if line_start and text.startswith(_BARE_SPEC):
+        return 0
+    i = text.find("\n" + _BARE_SPEC)
+    return -1 if i == -1 else i + 1
+
+
+def _bare_spec_held(text: str, line_start: bool) -> int:
+    """How many trailing chars of ``text`` start a line the way ``_BARE_SPEC``
+    does, so the next chunk decides whether they are a spec."""
+    s = text.rfind("\n") + 1
+    tail = text[s:] if s or line_start else ""
+    return len(tail) if tail and _BARE_SPEC.startswith(tail) else 0
+
+
+def _card_object(fence: str | None) -> dict[str, Any] | None:
+    """The ``{ui, state?}`` object inside a fence ``render_card`` passed, or None
+    when it is not one (a legacy card, passed through or repriced)."""
+    if not fence:
+        return None
+    try:
+        card = json.loads(fence[len(_CARD_HEAD) : -len(_TICKS)])
+    except ValueError:
+        return None
+    return card if isinstance(card, dict) and "ui" in card else None
+
+
 class FenceFilter:
     """Holds every ``` fence in a streamed reply until it closes, then decides.
 
@@ -1207,6 +2239,23 @@ class FenceFilter:
     next ``` closes it. A ``` that closes on its own line is a code span and gets
     the fixed line too. Text outside fences streams straight through; only up to
     two trailing backticks are held, in case the next chunk completes a marker.
+
+    A model sometimes abandons a card and writes it again. Inside a card body
+    still in an open JSON string (no card can end there), ```pawbar-card is that
+    restart, not a close: the partial card is dropped and a new one opens (its
+    ``card.rejected`` reason is "restarted" when streaming). A card fence that
+    did close and is followed straight by ``pawbar-card`` reopens as a new card.
+    Last line of defence: a text line starting with ``{"ui":`` is never shown;
+    it and everything up to the next ``` are dropped.
+
+    With ``stream_cards`` (the "ripple" profile) a card fence is not held: its
+    opening line yields ``CardEvent("card.start")``, its body ``card.delta``s as it
+    arrives (the same backtick hold), and its close ``card.final`` with the
+    rendered ``{ui, state?}`` object, or ``card.rejected`` ("invalid"; "truncated"
+    from ``close()`` for a fence still open; "restarted", above). Before each delta the body is
+    checked: past ``max_chars``, or with a string ``card_spec.PartialScan`` says
+    the card cannot pass, it is rejected ("invalid") at once and the rest of its
+    fence swallowed, unbuffered. Card ids run c1, c2... per filter.
     """
 
     def __init__(
@@ -1220,7 +2269,28 @@ class FenceFilter:
         lookup: Any = None,
         lead_capture: bool = False,
         action: Any = None,
+        profile: Any = None,
+        stream_cards: bool = False,
+        storefront: Any = None,
     ) -> None:
+        from pocketpaw_ee.paw_bar.card_spec import PAWBAR_PROFILE
+
+        # The turn's concierge_store.StoreData (None: no store); fills store widgets.
+        self._storefront = storefront
+        self._stream_cards = stream_cards is True
+        self._cards = 0
+        self._card_id = ""  # the open streamed card, "" when none
+        self._parts: list[str] = []  # its body so far, as sent in card.delta
+        self._size = 0  # their total length
+        self._partial: Any = None  # its card_spec.PartialScan
+        self._swallow = False  # a rejected card's fence is still open
+        self._in_str = self._esc = False  # the open card's body is mid JSON string
+        self._reopen = False  # a card fence just closed; "pawbar-card" next reopens
+        self._spec = False  # dropping a bare {"ui": line up to the next fence
+        self._line_start = True  # the text emitted so far ends a line
+
+        # The site's card_spec.CardProfile; every card is checked against it.
+        self._profile = profile or PAWBAR_PROFILE
         self._catalog = list(catalog or ())
         self._render_action = action
         self._action_seen = False
@@ -1237,20 +2307,22 @@ class FenceFilter:
         self._buf = ""
         self._tag = ""
 
-    def feed(self, chunk: str) -> list[str]:
-        """The text to emit for ``chunk``, cards hydrated from ``catalog``."""
-        out = [p if isinstance(p, str) else self._finish(*p) for p in self._scan(chunk)]
+    def feed(self, chunk: str) -> list[Any]:
+        """The text (and, streaming cards, ``CardEvent``s) to emit for ``chunk``,
+        cards hydrated from ``catalog``."""
+        out = [self._finish(*p) if isinstance(p, tuple) else p for p in self._scan(chunk)]
         return [piece for piece in out if piece]
 
-    async def afeed(self, chunk: str) -> list[str]:
+    async def afeed(self, chunk: str) -> list[Any]:
         """``feed``, with each card hydrated through ``lookup`` when one is set."""
-        out: list[str] = []
+        out: list[Any] = []
         for piece in self._scan(chunk):
-            out.append(piece if isinstance(piece, str) else await self._afinish(*piece))
+            out.append(await self._afinish(*piece) if isinstance(piece, tuple) else piece)
         return [piece for piece in out if piece]
 
     def _scan(self, chunk: str) -> list[Any]:
-        """Text pieces and closed fences (``(tag, body)``), in order."""
+        """Text pieces, ``CardEvent``s and closed fences (``(tag, body)``, plus the
+        card id for a streamed card), in order."""
         out: list[Any] = []
         data = chunk or ""
         while True:
@@ -1259,14 +2331,38 @@ class FenceFilter:
             text, self._buf = self._buf + data, ""
             data = ""
             if self._mode == "text":
+                if self._reopen:
+                    head = text[: len(_CARD_LANG)]
+                    if len(head) < len(_CARD_LANG) and _CARD_LANG.startswith(head):
+                        self._buf = text
+                        break
+                    self._reopen = False
+                    if head == _CARD_LANG:
+                        self._mode, data = "tag", text
+                        continue
+                if self._spec:
+                    j = text.find(_TICKS)
+                    if j == -1:
+                        self._buf = text[-2:]
+                        break
+                    self._spec, data = False, text[j + len(_TICKS) :]
+                    continue
                 i = text.find(_TICKS)
+                k = _bare_spec_at(text if i == -1 else text[:i], self._line_start)
+                if k != -1:
+                    out.append(self._shown(text[:k]))
+                    self._spec, data = True, text[k:]
+                    continue
                 if i == -1:
-                    held = len(text) - len(text.rstrip("`"))
-                    out.append(text[: len(text) - held])
+                    held = max(
+                        len(text) - len(text.rstrip("`")), _bare_spec_held(text, self._line_start)
+                    )
+                    out.append(self._shown(text[: len(text) - held]))
                     self._buf = text[len(text) - held :]
                     break
-                out.append(text[:i])
+                out.append(self._shown(text[:i]))
                 self._mode, data = "tag", text[i + len(_TICKS) :]
+                self._line_start = False
             elif self._mode == "tag":
                 newline, ticks = text.find("\n", start), text.find(_TICKS, start)
                 if ticks != -1 and (newline == -1 or ticks < newline):
@@ -1278,6 +2374,49 @@ class FenceFilter:
                 else:
                     self._tag = text[:newline].strip()
                     self._mode, data = "body", text[newline + 1 :]
+                    if self._stream_cards and self._tag == _CARD_LANG:
+                        from pocketpaw_ee.paw_bar.card_spec import PartialScan
+
+                        self._cards += 1
+                        self._card_id = f"c{self._cards}"
+                        self._parts, self._size = [], 0
+                        self._in_str = self._esc = False
+                        self._partial = PartialScan(self._profile)
+                        out.append(CardEvent("card.start", {"card_id": self._card_id}))
+            elif self._card_id or self._swallow:
+                # A streamed card: _buf holds at most two trailing backticks (the
+                # sent body is in _parts), so a piece costs O(piece). The piece
+                # goes out as it comes, checked first; a card sure to fail is
+                # rejected at once and swallowed to its close.
+                j = text.find(_TICKS)
+                held = 0 if j != -1 else 2 if text.endswith("``") else int(text.endswith("`"))
+                end = j if j != -1 else len(text) - held
+                if self._card_id and end:
+                    out.append(self._card_piece(text[:end]))
+                if j == -1:
+                    self._buf = text[end:] if self._card_id else text[-2:]
+                    break
+                after = text[j + len(_TICKS) :]
+                if self._card_id and self._in_str:
+                    # Mid JSON string no card can end: ```pawbar-card here is the
+                    # model starting the card over. Hold until that is known.
+                    head = after[: len(_CARD_LANG)]
+                    if _CARD_LANG.startswith(head):
+                        if len(head) < len(_CARD_LANG):
+                            self._buf = text[j:]
+                            break
+                        out.append(
+                            CardEvent(
+                                "card.rejected", {"card_id": self._card_id, "reason": "restarted"}
+                            )
+                        )
+                        self._card_id, self._parts = "", []
+                        self._mode, data = "tag", after
+                        continue
+                if self._card_id:
+                    out.append((self._tag, "".join(self._parts), self._card_id))
+                self._card_id, self._swallow, self._parts = "", False, []
+                self._mode, data, self._reopen = "text", after, True
             else:
                 j = text.find(_TICKS, start)
                 if j == -1:
@@ -1285,34 +2424,97 @@ class FenceFilter:
                     break
                 out.append((self._tag, text[:j]))
                 self._mode, data = "text", text[j + len(_TICKS) :]
+                self._reopen = self._tag == _CARD_LANG
         return out
 
-    def close(self) -> list[str]:
-        held = self._buf if self._mode == "text" else ""
-        self._mode, self._buf, self._tag = "text", "", ""
-        return [held] if held else []
+    def _shown(self, piece: str) -> str:
+        """``piece`` as visible text, noting whether it ends a line."""
+        if piece:
+            self._line_start = piece.endswith("\n")
+        return piece
 
-    async def _afinish(self, tag: str, body: str) -> str:
+    def _track_strings(self, piece: str) -> None:
+        """Follows whether the open card's body is inside a JSON string."""
+        in_str, esc = self._in_str, self._esc
+        for ch in piece:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = in_str
+            elif ch == '"':
+                in_str = not in_str
+        self._in_str, self._esc = in_str, esc
+
+    def _card_piece(self, piece: str) -> CardEvent:
+        """The streaming card's next body piece as a ``card.delta``, or
+        ``card.rejected`` "invalid" once the card is sure to fail: its raw body
+        past the profile's ``max_chars`` (``render_card`` folds CRLF and trailing
+        blanks before measuring; a model sends neither) or a definite string
+        violation (``card_spec.PartialScan``). A rejected card's fence is then
+        swallowed, unbuffered."""
+        card_id = self._card_id
+        self._size += len(piece)
+        if self._size > self._profile.max_chars or self._partial.feed(piece):
+            self._card_id, self._swallow, self._parts = "", True, []
+            return CardEvent("card.rejected", {"card_id": card_id, "reason": "invalid"})
+        self._parts.append(piece)
+        self._track_strings(piece)
+        return CardEvent("card.delta", {"card_id": card_id, "text": piece})
+
+    def close(self) -> list[Any]:
+        # A held "pawbar-ca..." after a card, or a bare spec line, is never shown.
+        held = self._buf if self._mode == "text" and not (self._reopen or self._spec) else ""
+        self._reopen = self._spec = False
+        out: list[Any] = [held] if held else []
+        if self._card_id:
+            out.append(
+                CardEvent("card.rejected", {"card_id": self._card_id, "reason": "truncated"})
+            )
+        self._mode, self._buf, self._tag, self._card_id = "text", "", "", ""
+        self._swallow, self._parts = False, []
+        return out
+
+    async def _afinish(self, tag: str, body: str, card_id: str = "") -> Any:
         if tag != _CARD_LANG or self._lookup is None:
-            return self._finish(tag, body)
+            return self._finish(tag, body, card_id)
         from pocketpaw_ee.paw_bar.card_spec import card_ids, render_card
 
-        ids = card_ids(body)
+        ids = card_ids(body, self._profile)
         try:
             items = list(await self._lookup(ids)) if ids else []
         except Exception:  # noqa: BLE001 — an unreadable catalog drops the card
             logger.warning("concierge: catalog lookup for a card failed", exc_info=True)
-            return ""
-        return self._noted(
-            body, render_card(body, items, verbs=self._verbs, lead_capture=self._lead_capture)
+            return self._carded(body, None, card_id)
+        return self._carded(
+            body,
+            render_card(
+                body,
+                items,
+                verbs=self._verbs,
+                lead_capture=self._lead_capture,
+                profile=self._profile,
+                storefront=self._storefront,
+            ),
+            card_id,
         )
+
+    def _carded(self, body: str, card: str | None, card_id: str) -> Any:
+        """``_noted``, or for a streamed card (``card_id``) its closing CardEvent:
+        ``card.final`` with the card object, else ``card.rejected`` "invalid"."""
+        if not card_id:
+            return self._noted(body, card)
+        obj = _card_object(card)
+        if obj is None:
+            return CardEvent("card.rejected", {"card_id": card_id, "reason": "invalid"})
+        fence = self._noted(body, card)
+        return CardEvent("card.final", {"card_id": card_id, "card": obj}, fence)
 
     def _noted(self, body: str, card: str | None) -> str:
         """The rendered card ("" when dropped), noting a lead card that passed."""
         if card and self._lead_capture and not self.lead_card:
             from pocketpaw_ee.paw_bar.card_spec import has_lead_form
 
-            self.lead_card = has_lead_form(body)
+            self.lead_card = has_lead_form(body, self._profile)
         return card or ""
 
     def _take_action(self, body: str) -> str:
@@ -1328,17 +2530,23 @@ class FenceFilter:
                 logger.warning("concierge: pawbar-action validation failed", exc_info=True)
         return ""
 
-    def _finish(self, tag: str, body: str) -> str:
+    def _finish(self, tag: str, body: str, card_id: str = "") -> Any:
         if tag == _ACTION_LANG:
             return self._take_action(body)
         if tag == _CARD_LANG:
             from pocketpaw_ee.paw_bar.card_spec import render_card
 
-            return self._noted(
+            return self._carded(
                 body,
                 render_card(
-                    body, self._catalog, verbs=self._verbs, lead_capture=self._lead_capture
+                    body,
+                    self._catalog,
+                    verbs=self._verbs,
+                    lead_capture=self._lead_capture,
+                    profile=self._profile,
+                    storefront=self._storefront,
                 ),
+                card_id,
             )
         if (
             self._allow_doc_code
@@ -1399,11 +2607,15 @@ def _fence_filter_for(
     doc_code_chars: int = _DOC_CODE_CHARS,
     lead_capture: bool = False,
     action: Any = None,
+    profile: Any = None,
+    stream_cards: bool = False,
+    storefront: Any = None,
 ) -> FenceFilter:
     """A filter hydrating cards from this widget's catalog in ``store`` and its
     declared verbs, and grounding code in ``knowledge`` when the site allows
     documentation code. No store (or no widget id) hydrates nothing. ``action``
-    is the page-action validator, None when the site has page actions off."""
+    is the page-action validator, None when the site has page actions off.
+    ``storefront`` (``storefront_for_turn``) fills the ripple store widgets."""
     spec = getattr(widget, "spec", None)
     widget_id = str(getattr(widget, "id", "") or "")
     lookup = None
@@ -1420,6 +2632,9 @@ def _fence_filter_for(
         lookup=lookup,
         lead_capture=lead_capture,
         action=action,
+        profile=profile,
+        stream_cards=stream_cards,
+        storefront=storefront,
     )
 
 
@@ -1466,12 +2681,23 @@ async def site_spend_today_usd(
     return sum(resolve_cost(usage, at=at).cost_usd for usage, at in rows)
 
 
-async def _over_spend_cap(settings: Any, workspace_id: str, pocket_id: str) -> bool:
-    """Whether the site is at or past today's cap. 0 means no cap.
+async def _over_spend_cap(
+    settings: Any, workspace_id: str, pocket_id: str, site: Any = None
+) -> bool:
+    """Whether the site is at or past today's cap. The global cap, where 0 means
+    no cap; a site's own ``concierge_daily_spend_cap`` (0 pauses it) can only
+    lower it, unless the site is an ops site (``is_ops_site``), whose own cap
+    replaces it.
 
     Fails OPEN, as the conversation quota does: a lost read must not silence a
     site that has paid for its concierge. The next turn reads again."""
+    own = getattr(site, "concierge_daily_spend_cap", None)
     cap = float(settings.pawbar_concierge_daily_spend_cap)
+    if isinstance(own, int | float) and not isinstance(own, bool):
+        if own <= 0:
+            return True
+        lowers = cap > 0 and not is_ops_site(site, settings)
+        cap = min(float(own), cap) if lowers else float(own)
     if cap <= 0:
         return False
     try:
@@ -1529,6 +2755,16 @@ def _hit_output_cap(exc: BaseException) -> bool:
     from pydantic_ai.exceptions import UnexpectedModelBehavior
 
     return isinstance(exc, UnexpectedModelBehavior) and "token limit" in str(exc).lower()
+
+
+def _piece_frame(piece: Any) -> tuple[str, bytes]:
+    """(what the transcript keeps, the SSE frame) for one ``FenceFilter`` piece:
+    text is a ``chunk``, a ``CardEvent`` its own ``card.*`` frame."""
+    from pocketpaw_ee.paw_bar.router import _sse
+
+    if isinstance(piece, CardEvent):
+        return piece.text, _sse(piece.event, piece.data)
+    return piece, _sse("chunk", {"content": piece, "type": "text"})
 
 
 async def degrade_reply(widget: Any, reason: str) -> AsyncIterator[bytes]:
@@ -1591,7 +2827,9 @@ async def run_concierge_v2(
     check; anything malformed is no tools, never a failed turn.
 
     Frames, in order: ``message.persisted`` {run_id, client_message_id}; one
-    ``chunk`` {content, type:"text"} per streamed delta; at most one ``sources``;
+    ``chunk`` {content, type:"text"} per streamed delta (on a "ripple" site each
+    card is its own ``card.*`` frames instead, in stream order: see
+    ``FenceFilter``); at most one ``sources``;
     then ``stream_end`` {assistant_message_id: None, cancelled: False}. A
     transient provider failure before any text is retried once; a failure that
     stands ends with ``degrade_reply`` (the ``unavailable`` frame, reason
@@ -1612,7 +2850,8 @@ async def run_concierge_v2(
     from pocketpaw_ee.paw_bar.router import _sse
 
     settings = _settings()
-    if await _over_spend_cap(settings, workspace_id, pocket_id):
+    profile = ui_profile(site, settings)
+    if await _over_spend_cap(settings, workspace_id, pocket_id, site):
         from pocketpaw_ee.paw_bar.notify import notify_spend_cap_reached
 
         await notify_spend_cap_reached(
@@ -1668,6 +2907,9 @@ async def run_concierge_v2(
     yield _sse("message.persisted", {"run_id": run_id, "client_message_id": client_message_id})
 
     full_text = ""
+    # Whether the visitor has seen anything (text or a card frame): no retry after.
+    shown = False
+    fences: FenceFilter | None = None
     # The site and widget ride the usage the meter prices, whatever the outcome.
     spend_tags = {"site_id": site_id, "widget_id": widget_id}
     usage: dict[str, Any] = {"backend": _BACKEND, **spend_tags}
@@ -1681,14 +2923,22 @@ async def run_concierge_v2(
         page_ctx = resolve_page(widget, page, site=site)
         page_ctx = await with_page_product(page_ctx, widget, store)
         query = _retrieval_query(message, history, page_ctx)
+        budget = knowledge_chars(site)
         # The search and the page's own article are two kb reads, and the catalog
         # a SQLite one; run them together.
-        retrieved, page_ctx, catalog = await asyncio.gather(
-            retrieve(site, query, agent_id=agent_id or None),
-            _with_page_article(page_ctx, site),
+        # The model the owner picked on the concierge agent rides along (memoized).
+        # The ripple store (menu, services, slots) rides along, cached per site.
+        retrieved, page_ctx, catalog, model_spec, storefront = await asyncio.gather(
+            retrieve(site, query, agent_id=agent_id or None, k=_top_k(budget)),
+            _with_page_article(page_ctx, site, query=query, budget=budget),
             catalog_for_turn(store, widget, query, page_ctx),
+            _turn_model_spec(settings, widget, site, workspace_id),
+            storefront_for_turn(site, settings),
         )
-        items = select_knowledge(retrieved, page_ctx)
+        retrieved, lead = await _with_page_siblings(
+            retrieved, site, page_ctx, budget=budget, message=message
+        )
+        items = select_knowledge(retrieved, page_ctx, budget=budget, lead=lead)
         declared = _declared_tools(site, tools, page_ctx)
         prompt = build_prompt(
             items,
@@ -1699,14 +2949,16 @@ async def run_concierge_v2(
             page=page_ctx,
             catalog=catalog,
             tools=declared,
+            profile=profile,
+            storefront=storefront,
         )
-        model = _build_model(settings)
+        model = _build_model(settings, model_spec)
         # NO tools, NO toolsets, NO capabilities: the zero-tools invariant (Global
         # Constraint 3), asserted in tests and guarded by a mutation plan. The frame
-        # is one of four constants; the owner's doc-code and lead-capture switches
+        # is one of nine constants; the ripple profile and the owner's switches
         # only pick which.
         allow_doc_code = _allows_doc_code(site)
-        frame = frame_for(site)
+        frame = frame_for(site, settings)
         agent = Agent(model, instructions=frame, output_type=str)
 
         # What the model writes is filtered before the visitor (or the owner's
@@ -1724,11 +2976,16 @@ async def run_concierge_v2(
                 ),
                 lead_capture=lead_capture_on(site),
                 action=_action_renderer(site, page_ctx, catalog, declared),
+                profile=profile,
+                stream_cards=profile.name == "ripple",
+                storefront=storefront,
             )
 
         # Spend attribution: the proxy's spend row names the site and the widget.
         tags = [f"pawbar_site:{site_id}", f"pawbar_widget:{widget_id}"]
-        model_settings = _model_settings(settings, workspace_id, tags=tags)
+        model_settings = _model_settings(
+            settings, model_spec, workspace_id, tags=tags, profile=profile
+        )
         # A visitor asking for a person always leaves with a route to the team,
         # whatever the model does (``contact_route``).
         contact = is_contact_request(message)
@@ -1745,12 +3002,13 @@ async def run_concierge_v2(
                 async with agent.run_stream(prompt, model_settings=model_settings) as result:
                     async for delta in result.stream_text(delta=True, debounce_by=None):
                         for piece in await fences.afeed(delta or ""):
-                            full_text += piece
-                            yield _sse("chunk", {"content": piece, "type": "text"})
-                    usage = {**_usage(settings, result), **spend_tags}
+                            text, frame = _piece_frame(piece)
+                            full_text, shown = full_text + text, True
+                            yield frame
+                    usage = {**_usage(settings, result, model_spec), **spend_tags}
                 break
             except Exception as exc:
-                if attempt > 1 or full_text or not _is_transient(exc):
+                if attempt > 1 or shown or not _is_transient(exc):
                     if not contact:
                         if _hit_output_cap(exc):
                             logger.warning(
@@ -1772,8 +3030,9 @@ async def run_concierge_v2(
                 )
                 await asyncio.sleep(_RETRY_BACKOFF_S)
         for piece in fences.close():
-            full_text += piece
-            yield _sse("chunk", {"content": piece, "type": "text"})
+            text, frame = _piece_frame(piece)
+            full_text += text
+            yield frame
         if contact and not fences.lead_card:
             for piece in contact_reply(
                 lead_capture=lead_capture_on(site), said_something=bool(full_text.strip())
@@ -1812,7 +3071,11 @@ async def run_concierge_v2(
             usage=usage,
         )
         # The ``unavailable`` frame, never an error frame and never a handoff.
-        # What already streamed stays on screen; the frame follows it.
+        # What already streamed stays on screen; the frame follows it, after the
+        # rejection of a card still streaming (never its held text).
+        for piece in fences.close() if fences is not None else ():
+            if isinstance(piece, CardEvent):
+                yield _sse(piece.event, piece.data)
         async for frame in degrade_reply(widget, reason):
             yield frame
     finally:
@@ -1830,6 +3093,7 @@ async def run_concierge_v2(
 
 __all__ = [
     "CODE_REPLACEMENT",
+    "CardEvent",
     "DEGRADE_REASONS",
     "FRAME",
     "FRAME_ACTIONS",
@@ -1843,6 +3107,7 @@ __all__ = [
     "lead_capture_on",
     "page_actions_on",
     "FRAME_DOC_CODE",
+    "FRAME_DEMO",
     "FenceFilter",
     "KnowledgeItem",
     "PageContext",
