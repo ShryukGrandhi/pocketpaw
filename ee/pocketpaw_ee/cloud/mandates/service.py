@@ -28,7 +28,9 @@
 # The BACKLOG (``_backlog``): a sighting stays open until a task citing it lands
 # (the mandate's run rows joined to the plan tasks' evidence refs). The shift
 # trigger persists what it finds resolved (``resolved_by_run``), since the runs
-# list only reaches the newest actions. The detail's ``line`` block and the
+# list only reaches the newest actions. Each open entry carries its full text's
+# ``Depends on:`` line; the trigger adds the named issues' states from one cached
+# ``patrols.issue_states`` read. The detail's ``line`` block and the
 # foreman's THE LINE read git (``belt.executor.line_status`` / ``line_merged``).
 #
 # System/executor reads (no Beanie leaks out): repo_for_mandate,
@@ -37,8 +39,9 @@
 # resume), executor_revalidate, mark_shift, has_continuous_mandate, and
 # list_cadence_due: the scheduler's cross-workspace read of ACTIVE mandates
 # that are due (daily / weekly by interval; continuous by ``_continuous_due``,
-# which first runs the ``issues`` patrol on a mandate that toggles it; manual
-# never; N+1 reads, fine at current mandate counts).
+# which first runs the ``issues`` patrol on a mandate that toggles it and wakes a
+# stood-down line on a new sighting or a run settled since; manual never; N+1
+# reads, fine at current mandate counts).
 #
 # Conventions (cloud entity rules): validate body at entry; tenant filter
 # ``workspace=...`` on EVERY request-path find; emit an event on every write (or
@@ -50,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
 
@@ -883,6 +887,19 @@ def _sighting_to_wire(s: SightingDoc) -> dict[str, Any]:
 # oldest); the prompt says how many it left out.
 _BACKLOG_CAP = 30
 
+# A sighting's ``Depends on:`` line (``**Depends on:** #4``, ``Depends on: #4``),
+# read off the full text since issue bodies end with it and summaries are cut;
+# capped per sighting.
+_DEPENDS_ON = re.compile(r"^[ \t>*_-]*depends on[ \t*_]*:.*$", re.IGNORECASE | re.MULTILINE)
+_DEPENDS_ON_CAP = 200
+
+
+def _depends_on(text: str) -> str | None:
+    """The first ``Depends on:`` line in ``text``, stripped and capped, or None."""
+    found = _DEPENDS_ON.search(text or "")
+    return found.group(0).strip()[:_DEPENDS_ON_CAP] if found else None
+
+
 # Task statuses that mean someone is still working the task: the foreman must
 # not plan it again.
 _IN_FLIGHT = frozenset(
@@ -1016,8 +1033,9 @@ async def _backlog(
 
     Returns ``{"open": [...], "tasks": [...], "teaching": [...]}``: open entries
     (highest severity, then oldest) are ``{id, patrol, severity, summary, new,
-    in_flight, tasks}``, where ``new`` means filed after ``since`` and ``tasks``
-    lists the citing tasks (``{shift_no, title, status}``); ``tasks`` covers the
+    in_flight, tasks, depends_on}``, where ``new`` means filed after ``since``,
+    ``tasks`` lists the citing tasks (``{shift_no, title, status}``) and
+    ``depends_on`` is the full text's ``Depends on:`` line (or None); ``tasks`` covers the
     plans behind this mandate's runs, every plan still at the plan gate (in
     flight, however many shifts ago), and ``history_plan_ids``; ``teaching`` is
     the gate teaching sightings as ``{shift_no, note}`` (shift history, never
@@ -1080,6 +1098,7 @@ async def _backlog(
                 "new": since is None or _aware(s.ts) > _aware(since),
                 "in_flight": any(c["status"] in _IN_FLIGHT for c in cites),
                 "tasks": cites,
+                "depends_on": _depends_on(str(s.evidence.get("text") or s.summary)),
             }
         )
     return {"open": entries, "tasks": tasks, "teaching": teaching}
@@ -1114,6 +1133,7 @@ async def trigger_shift(workspace_id: str, user_id: str, mandate_id: str) -> dic
     from uuid import uuid4
 
     from pocketpaw_ee.cloud.mandates import foreman as foreman_mod
+    from pocketpaw_ee.cloud.mandates import patrols as mandate_patrols
     from pocketpaw_ee.cloud.mandates import soul_link
 
     doc = await _fetch_mandate(workspace_id, mandate_id)
@@ -1193,10 +1213,19 @@ async def trigger_shift(workspace_id: str, user_id: str, mandate_id: str) -> dic
         doc.soul_path, f"{doc.name} {doc.charter.goal}"
     )
 
+    shown = backlog["open"][:_BACKLOG_CAP]
+    # One cached ``gh issue list --state all``, and only when a sighting names
+    # its dependencies, so the foreman can plan work whose dependencies closed.
+    issue_states = (
+        await mandate_patrols.issue_states(doc.surface.repo_id)
+        if any(s["depends_on"] for s in shown)
+        else {}
+    )
     context = foreman_mod.ForemanContext(
         shift_no=shift_no,
         charter=charter_wire,
-        sightings=backlog["open"][:_BACKLOG_CAP],
+        sightings=shown,
+        issue_states=issue_states,
         open_total=len(backlog["open"]),
         history=history,
         line=await line_status(doc.surface.repo_id, mandate_id),
@@ -2375,8 +2404,10 @@ async def has_continuous_mandate() -> bool:
 async def _continuous_due(doc: MandateDoc, last: ShiftDoc | None, now: datetime) -> bool:
     """A CONTINUOUS mandate is due when the minimum gap since its last shift has
     passed, that shift is finished (``done``; ``stood_down`` only once a sighting
-    arrived after it, so a foreman that planned nothing is not re-asked about the
-    same backlog), none of its runs is still in flight, and an open sighting no
+    arrived after it or one of the mandate's runs settled after it: landed,
+    rejected or released, failed. A foreman that planned nothing is not re-asked
+    about the same backlog, but one that waited on a run is woken when the run
+    resolves), none of its runs is still in flight, and an open sighting no
     task is working remains. A shift older than the stall timeout stops holding
     the next one through in-flight runs or a stuck ``planning`` / ``executing``
     state; a plan waiting ``in_gate`` for a human always holds it, and so do
@@ -2446,7 +2477,21 @@ async def _continuous_due(doc: MandateDoc, last: ShiftDoc | None, now: datetime)
     )
     work = [o for o in backlog["open"] if not o["in_flight"]]
     if last is not None and last.state == "stood_down":
-        work = [o for o in work if o["new"]]
+        # ponytail: ``updated_at`` also moves on blob writes after a run settles
+        # (a tester's patches, lane nudges), so a stood-down line may be asked
+        # once more per write, at most once per min gap; a status-change stamp
+        # (or the settled run ids snapshotted at stand-down) would make it exact.
+        # The store stamps whole seconds, so the stand-down is cut to its second:
+        # a run settled in that same second wakes the line rather than being lost.
+        stood_down_at = _aware(last.createdAt).replace(microsecond=0)
+        settled = any(
+            _task_status(r) not in _IN_FLIGHT
+            and r.get("updated_at")
+            and _aware(datetime.fromisoformat(r["updated_at"])) >= stood_down_at
+            for r in runs
+        )
+        if not settled:
+            work = [o for o in work if o["new"]]
     return bool(work)
 
 
