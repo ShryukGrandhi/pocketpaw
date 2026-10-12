@@ -65,7 +65,7 @@ _FIXTURE = Path(__file__).parents[1] / "fixtures" / "ripple_explainer_card.json"
 # Refreshing ripple-manifest.json: see ee/pocketpaw_ee/paw_bar/ripple-manifest.json.source
 # (vendored from ripple branch feat/play-wave pending a release; drop the widget examples,
 # update the pins below).
-_RIPPLE_MANIFEST_SHA256 = "21829be61e0b2c82066ed18c4c0e5af98f3221326327cc31209224176721f066"
+_RIPPLE_MANIFEST_SHA256 = "3dc2a1170009f12c4f865efa551de8dced084f07e5ae19cb99244fea2156308b"
 
 
 def _pin_ops(monkeypatch, *site_ids: str, cap: float | None = None) -> None:
@@ -105,7 +105,7 @@ def test_the_vendored_ripple_manifest_has_not_drifted():
     raw = card_spec.RIPPLE_MANIFEST_PATH.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(raw).hexdigest() == _RIPPLE_MANIFEST_SHA256
     assert card_spec.RIPPLE_MANIFEST["version"] == "0.8.0"
-    assert len(card_spec.RIPPLE_MANIFEST["widgets"]) == 207
+    assert len(card_spec.RIPPLE_MANIFEST["widgets"]) == 213
     # Every trimmed or typed name is a real widget (a typo would trim nothing).
     every = {w["type"] for w in card_spec.RIPPLE_MANIFEST["widgets"]}
     chrome, deferred = card_spec.RIPPLE_CHROME, card_spec.RIPPLE_DEFERRED
@@ -113,7 +113,7 @@ def test_the_vendored_ripple_manifest_has_not_drifted():
     r = card_spec.RIPPLE_PROFILE
     assert r.typed.keys() <= r.detailed <= r.widget_types
     assert {"illustration", "bill-split"} <= every & r.widget_types
-    assert len(r.widget_types) == 207 - len(deferred) - len(chrome)
+    assert len(r.widget_types) == 213 - len(deferred) - len(chrome)
 
 
 def test_the_pawbar_profile_is_todays_rules():
@@ -393,8 +393,15 @@ def test_only_the_data_widgets_list_typed_props():
         "comparison-layout {items: [{id,name,subtitle?,price?:number," in lines["comparison-layout"]
     )
     assert "winner?: {id,reason,runner_up?:{id,reason}}" in lines["comparison-layout"]
-    # booking and menu-order list only what the model writes; exec-dashboard its rows.
-    assert _fields(lines["booking"]) == "- booking {party?: number, preferred?: {date?,after?}"
+    # menu-order lists only what the model writes, booking its non-table fields too;
+    # exec-dashboard its rows.
+    booking = _fields(lines["booking"])
+    assert booking.startswith("- booking {services?: [{id,name,kind?:table|hair|")
+    assert booking.endswith(
+        "days?: [{date,date_label,slots:[{start,label,available:boolean}]}], "
+        "party?: number, preferred?: {date?,after?}"
+    )
+    assert "notice" not in booking and "confirmed" not in booking and "tz" not in booking
     menu = _fields(lines["menu-order"])
     assert menu.startswith("- menu-order {items: [{id?,product_id?,name?,")
     assert menu.endswith("featured?: {id,reason?}, preset?: [{id,qty:number}]")
@@ -445,6 +452,9 @@ def test_the_rules_point_each_answer_at_its_data_widget():
         "a menu-order: items by product_id",
         # booking's and growth-projection's fields are on their typed lines.
         "A booking is a booking.",
+        "for any other booking (a dentist, a haircut) write its services",
+        "Weather is a weather-forecast",
+        "places to go are place-results",
         "A meal plan is a meal-plan, one dish a recipe, a workout an interval-workout, "
         "study cards a flashcard-deck",
         "Savings or growth is a growth-projection.",
@@ -3423,3 +3433,125 @@ def test_the_rules_send_notes_and_music_to_their_widgets():
     rule = next(r for r in _RIPPLE_RULES if "Match the card to the answer" in r)
     assert "a notes card, never inputs and buttons" in rule
     assert "a music-player of its preset sounds" in rule
+
+
+# --------------------------------------------------------------------------- #
+# weather-forecast, week-schedule, agenda, place-results, product-grid, media-grid
+# (ripple #223, #224): realistic cards pass (``_DATA_CARDS``, each widget's manifest
+# example, the three catalog grids with an ``on_choose`` ask); rows hold to the
+# widget's enums, counts and plain text, and an image to the URL policy.
+# --------------------------------------------------------------------------- #
+
+_NEW_DATA = (
+    "weather-forecast",
+    "week-schedule",
+    "agenda",
+    "place-results",
+    "product-grid",
+    "media-grid",
+)
+
+
+def _new(name: str, rows: str | None = None, row: dict | None = None, **props) -> dict:
+    """``name``'s fixture card with ``props`` set and, given ``rows``, its first row
+    of that list merged with ``row``."""
+    card = json.loads(json.dumps(_DATA_CARDS[name]))
+    card["ui"]["props"].update(props)
+    if rows:
+        card["ui"]["props"][rows][0].update(row or {})
+    return card
+
+
+def _with(card: dict, **node) -> dict:
+    card["ui"].update(node)
+    return card
+
+
+def test_realistic_new_data_widget_cards_pass():
+    for name in _NEW_DATA:
+        assert _ripple(_DATA_CARDS[name]) is not None, name
+    # An on_choose may ask with plain {text}; an image may be a same-site path.
+    assert _DATA_CARDS["place-results"]["ui"]["on_choose"]["target"] == "ask"
+    assert _ripple(_new("product-grid", "products", {"image": "/img/h1.png"})) is not None
+    assert _ripple(_new("media-grid", "items", {"image": "/img/d1.png"})) is not None
+    assert _ripple(_new("week-schedule", "events", {"end": "24:00"})) is not None
+
+
+@pytest.mark.parametrize(
+    ("why", "spec"),
+    [
+        (
+            "a javascript: product image",
+            _new("product-grid", "products", {"image": "javascript:alert(1)"}),
+        ),
+        (
+            "a javascript: media image",
+            _new("media-grid", "items", {"image": "javascript:alert(1)"}),
+        ),
+        (
+            "an https image off the hosts",
+            _new("product-grid", "products", {"image": "https://cdn.example.com/a.png"}),
+        ),
+        (
+            "an unknown weather condition",
+            _new("weather-forecast", "days", {"condition": "overcast"}),
+        ),
+        (
+            "an unknown condition now",
+            _new("weather-forecast", now={"temp": 20, "condition": "hail"}),
+        ),
+        ("an unknown unit", _new("weather-forecast", unit="K")),
+        (
+            "15 forecast days",
+            _new(
+                "weather-forecast",
+                days=[{"day": "Mon", "condition": "sunny", "high": 1, "low": 0}] * 15,
+            ),
+        ),
+        (
+            "a forecast day without a high",
+            _new("weather-forecast", days=[{"day": "Mon", "condition": "sunny", "low": 0}]),
+        ),
+        ("html in a forecast place", _new("weather-forecast", place="<b>Lisbon</b>")),
+        ("an unknown place kind", _new("place-results", "places", {"kind": "casino"})),
+        ("a place price of 5", _new("place-results", "places", {"price": 5})),
+        (
+            "html in a place name",
+            _new("place-results", "places", {"name": "<img src=x onerror=alert(1)>"}),
+        ),
+        ("a place link", _new("place-results", "places", {"link": "/x"})),
+        ("21 places", _new("place-results", places=[{"name": "A", "kind": "cafe"}] * 21)),
+        ("an unknown media kind", _new("media-grid", kind="game")),
+        ("an unknown media color", _new("media-grid", "items", {"color": "red"})),
+        ("html in a media blurb", _new("media-grid", "items", {"blurb": "<script>x</script>"})),
+        (
+            "an expression in a media title",
+            _new("media-grid", "items", {"title": "{state.secret}"}),
+        ),
+        ("an unknown product color", _new("product-grid", "products", {"color": "gray"})),
+        ("4 product specs", _new("product-grid", "products", {"specs": ["a", "b", "c", "d"]})),
+        ("a product without a price", _new("product-grid", products=[{"name": "A"}])),
+        ("html in a product badge", _new("product-grid", "products", {"badge": "<b>Hot</b>"})),
+        ("an unknown schedule color", _new("week-schedule", "events", {"color": "violet"})),
+        ("a schedule time that is not HH:MM", _new("week-schedule", "events", {"start": "9am"})),
+        ("html in an event title", _new("week-schedule", "events", {"title": "<i>Gym</i>"})),
+        (
+            "61 events",
+            _new(
+                "week-schedule",
+                events=[{"day": "Mon", "start": "09:00", "end": "10:00", "title": "x"}] * 61,
+            ),
+        ),
+        ("an agenda item of 241 minutes", _new("agenda", "items", {"minutes": 241})),
+        ("an agenda start that is not HH:MM", _new("agenda", start="ten")),
+        ("html in an agenda owner", _new("agenda", "items", {"owner": "<b>Maya</b>"})),
+        ("no agenda items", _new("agenda", items=[])),
+        ("a handler on a forecast", _with(_new("weather-forecast"), on_choose=_ASKED)),
+        (
+            "an on_choose that navigates",
+            _with(_new("place-results"), on_choose={"action": "navigate", "target": "/x"}),
+        ),
+    ],
+)
+def test_new_data_widgets_hold_to_their_enums_counts_and_plain_text(why, spec):
+    assert _ripple(spec) is None, why

@@ -9,7 +9,9 @@
 # minus deferred widgets and page chrome (its ``illustration`` SVG is held to
 # illustration_svg's policy and its annotations to ids the widget keeps, ``bill-split``
 # to plain numbers, the games, habit-tracker and focus-timer to literal data (``_PLAY_CHECKS``),
-# ``notes`` to plain-text notes and ``music-player`` to preset sounds (``_DATA_CHECKS``), a
+# ``notes`` to plain-text notes, ``music-player`` to preset sounds, a model-written booking
+# and the six catalog widgets (weather-forecast to place-results, ``_CATALOG_CHECKS``) to
+# plain data within the widget's enums and caps (``_DATA_CHECKS``), a
 # button's choice-card ``icon`` and ``description`` to a key and short plain text), and
 # is ``strict``:
 # ``_check_strict`` walks all of ``ui`` and ``state`` iteratively, holding nodes,
@@ -25,8 +27,9 @@
 #
 # Hydration runs after the checks and is not checked again: product data comes only
 # from the site catalog, and on the ripple profile ``_fill_store`` fills menu-order,
-# booking and comparison-layout nodes from the site's store and attaches the one
-# server-wired handler each may fire (a model-written one is refused). ``card_ids``
+# comparison-layout and table bookings (``_table_booking``; a dentist keeps the model's
+# services, display only) from the site's store and attaches the one server-wired
+# handler each may fire (a model-written one is refused). ``card_ids``
 # and ``has_lead_form`` read a body for the runner; ``PartialScan`` judges a body
 # still streaming, flagging only what the finished card is sure to fail.
 #
@@ -148,12 +151,13 @@ RIPPLE_CHROME: frozenset[str] = frozenset(
 )
 # The data widgets: the model writes a few lines of data and the widget draws the
 # card. Listed with typed props, minus the ones every data widget shares (the rules
-# teach those once). booking and menu-order list only what the model writes (the
-# server fills the rest); exec-dashboard its rows mode only, so the model writes
-# rows instead of prebuilt KPI tiles and charts.
+# teach those once). menu-order lists only what the model writes (the server fills
+# the rest); booking its services and days too, which the model writes only for a
+# booking that is not a table (``_fill_booking``); exec-dashboard its rows mode only,
+# so the model writes rows instead of prebuilt KPI tiles and charts.
 RIPPLE_DATA_WIDGETS: dict[str, frozenset[str] | None] = {
     "itinerary": None,
-    "booking": frozenset({"party", "preferred"}),
+    "booking": frozenset({"services", "days", "party", "preferred"}),
     "menu-order": frozenset({"items", "featured", "preset"}),
     "growth-projection": None,
     "recipe": None,
@@ -164,6 +168,12 @@ RIPPLE_DATA_WIDGETS: dict[str, frozenset[str] | None] = {
     "bill-split": None,
     "notes": frozenset({"notes"}),
     "music-player": frozenset({"tracks"}),
+    "weather-forecast": None,
+    "week-schedule": None,
+    "agenda": None,
+    "place-results": None,
+    "product-grid": None,
+    "media-grid": None,
     "exec-dashboard": frozenset(
         {"rows", "measures", "dimensions", "x", "split", "compare", "compareLabel", "filters"}
     ),
@@ -224,6 +234,15 @@ MUSIC_SOUNDS: frozenset[str] = frozenset(
 )
 TRACKS = (1, 30)
 TRACK_MINUTES = (1, 60)
+# A model-written booking (a dentist, a haircut; a table is the store's): services and
+# days as plain data within these caps, a service ``kind`` one of the widget's.
+BOOKING_KINDS: frozenset[str] = frozenset({"table", "hair", "beauty", "health", "class", "other"})
+BOOKING_SERVICES, BOOKING_DAYS, BOOKING_SLOTS = 20, 14, 48
+BOOKING_DURATION = (1, 1440)
+BOOKING_PARTY = (1, 100)
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# A service that reads as a table: the store's table service replaces the model's.
+_TABLE_SERVICE = re.compile(r"\b(table|dining|dinner|lunch|brunch|restaurant)\b", re.IGNORECASE)
 # Names ripple's registry also draws as one of these widgets, which its chat allowlist
 # refuses: a node by one is checked and sent under the widget's own name, a board-game
 # alias filling a missing ``game``.
@@ -1349,7 +1368,324 @@ def _check_music_player(node: dict[str, Any], props: dict[str, Any]) -> None:
             raise _Reject("a music track that is not a preset sound with plain text")
 
 
+def _check_booking(node: dict[str, Any], props: dict[str, Any]) -> None:
+    """A model-written ``services`` (at most ``BOOKING_SERVICES``, each a plain ``id``
+    and ``name``, whole ``duration_min``, a ``BOOKING_KINDS`` kind, a number ``price``,
+    a ``party`` range) and ``days`` (at most ``BOOKING_DAYS``, a YYYY-MM-DD ``date``, a
+    plain ``date_label`` and up to ``BOOKING_SLOTS`` plain slots) are plain data."""
+
+    def service_ok(s: Any) -> bool:
+        party = s.get("party") if isinstance(s, dict) else None
+        return (
+            isinstance(s, dict)
+            and _text_ok(s.get("id"), 60)
+            and _text_ok(s.get("name"), NOTE_TITLE_MAX)
+            and _is_int(s.get("duration_min"), BOOKING_DURATION)
+            and _optional(s, "kind", lambda v: v in BOOKING_KINDS)
+            and _optional(s, "price", lambda v: _is_number(v) and v >= 0)
+            and (
+                party is None
+                or isinstance(party, dict)
+                and _is_int(party.get("min"), BOOKING_PARTY)
+                and _is_int(party.get("max"), BOOKING_PARTY)
+            )
+        )
+
+    def slot_ok(s: Any) -> bool:
+        return (
+            isinstance(s, dict)
+            and _text_ok(s.get("start"), 40)
+            and _text_ok(s.get("label"), 20)
+            and isinstance(s.get("available"), bool)
+        )
+
+    def day_ok(d: Any) -> bool:
+        slots = d.get("slots") if isinstance(d, dict) else None
+        return (
+            isinstance(d, dict)
+            and isinstance(d.get("date"), str)
+            and bool(_DATE.fullmatch(d["date"]))
+            and _text_ok(d.get("date_label"), 40)
+            and isinstance(slots, list)
+            and len(slots) <= BOOKING_SLOTS
+            and all(map(slot_ok, slots))
+        )
+
+    services, days = props.get("services"), props.get("days")
+    if services is not None and not (
+        isinstance(services, list)
+        and len(services) <= BOOKING_SERVICES
+        and all(map(service_ok, services))
+    ):
+        raise _Reject("booking services that are not plain data within the widget's caps")
+    if days is not None and not (
+        isinstance(days, list) and len(days) <= BOOKING_DAYS and all(map(day_ok, days))
+    ):
+        raise _Reject("booking days that are not plain data within the widget's caps")
+
+
+# weather-forecast, week-schedule, agenda, place-results, product-grid and media-grid
+# (ripple #223, #224): each listed prop and every row field held to the widget's own
+# enums, counts and plain text (``_text_ok``); a row may carry only the fields below,
+# so no URL key but ``image``, which the walk holds to the URL policy. Only the three
+# catalog grids take a handler, ``on_choose`` (an ``ASK_HANDLERS`` key).
+WEATHER_CONDITIONS: frozenset[str] = frozenset(
+    {"sunny", "partly-cloudy", "cloudy", "rain", "heavy-rain", "thunder", "snow", "fog"}
+    | {"wind", "night-clear"}
+)
+SCHEDULE_COLORS: frozenset[str] = frozenset(
+    {"blue", "green", "orange", "purple", "pink", "teal", "red", "yellow", "gray"}
+)
+CATALOG_COLORS: frozenset[str] = frozenset(
+    {"blue", "violet", "teal", "green", "amber", "rose", "orange", "slate"}
+)
+PLACE_KINDS: frozenset[str] = frozenset(
+    {"cafe", "restaurant", "bar", "bakery", "shop", "park", "museum", "hotel", "other"}
+)
+MEDIA_KINDS: frozenset[str] = frozenset(
+    {"documentary", "film", "series", "podcast", "book", "album"}
+)
+_HHMM = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d|24:00")
+
+
+def _txt(cap: int) -> Any:
+    return lambda v: _text_ok(v, cap)
+
+
+def _num(low: float = -math.inf, high: float = math.inf) -> Any:
+    return lambda v: _is_number(v) and low <= v <= high
+
+
+def _int(low: int, high: int) -> Any:
+    return lambda v: _is_int(v, (low, high))
+
+
+def _one_of(allowed: frozenset[str]) -> Any:
+    return lambda v: v in allowed
+
+
+def _hhmm(v: Any) -> bool:
+    return isinstance(v, str) and bool(_HHMM.fullmatch(v))
+
+
+def _flag(v: Any) -> bool:
+    return isinstance(v, bool)
+
+
+def _words_of(count: int, cap: int) -> Any:
+    return lambda v: isinstance(v, list) and len(v) <= count and all(map(_txt(cap), v))
+
+
+def _rows_of(bounds: tuple[int, int], fields: dict[str, Any], required: set[str]) -> Any:
+    """A list of ``bounds`` rows, each only ``fields`` (each passing its check when
+    not null) with every ``required`` one present."""
+
+    def ok(rows: Any) -> bool:
+        return (
+            isinstance(rows, list)
+            and bounds[0] <= len(rows) <= bounds[1]
+            and all(
+                isinstance(r, dict)
+                and r.keys() <= fields.keys()
+                and required <= r.keys()
+                and all(r.get(k) is None or ok(r[k]) for k, ok in fields.items())
+                for r in rows
+            )
+        )
+
+    return ok
+
+
+_ID = _txt(60)
+_RATING = _num(0, 5)
+_COUNT = _int(0, 10**9)
+_WEATHER = _one_of(WEATHER_CONDITIONS)
+# Per widget: (its props' checks, the props it must have, its one handler or None).
+_CATALOG_CHECKS: dict[str, tuple[dict[str, Any], set[str], str | None]] = {
+    "weather-forecast": (
+        {
+            "place": _txt(80),
+            "unit": _one_of(frozenset({"C", "F"})),
+            "now": lambda v: _rows_of(
+                (1, 1),
+                {
+                    "temp": _num(),
+                    "condition": _WEATHER,
+                    "feelsLike": _num(),
+                    "humidity": _num(0, 100),
+                    "wind": _txt(40),
+                },
+                {"temp", "condition"},
+            )([v]),
+            "days": _rows_of(
+                (1, 14),
+                {
+                    "day": _txt(20),
+                    "condition": _WEATHER,
+                    "high": _num(),
+                    "low": _num(),
+                    "rainChance": _num(0, 100),
+                    "sunrise": _txt(10),
+                    "sunset": _txt(10),
+                },
+                {"day", "condition", "high", "low"},
+            ),
+            "hourly": _rows_of(
+                (0, 48),
+                {
+                    "time": _txt(10),
+                    "temp": _num(),
+                    "condition": _WEATHER,
+                    "rainChance": _num(0, 100),
+                },
+                {"time", "temp", "condition"},
+            ),
+            "note": _txt(120),
+        },
+        {"place", "days"},
+        None,
+    ),
+    "week-schedule": (
+        {
+            "startHour": _int(0, 23),
+            "endHour": _int(1, 24),
+            "days": _words_of(14, 12),
+            "events": _rows_of(
+                (0, 60),
+                {
+                    "id": _ID,
+                    "day": _txt(12),
+                    "start": _hhmm,
+                    "end": _hhmm,
+                    "title": _txt(80),
+                    "place": _txt(80),
+                    "color": _one_of(SCHEDULE_COLORS),
+                },
+                {"day", "start", "end", "title"},
+            ),
+        },
+        {"events"},
+        None,
+    ),
+    "agenda": (
+        {
+            "start": _hhmm,
+            "items": _rows_of(
+                (1, 30),
+                {
+                    "id": _ID,
+                    "title": _txt(80),
+                    "owner": _txt(60),
+                    "minutes": _int(1, 240),
+                    "notes": _txt(140),
+                    "done": _flag,
+                },
+                {"title", "minutes"},
+            ),
+        },
+        {"items"},
+        None,
+    ),
+    "place-results": (
+        {
+            "query": _txt(120),
+            "showMap": _flag,
+            "places": _rows_of(
+                (0, 20),
+                {
+                    "id": _ID,
+                    "name": _txt(80),
+                    "kind": _one_of(PLACE_KINDS),
+                    "rating": _RATING,
+                    "reviews": _COUNT,
+                    "price": _int(1, 4),
+                    "distance": lambda v: _num(0)(v) or _txt(20)(v),
+                    "walkMinutes": _int(0, 600),
+                    "open": _flag,
+                    "hours": _txt(40),
+                    "address": _txt(120),
+                    "tags": _words_of(8, 24),
+                    "blurb": _txt(200),
+                    "lat": _num(-90, 90),
+                    "lng": _num(-180, 180),
+                },
+                {"name", "kind"},
+            ),
+        },
+        {"places"},
+        "on_choose",
+    ),
+    "product-grid": (
+        {
+            "filters": _flag,
+            "products": _rows_of(
+                (0, 24),
+                {
+                    "id": _ID,
+                    "name": _txt(80),
+                    "brand": _txt(60),
+                    "category": _txt(40),
+                    "price": _num(0),
+                    "was": _num(0),
+                    "rating": _RATING,
+                    "reviews": _COUNT,
+                    "badge": _txt(24),
+                    "color": _one_of(CATALOG_COLORS),
+                    "image": lambda v: isinstance(v, str),
+                    "specs": _words_of(3, 40),
+                },
+                {"name", "price"},
+            ),
+        },
+        {"products"},
+        "on_choose",
+    ),
+    "media-grid": (
+        {
+            "kind": _one_of(MEDIA_KINDS),
+            "items": _rows_of(
+                (0, 24),
+                {
+                    "id": _ID,
+                    "title": _txt(80),
+                    "by": _txt(80),
+                    "year": _int(1800, 2100),
+                    "minutes": _int(1, 1000),
+                    "episodes": _int(1, 10_000),
+                    "rating": _RATING,
+                    "genres": _words_of(6, 24),
+                    "blurb": _txt(280),
+                    "color": _one_of(CATALOG_COLORS),
+                    "image": lambda v: isinstance(v, str),
+                },
+                {"title"},
+            ),
+        },
+        {"items"},
+        "on_choose",
+    ),
+}
+
+
+def _check_catalog(node: dict[str, Any], props: dict[str, Any]) -> None:
+    """One of ``_CATALOG_CHECKS``: its handler only, a plain ``title`` and
+    ``subtitle``, its required props, and each listed prop passing its check."""
+    kind = node["type"]
+    checks, required, handler = _CATALOG_CHECKS[kind]
+    _play_basics(kind, node, props, handler, ())
+    for key in ("title", "subtitle"):
+        if not _optional(props, key, _txt(120)):
+            raise _Reject(f"a {kind} {key} that is not short plain text")
+    if not required <= props.keys():
+        raise _Reject(f"a {kind} without {', '.join(sorted(required - props.keys()))}")
+    for key, ok in checks.items():
+        if not _optional(props, key, ok):
+            raise _Reject(f"a {kind} {key} outside the widget's enums, caps or plain text")
+
+
 _DATA_CHECKS = {"notes": _check_notes, "music-player": _check_music_player}
+_DATA_CHECKS["booking"] = _check_booking
+_DATA_CHECKS |= dict.fromkeys(_CATALOG_CHECKS, _check_catalog)
 
 _PLAY_CHECKS = {
     "memory-match": _check_memory_match,
@@ -1568,20 +1904,19 @@ def _fill_store(value: Any, store: Any, profile: CardProfile) -> Any:
         props = out.get("props")
         out["props"] = fill(dict(props) if isinstance(props, dict) else {}, store)
         wired = SERVER_WIRED.get(out["type"])
-        if (
-            wired
-            and store is not None
-            and wired[1] in profile.host_events
-            and _usable(out["props"])
-        ):
+        if wired and wired[1] in profile.host_events and _usable(out["props"], store):
             out[wired[0]] = {"action": "emit", "target": wired[1]}
     return out
 
 
-def _usable(props: dict[str, Any]) -> bool:
+def _usable(props: dict[str, Any], store: Any) -> bool:
     """Whether a filled widget can fire: a menu that checks out, a booking with the
-    store's services and days. With no store nothing is wired: the card is display."""
-    return props.get("checkout") is True or bool(props.get("days") and props.get("services"))
+    store's services and days (a booking that kept the model's own services is
+    display). With no store nothing is wired: the card is display."""
+    services = getattr(store, "services", None)
+    return props.get("checkout") is True or bool(
+        props.get("days") and services and props.get("services") == list(services)
+    )
 
 
 def _store_items(items: Any, store: Any, *, menu: bool) -> tuple[list[Any], bool]:
@@ -1635,14 +1970,34 @@ def _fill_menu_order(props: dict[str, Any], store: Any) -> dict[str, Any]:
     return props
 
 
+def _table_booking(services: Any, store: Any) -> bool:
+    """Whether a booking is the store's: the model wrote no services, or one that
+    reads as a table (kind "table", a dining word in its name or id) or names one of
+    the store's service ids. A dentist or a haircut keeps the model's own."""
+    if not isinstance(services, list) or not services:
+        return True
+    ids = {s.get("id") for s in getattr(store, "services", None) or ()}
+    return any(
+        isinstance(s, dict)
+        and (
+            s.get("kind") == "table"
+            or s.get("id") in ids
+            or _TABLE_SERVICE.search(f"{s.get('name', '')} {s.get('id', '')}")
+        )
+        for s in services
+    )
+
+
 def _fill_booking(props: dict[str, Any], store: Any) -> dict[str, Any]:
-    """Services and 7 days of slots from the store; a calm notice when it is down.
-    ``confirmed`` and ``notice`` are the host's to write."""
+    """Services and 7 days of slots from the store for a table booking
+    (``_table_booking``); a calm notice when it is down. Any other booking keeps
+    the model's services and days and is display only (``_usable``). ``confirmed``
+    and ``notice`` are the host's to write."""
     import copy
 
     props.pop("confirmed", None)
     props.pop("notice", None)
-    if store is None:
+    if store is None or not _table_booking(props.get("services"), store):
         return props
     for key in ("services", "days", "tz"):
         props.pop(key, None)
