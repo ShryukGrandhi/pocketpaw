@@ -1,0 +1,165 @@
+[
+  {
+    "label": "a merged PR is not treated as landed",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "if pr.get(\"state\") == \"MERGED\":",
+    "replace": "if pr.get(\"state\") == \"MERGED!\":",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_merged_pr_lands_the_run"
+    ]
+  },
+  {
+    "label": "a fast-lane refusal comment does not escalate",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "str(c.get(\"body\") or \"\").startswith(_REFUSED) for c in pr.get(\"comments\") or []",
+    "replace": "False for c in pr.get(\"comments\") or []",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_lane_refusal_escalates_to_the_diff_gate"
+    ]
+  },
+  {
+    "label": "any PR is taken as the run's PR, marker or not",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "if any(line.strip() == mark for line in str(pr.get(\"body\") or \"\").splitlines()):",
+    "replace": "if True:",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_merged_pr_lands_the_run"
+    ]
+  },
+  {
+    "label": "a launch clone on another repo is not re-pointed before the fetch",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "if was != slug:",
+    "replace": "if False:",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_launch_clone_on_another_origin_is_repointed_then_fetched",
+      "tests/cloud/test_belt_cloud_station.py::test_conflicting_pr_gets_one_rebase_fixer_then_merges"
+    ]
+  },
+  {
+    "label": "a dot or dash-led bound-repo slug reaches git",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "any(p in {\".\", \"..\"} or p.startswith(\"-\") for p in slug.split(\"/\"))",
+    "replace": "False",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_malformed_bound_repo_slug_is_refused"
+    ]
+  },
+  {
+    "label": "the launch clone is not detached at origin/<base>",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "\"--detach\", f\"origin/{base}\"",
+    "replace": "\"--detach\", \"HEAD\"",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_merged_pr_lands_the_run"
+    ]
+  },
+  {
+    "label": "the tracker never gives up",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "if self.clock() >= deadline:",
+    "replace": "if self.clock() >= deadline and False:",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_tracker_timeout_without_a_pr"
+    ]
+  },
+  {
+    "label": "a stuck PR never passes the fixer grace period",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "elif self.clock() - stuck_since >= self.fix_grace_seconds:",
+    "replace": "elif self.clock() - stuck_since >= self.fix_grace_seconds and False:",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_conflicting_pr_gets_one_rebase_fixer_then_merges"
+    ]
+  },
+  {
+    "label": "the fixer attempts cap never escalates",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "if len(fixes) >= self.fix_attempts:",
+    "replace": "if len(fixes) >= self.fix_attempts and False:",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_fixer_attempts_cap_escalates"
+    ]
+  },
+  {
+    "label": "a landed run keeps an empty diff",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "            await _patch(store, run_ref, diff=diff if diff.endswith(\"\\n\") else diff + \"\\n\")\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_merged_pr_lands_the_run"
+    ]
+  },
+  {
+    "label": "a landing never fetches the bound repo",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "        await self._fetch_bound(blob)\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_merged_pr_lands_the_run"
+    ]
+  },
+  {
+    "label": "a landing reuses Clef's diff after the head moved",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "known = clef_diff if clef_head == head else \"\"",
+    "replace": "known = clef_diff",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_landing_refetches_the_diff_when_the_head_moved"
+    ]
+  },
+  {
+    "label": "the seated dev's instructions are left out of the brief",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "f\"{_task_block(request)}\\n\\n{_worker_block(request)}\"",
+    "replace": "f\"{_task_block(request)}\\n\\n\"",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_seated_dev_instructions_ride_the_brief"
+    ]
+  },
+  {
+    "label": "the PR's diff never reaches Clef's shadow scorer",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "clef_diff = await self._shadow_score(blob, run_ref, slug, number, cwd)",
+    "replace": "clef_diff = \"\"",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_merged_pr_lands_the_run"
+    ]
+  },
+  {
+    "label": "a timed-out launch drops the output the CLI streamed",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "out = out or \"\\n\".join(seen)",
+    "replace": "out = out",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_launch_timeout_keeps_the_streamed_output"
+    ]
+  },
+  {
+    "label": "an untrusted launch clone is reported as a missing session",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "if \"trustthisfolder\" in re.sub(",
+    "replace": "if \"never\" in re.sub(",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_untrusted_launch_clone_fails_with_a_clear_error"
+    ]
+  },
+  {
+    "label": "pty_run buffers instead of streaming",
+    "file": "ee/pocketpaw_ee/cloud/belt/pty_run.py",
+    "find": "    sys.stdout.buffer.flush()\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_pty_run_streams_output_before_a_timeout"
+    ]
+  },
+  {
+    "label": "pty_run waits at the folder-trust prompt",
+    "file": "ee/pocketpaw_ee/cloud/belt/pty_run.py",
+    "find": "_TRUST_PROMPT = b\"trustthisfolder\"",
+    "replace": "_TRUST_PROMPT = b\"neverseen\"",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_pty_run_fails_fast_at_the_folder_trust_prompt"
+    ]
+  }
+]

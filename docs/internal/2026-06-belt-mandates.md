@@ -4,12 +4,13 @@
      crew (cloud Agents as workers: roster, seat rule, per-worker model,
      instructions and setup), the headless develop station (strict and owner
      Claude setups, the trust restore, ORIENT) and its security posture, the
+     cloud develop station (claude --cloud, PR tracking through gh, fixers), the
      architecture context the foreman and review get, the mandate's line
      branch (base sync, landing, re-develop, one PR, its state on the wire and
      the UI surfaces), the run feed (live over SSE and stored per stage, with
      its wire contract), the run on its blueprint (C4 `paths`, the file join,
-     `file_touched`), endpoints (incl. the digest), env vars, and the
-     remaining demo-bar concessions. -->
+     `file_touched`), the auto plan gate and the continuous cadence, endpoints
+     (incl. the digest), env vars, and the remaining demo-bar concessions. -->
 
 # Belt Mandates — the standing JOB primitive
 
@@ -23,8 +24,11 @@ The **craft factory** is mandates running unattended: a cadence scheduler fires
 shifts, patrols (including `upstream`, which watches pinned GitHub engines)
 feed the foreman, and the headless develop station turns each approved task into
 a checked diff (reviewed by an LLM seat too, unless it came from a recipe) that
-still waits at the per-diff Instinct gate. A digest route reports the day. Nothing lands on its own: every plan and every
-diff passes a human gate, and nothing merges.
+still waits at the per-diff Instinct gate. A digest route reports the day. Every
+diff passes a gate and nothing merges on its own. Every plan passes a human
+gate too, unless the auto plan gate is on (`POCKETPAW_BELT_PLAN_GATE=auto`, see
+*The auto plan gate*), which lets a plan Clef scores as safe through and leaves
+the rest for a human.
 
 ## Anatomy
 
@@ -40,7 +44,8 @@ MANDATE  (charter: goal, KPIs, says_no, boundaries, budget, cadence, checks,
    │     • upstream  — commits on each pinned GitHub dep since its pin
    │     • feedback  — human intake (POST .../feedback)
    │
-   └── SHIFT (manual trigger, or the cadence scheduler: daily / weekly)
+   └── SHIFT (manual trigger, or the cadence scheduler: daily / weekly /
+             continuous)
          1. sense   — run patrols, persist new sightings (deduped)
          2. judge   — the FOREMAN makes ONE LLM call over:
                       charter (verbatim, BOUNDARIES first) + the OPEN
@@ -58,7 +63,8 @@ MANDATE  (charter: goal, KPIs, says_no, boundaries, budget, cadence, checks,
                       (the third blob peer of `_pocket_write`/`_code_change`)
             ── or ── stood_down: empty plan, a SUCCESS state; the chain opens
                       and closes in the trigger, no human gate for a no-op
-         5. dispatch — on human APPROVE, the plan executor re-validates
+         5. dispatch — on APPROVE (a human, or the auto plan gate as
+                      `system:belt-policy`), the plan executor re-validates
                       (mandate active, budget unchanged) and dispatches each
                       task as a Belt run; on REJECT the router closes the
                       chain and the shift records the reason
@@ -70,13 +76,32 @@ MANDATE  (charter: goal, KPIs, says_no, boundaries, budget, cadence, checks,
 
 ### The charter: cadence, checks, recipes
 
-- **`cadence`** is `daily`, `weekly` or `manual`. The cadence scheduler
-  (`mandates/scheduler.py`, one sweeper loop, every
+- **`cadence`** is `daily`, `weekly`, `continuous` or `manual`. The cadence
+  scheduler (`mandates/scheduler.py`, one sweeper loop, every
   `POCKETPAW_MANDATE_SCHEDULER_INTERVAL` seconds, default 3600) fires a shift
   for each ACTIVE mandate whose last shift is older than 1 day (`daily`) or 7
   days (`weekly`); a mandate that never shifted is due at once, and `manual`
-  is never fired. It starts under `POCKETPAW_CLOUD_SCHEDULER_ENABLED=true`,
-  through the lease, like the other background loops.
+  is never fired. A **`continuous`** mandate is due when all of these hold
+  (`service._continuous_due`):
+  - at least `POCKETPAW_MANDATE_CONTINUOUS_MIN_GAP_MINUTES` (default 5) have
+    passed since its last shift;
+  - that shift is finished: `done`, or `stood_down` with a sighting filed since
+    (a foreman that planned nothing is not asked again about the same backlog).
+    A plan waiting `in_gate` for a human always holds the next shift;
+  - none of that shift's runs is still in flight (queued, developing, pending at
+    the diff gate). A shift older than `POCKETPAW_MANDATE_CONTINUOUS_STALL_HOURS`
+    (default 3) stops holding the next one this way, and also releases a shift
+    stuck in `planning` (a failed foreman call) or `executing`;
+  - it has an open sighting that no landed or in-flight task covers.
+
+  While any ACTIVE continuous mandate exists, the loop ticks every
+  `POCKETPAW_MANDATE_SCHEDULER_CONTINUOUS_INTERVAL` seconds (default 60)
+  instead. A due mandate fires through the same `trigger_shift` as the shift
+  route, as `system:scheduler`. The scheduler starts under
+  `POCKETPAW_CLOUD_SCHEDULER_ENABLED=true` with every other background loop, or
+  alone under `POCKETPAW_MANDATE_SCHEDULER_ENABLED=true`, through the lease
+  either way. Pair `continuous` with the auto plan gate, or every shift waits
+  for a human at the plan gate.
 - **`checks`** are commands that must pass before a headless diff is attached,
   e.g. `["uv run pytest -q", "uv run ruff check ."]`.
 - **`recipes`** map a name to a deterministic command, e.g.
@@ -96,6 +121,42 @@ pnpm, python, python3, pytest, cargo, make, go`: no shells, `env`, `sudo`,
 `curl`, `wget` or `git`. Create also rejects (422) a `surface.repo_id` that does
 not resolve inside the workspace's belt allowlist roots. Only `belt.manage`
 (admin) can write a charter.
+
+### The auto plan gate
+
+With `POCKETPAW_BELT_PLAN_GATE=auto` (default `manual`: unchanged), the shift
+trigger awaits Clef's plan score inline instead of leaving it in the background
+(the `belt/clef.shadow_plan` task, shielded, up to
+`POCKETPAW_BELT_PLAN_GATE_CLEF_TIMEOUT` seconds, default 45; the verdict is
+still recorded on the blob as `clef`, even when the wait times out), then asks the pure
+`mandates/plan_policy.decide`. The plan is approved only when all of these hold:
+
+- every task cites at least one evidence ref that is an open sighting of this
+  mandate;
+- the plan fits the charter budget (`max_tasks_per_shift`);
+- Clef scores `in_scope` >= 0.80 and `low_risk` >= 0.75.
+
+It escalates the whole plan, leaving it pending for a human exactly as with the
+gate off, when Clef is off, fails, times out or truncated the plan,
+`tasks_independent` < 0.40, `too_big` > 0.65, or any task fails a rule above.
+The policy never rejects: a rejection would file a teaching sighting no human
+wrote. Auto mode needs Clef on (`POCKETPAW_BELT_CLEF=shadow` plus its token and
+account id); without it every plan escalates.
+
+An approval runs `service.resolve_plan`, the function the `plan/resolve` route
+calls, with `system:belt-policy` as the actor, so the chain reads
+`agent.proposed → human.corrected → decision.completed` like a console approval.
+Either way the decision goes on the `_belt_plan` blob as `policy`
+(`decision`, `rule`, `reason` with Clef's four numbers, `approver`, the
+thresholds, `at`), and an escalation is logged with its reason.
+
+The thresholds come from the supervisor's gate log of the first unattended
+pilot (seven plan decisions, pinned in `tests/cloud/test_belt_plan_policy.py`).
+Six match. The miss is a plan the supervisor trimmed for a file overlap Clef
+does not score (independence .52, above a plan approved in full at .50), which
+the policy approves as proposed. Each threshold has an env override:
+`POCKETPAW_BELT_POLICY_MIN_IN_SCOPE`, `..._MIN_LOW_RISK`,
+`..._MIN_INDEPENDENT`, `..._MAX_TOO_BIG`.
 
 ### Pulley blocks through recipes
 
@@ -371,7 +432,8 @@ feed").
 When a mandate binds `soul_path`, `soul_link.py` recalls up to 5 memories
 before planning and appends an episodic shift summary after every terminal
 (dispatched / rejected / stood_down) via the real soul-protocol API
-(`Soul.awaken → recall/remember → save_local`). Best-effort throughout — a
+(`Soul.awaken → recall/remember`, then `export` back into a `.soul` file, or
+`save_local` for a soul directory). Best-effort throughout — a
 soul failure never wedges a shift.
 
 ## Autopilot — Foresight-seeded simulated users (feat/belt-autopilot)
@@ -501,6 +563,106 @@ the blob's `expected_outcome`; the attached run's `summary` becomes the
 station's report (checks, setup, orient source, review verdict and notes, fix
 attempts), and its `files_changed` is the station's count (else the diff's
 `+++` headers).
+
+### The cloud develop station
+
+`POCKETPAW_FACTORY_DEVELOP=cloud` (with `POCKETPAW_MANDATE_DISPATCHER=headless`)
+is for a host that should not build or test: nothing agent-written runs on it.
+`belt/cloud_station.CloudTaskDispatcher` takes the headless dispatcher's seat
+(`headless.set_production_dispatcher`). An approved task is filed as the usual
+queued run, then in the background:
+
+```
+LAUNCH  task text injection-screened; bound repo inside the allowlist; the
+        launch clone (POCKETPAW_FACTORY_CLOUD_LAUNCH_DIR, never the bound repo)
+        is re-pointed at the bound repo's origin if it names another one (see
+        below); fetch + detach at origin/<base> (a cloud
+        session starts from the local commit); `claude --cloud "<brief>"` under
+        belt/pty_run.py (the CLI refuses a non-TTY), which streams the CLI's
+        output, so a launch that times out (300 s) still shows what it printed;
+        the session URL is read from that output. If the CLI stops at its
+        folder-trust prompt, pty_run exits and the run fails with `LAUNCH: the
+        claude CLI does not trust <dir>`; open the clone in claude once and
+        accept the prompt (Belt never answers it). One launch at a time.
+TRACK   gh finds the PR whose body has the line `Belt-Run: <run id>`, then polls
+        it every POCKETPAW_FACTORY_CLOUD_POLL seconds:
+          merged   -> approved as `system:fast-lane` (audited), mark_executed:
+                      the run is landed, with pr_url, head branch, merge sha
+                      and the PR's diff (so the UI can show touched files;
+                      the diff Clef scored is reused if the head has not
+                      moved since); then `git fetch -q origin` in the bound
+                      repo, since nothing else refreshes its origin/<base>
+                      in cloud mode and the blueprint reads the C4 model
+                      there (a failed fetch is logged, never fails the land)
+          refused  -> closed unmerged, or a `Fast lane: not eligible` comment:
+                      `gh pr diff` is attached as the run's diff, which waits
+                      at the per-diff Instinct gate (approving it lands it on
+                      the line like any run; close the PR then)
+          stuck    -> mergeable=CONFLICTING, or a failed check on the head
+                      commit, for POCKETPAW_FACTORY_CLOUD_FIX_GRACE seconds:
+                      one fixer session (see below), at most
+                      POCKETPAW_FACTORY_CLOUD_FIX_ATTEMPTS per run, then the
+                      PR escalates like a refusal
+          timeout  -> headless_error, the run stays queued
+```
+
+**One launch clone for every repo.** The claude CLI asks a folder-trust
+question the first time it runs in a new folder, and pty_run fails the launch
+there, so a per-repo launch folder would stall every new repo on that prompt.
+Belt keeps the one clone the CLI already trusts and re-points it instead: when
+the bound repo's GitHub slug differs from the clone's, `_launch` runs
+`git remote set-url origin https://github.com/<slug>.git` before the fetch and
+logs the switch (`launch clone origin <old> -> <new>`). The slug comes from the
+bound repo's origin through `_GH_SLUG` and is refused if a part is `.`, `..` or
+starts with `-`; git runs without a shell. The URL is always rebuilt from the
+slug, never copied, so credentials in the bound repo's remote never reach the
+clone. Every launch, worker or fixer, re-checks and re-points under the launch
+lock, so a fixer opens on the right repo even if another repo launched in
+between, and two launches never race on the remote.
+
+**Fixers.** A cloud worker stops once its PR is open, so a PR can get stuck
+after it: red CI on a runner the session never saw (an older Swift on macOS),
+or a conflict after a sibling PR from the same shift merged first. The tracker
+reads `mergeable` and `statusCheckRollup` from the same `gh pr view` poll and
+classifies checks the way `scripts/fast-lane.sh` does (the lane's own Fast Lane
+check and Copilot checks don't count; the rollup has no "required" flag, so any
+failed check counts). A PR that stays stuck for the grace period (default 300
+s, so the lane's own refresh or a running CI can settle first) gets ONE fixer,
+launched through the same path as the worker (launch clone, `claude --cloud`,
+one launch at a time) with a fix brief instead of the task brief:
+
+- conflicting: check out the PR's branch, rebase onto the latest
+  `origin/<base>`, keep both sides' behavior (shared lists keep both entries),
+  run the charter checks until they pass, `--force-with-lease` to the same
+  branch, comment on the PR;
+- red CI: the failing check's name and the last 40 lines of
+  `gh run view <run> --job <job> --log-failed` (fenced as data); fix minimal,
+  run the charter checks, push to the same branch, stop (if the new head goes
+  red, the tracker starts the next fixer with the new log, so two fixers never
+  push to one branch at once).
+
+Both say: no new PR, keep the `Belt-Run` line, no AI attribution, never merge.
+The tracker keeps polling the same PR under the same overall timeout. A fixer
+is launched at most once per head commit: the next one waits for a new head
+(a fixer that pushes nothing leaves the run to the timeout). Every attempt is
+appended to the blob's `fixes` list as `{kind: "rebase"|"ci", session_url, at}`,
+or `{kind, error, at}` when the launch failed (that counts as an attempt and
+tracking goes on), and emits `belt_run_updated` with `stage="fix"`. When the
+attempts are used up and the PR is still stuck, its diff is attached for the
+per-diff gate, with a summary saying how many fixers ran.
+
+The brief tells the session to do the task, follow the repo's CLAUDE.md, run
+the charter checks until they pass, open ONE PR to the base that says
+`Closes #<issue>` (the first `#n` in the task text) and carries the
+`Belt-Run` line, add the label (`POCKETPAW_FACTORY_CLOUD_PR_LABEL`, default
+`fast-lane`), add no AI attribution, and stop without merging. The seated dev's
+instructions ride the brief fenced as data, as in the local develop prompt.
+The repo's own fast lane and CI are the diff gate for small PRs; the plan gate
+is unchanged. Once the PR is known, its diff also goes to Clef's shadow scorer
+(`belt/clef.shadow_diff`), which records a verdict and gates nothing. There is no local ORIENT, CHECK or REVIEW in this mode: the
+session works in the cloud. Tracking is process-local: a restart leaves the run
+with `headless_state: "cloud"` (the digest lists it as stuck) and nothing
+resumes it yet.
 
 ### The crew: cloud Agents as workers
 
@@ -1082,7 +1244,13 @@ uv run python scripts/factory_digest.py --base http://localhost:8893 \
 | Variable | Default | What |
 |---|---|---|
 | `POCKETPAW_MANDATE_DISPATCHER` | `station` | `station` / `headless` / `bus` (above) |
-| `POCKETPAW_FACTORY_DEVELOP` | unset | `claude` wires the develop station (needs `POCKETPAW_MANDATE_DISPATCHER=headless`) |
+| `POCKETPAW_FACTORY_DEVELOP` | unset | `claude` wires the develop station (needs `POCKETPAW_MANDATE_DISPATCHER=headless`); `cloud` wires the cloud develop station instead (see *The cloud develop station*) |
+| `POCKETPAW_FACTORY_CLOUD_LAUNCH_DIR` | unset | Cloud mode only, and required there: an existing git clone, already trusted by the claude CLI, that cloud sessions launch from; its origin is re-pointed to each bound repo per launch |
+| `POCKETPAW_FACTORY_CLOUD_PR_LABEL` | `fast-lane` | The label the cloud brief tells the session to put on its PR |
+| `POCKETPAW_FACTORY_CLOUD_POLL` | `60` | Seconds between `gh` polls of a cloud run's PR |
+| `POCKETPAW_FACTORY_CLOUD_TIMEOUT` | `14400` | Seconds a cloud run waits for its PR to merge or be refused before it fails back to queued |
+| `POCKETPAW_FACTORY_CLOUD_FIX_GRACE` | `300` | Seconds a cloud run's PR must stay conflicting or red before a fixer session launches |
+| `POCKETPAW_FACTORY_CLOUD_FIX_ATTEMPTS` | `2` | Fixer sessions per cloud run; past it a still-stuck PR escalates to the per-diff gate |
 | `POCKETPAW_FACTORY_DEDICATED_HOST` | unset | `1` lets the station wire in a process serving cloud tenants; set it only on a dedicated single-tenant host |
 | `POCKETPAW_FACTORY_ALLOWED_COMMANDS` | `uv,uvx,bun,bunx,belt,node,npm,pnpm,python,python3,pytest,cargo,make,go` | Comma-separated program basenames a charter check or recipe may start |
 | `POCKETPAW_BELT_REPO_ALLOWLIST` | empty | JSON list of repo roots; the develop station refuses to run while it is empty |
@@ -1096,6 +1264,16 @@ uv run python scripts/factory_digest.py --base http://localhost:8893 \
 | `POCKETPAW_FACTORY_CHECK_TIMEOUT` | `600` | Seconds per check or recipe command |
 | `POCKETPAW_MANDATE_LLM` | `claude` | Foreman / autopilot transport: `claude` or `mock` |
 | `POCKETPAW_MANDATE_SCHEDULER_INTERVAL` | `3600` | Cadence sweep interval, seconds |
+| `POCKETPAW_MANDATE_SCHEDULER_CONTINUOUS_INTERVAL` | `60` | Sweep interval while any active `continuous` mandate exists, seconds |
+| `POCKETPAW_MANDATE_SCHEDULER_ENABLED` | off | `true` starts the cadence scheduler alone, without the other background loops |
+| `POCKETPAW_MANDATE_CONTINUOUS_MIN_GAP_MINUTES` | `5` | Minimum time between two shifts of a `continuous` mandate |
+| `POCKETPAW_MANDATE_CONTINUOUS_STALL_HOURS` | `3` | Age after which a `continuous` mandate's last shift stops holding the next one (in-flight runs, a stuck `planning`/`executing` state; never `in_gate`) |
+| `POCKETPAW_BELT_PLAN_GATE` | `manual` | `auto` runs the auto plan gate (needs Clef on) |
+| `POCKETPAW_BELT_PLAN_GATE_CLEF_TIMEOUT` | `45` | Seconds the auto gate waits for Clef's plan score |
+| `POCKETPAW_BELT_POLICY_MIN_IN_SCOPE` | `0.80` | Auto gate: lowest Clef `in_scope` that approves |
+| `POCKETPAW_BELT_POLICY_MIN_LOW_RISK` | `0.75` | Auto gate: lowest Clef `low_risk` that approves |
+| `POCKETPAW_BELT_POLICY_MIN_INDEPENDENT` | `0.40` | Auto gate: below this `tasks_independent` the plan escalates |
+| `POCKETPAW_BELT_POLICY_MAX_TOO_BIG` | `0.65` | Auto gate: above this `too_big` the plan escalates |
 | `POCKETPAW_MANDATE_AUTOPILOT_INTERVAL` | `300` | Autopilot cycle interval, seconds |
 | `POCKETPAW_CLOUD_SCHEDULER_ENABLED` | off | Starts the cadence scheduler and autopilot loops |
 
@@ -1172,7 +1350,11 @@ diff);
 `test_belt_pulley_c4.py` maps the seven real Pulley manifests through
 `block_component` and reads the result back with `c4_lines`;
 `test_belt_headless.py` and `test_belt_scheduler.py` cover the runner and the
-cadence scheduler; the headless file also lands a run (commit subject from the
+cadence scheduler; `test_belt_continuous_cadence.py` pins each `continuous` due
+rule and the loop's tick interval; `test_belt_plan_policy.py` pins the auto plan
+gate against the pilot's gate log and drives it through the real trigger, store
+and executor (approve as `system:belt-policy` with one chain, escalate on a Clef
+outage or low independence, unchanged with the flag off); the headless file also lands a run (commit subject from the
 title) and drives the re-develop against a real tmp repo: two diffs from one
 base, the first landed and merged, the second re-developed once and back at the
 gate, a second conflict failing with "base moved twice", and no develop loop

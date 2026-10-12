@@ -4,10 +4,10 @@
 # ``state`` plus typed questions (``noul`` yes/no, ``choice``, ``score``) and
 # returns a probability per answer. Belt asks it about the foreman's PLANS and
 # the station's DIFFS and records the verdict on the Instinct Action blob it
-# judged (``_belt_plan`` / ``_code_change``, key ``clef``). SHADOW ONLY: nothing
-# reads a verdict to decide anything; the eval lists verdicts beside what the
-# human and the executor actually did (``list_verdicts``,
-# ``scripts/clef_verdicts.py``).
+# judged (``_belt_plan`` / ``_code_change``, key ``clef``). Diff verdicts are
+# shadow only. A plan verdict decides nothing unless the plan gate runs its auto
+# policy; the eval lists verdicts beside what the human and the executor did
+# (``list_verdicts``, ``scripts/clef_verdicts.py``).
 #
 #   * ``ClefClient.ask`` — one POST, 20 s timeout, one retry on a 5xx; returns
 #     ``None`` on any failure (timeout, 4xx, ``success:false``, bad JSON).
@@ -16,6 +16,10 @@
 #   * ``record_verdict`` / ``list_verdicts`` — the blob write and the eval read.
 #   * ``shadow_plan`` / ``shadow_diff`` — the hooks: a synchronous flag check,
 #     then a fire-and-forget task that scores and records, logging one line.
+#   * ``score_and_record_plan`` — the plan scoring + recording ``shadow_plan``
+#     runs. ``shadow_plan``'s task returns the verdict, so the plan gate's auto
+#     policy (``mandates/plan_policy.py``, ``POCKETPAW_BELT_PLAN_GATE=auto``)
+#     awaits that task inline (shielded: a timeout still records).
 #
 # Off unless ``POCKETPAW_BELT_CLEF=shadow`` and both ``POCKETPAW_CLEF_TOKEN`` and
 # ``POCKETPAW_CLEF_ACCOUNT_ID`` are set. INVARIANTS: nothing here raises into a
@@ -352,9 +356,6 @@ async def record_verdict(
     workspace_id: str,
 ) -> bool:
     """Write ``clef`` onto the judged Action's blob. Never raises."""
-    # ponytail: read-modify-write ~1-2 s after the propose; an approve that edits
-    # the blob inside that window is overwritten (dispatch already read it). A
-    # store-side field merge closes it if Clef ever leaves shadow mode.
     from pocketpaw.stores import get_instinct_store
     from pocketpaw_ee.cloud._core.proposals import update_action_blob
 
@@ -430,11 +431,12 @@ def _spawn(label: str, coro_fn: Any) -> asyncio.Task[Any] | None:
     if client is None:
         return None
 
-    async def run() -> None:
+    async def run() -> Any:
         try:
-            await coro_fn(client)
+            return await coro_fn(client)
         except Exception as exc:  # noqa: BLE001 — shadow mode never fails a shift
             logger.warning("clef: %s shadow score failed (%s)", label, type(exc).__name__)
+            return None
 
     try:
         task = asyncio.get_running_loop().create_task(run())
@@ -445,22 +447,44 @@ def _spawn(label: str, coro_fn: Any) -> asyncio.Task[Any] | None:
     return task
 
 
+async def score_and_record_plan(
+    workspace_id: str,
+    plan_action_id: str,
+    plan_tasks: list[dict[str, Any]],
+    charter: dict,
+    *,
+    client: ClefClient | None = None,
+) -> PlanVerdict | None:
+    """Score a proposed plan, record the verdict on its ``_belt_plan`` blob and
+    return it (``None`` when Clef is off or failed). The shadow hook spawns this;
+    the auto plan gate awaits it."""
+    client = client or from_env()
+    if client is None:
+        return None
+    scope = f"Goal: {charter.get('goal', '')}"
+    rubric = "\n".join(
+        [f"Boundary: {b}" for b in charter.get("boundaries") or []]
+        + [f"Says no to: {s}" for s in charter.get("says_no") or []]
+    )
+    verdict = await score_plan(plan_tasks, scope, rubric, client=client)
+    if verdict is None:
+        return None
+    await record_verdict(plan_action_id, "plan", verdict, workspace_id=workspace_id)
+    logger.info("clef: plan %s scored %s", plan_action_id, asdict(verdict))
+    return verdict
+
+
 def shadow_plan(
     workspace_id: str, plan_action_id: str, plan_tasks: list[dict[str, Any]], charter: dict
 ) -> asyncio.Task[Any] | None:
-    """Score a proposed plan and record the verdict on its ``_belt_plan`` blob."""
+    """Score a proposed plan in the background and record the verdict. The
+    task's result is the ``PlanVerdict`` (or ``None``), so the auto plan gate
+    can await it; a timed-out wait leaves it recording in the background."""
 
-    async def go(client: ClefClient) -> None:
-        scope = f"Goal: {charter.get('goal', '')}"
-        rubric = "\n".join(
-            [f"Boundary: {b}" for b in charter.get("boundaries") or []]
-            + [f"Says no to: {s}" for s in charter.get("says_no") or []]
+    async def go(client: ClefClient) -> PlanVerdict | None:
+        return await score_and_record_plan(
+            workspace_id, plan_action_id, plan_tasks, charter, client=client
         )
-        verdict = await score_plan(plan_tasks, scope, rubric, client=client)
-        if verdict is None:
-            return
-        await record_verdict(plan_action_id, "plan", verdict, workspace_id=workspace_id)
-        logger.info("clef: plan %s scored %s", plan_action_id, asdict(verdict))
 
     return _spawn("plan", go)
 

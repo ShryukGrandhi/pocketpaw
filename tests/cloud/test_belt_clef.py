@@ -154,13 +154,8 @@ async def test_timeout_returns_none(on):
 
 
 async def test_shadow_hook_swallows_failure_and_records_nothing(on, monkeypatch):
-    fake = on(Fake())
+    on(Fake(exc=RuntimeError("boom")))
     recorded: list = []
-
-    async def explode(*a, **k):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(clef, "score_plan", explode)
 
     async def record(*a, **k):
         recorded.append(a)
@@ -170,7 +165,7 @@ async def test_shadow_hook_swallows_failure_and_records_nothing(on, monkeypatch)
     task = clef.shadow_plan(WS, "a1", TASKS, {"goal": "g"})
     assert task is not None
     await task  # never raises
-    assert recorded == [] and fake.requests == []
+    assert recorded == []
 
 
 @pytest.mark.usefixtures("store", "journal", "graph")
