@@ -68,6 +68,12 @@ from pocketpaw_ee.cloud.growth.dto import (
     UpdateIcpRequest,
     UpdateProspectRequest,
 )
+from pocketpaw_ee.cloud.growth.social.dto import (
+    AddPulseCompaniesRequest,
+    AddPulseCompaniesResponse,
+    RefreshPulseRequest,
+    SocialPulseResponse,
+)
 from pocketpaw_ee.cloud.license import require_license
 
 router = APIRouter(prefix="/growth", tags=["Growth"], dependencies=[Depends(require_license)])
@@ -587,3 +593,63 @@ async def deliver_approved(
     attempt in flight. 422 ``queue.not_deliverable`` for linkedin, 409
     ``growth.mock_delivery_off`` when mock delivery is off."""
     return await growth_service.deliver_approved(ctx, channel)
+
+
+@router.get(
+    "/icps/{icp_id}/pulse",
+    response_model=SocialPulseResponse,
+    dependencies=[Depends(require_action_any_workspace("growth.read"))],
+)
+async def get_icp_pulse(
+    icp_id: str, ctx: RequestContext = Depends(request_context)
+) -> SocialPulseResponse:
+    """This hunt's market pulse (empty before the first refresh)."""
+    from pocketpaw_ee.cloud.growth.social import service as social_service
+
+    return await social_service.get_hunt_pulse(ctx, icp_id)
+
+
+@router.post(
+    "/icps/{icp_id}/pulse/refresh",
+    response_model=SocialPulseResponse,
+    dependencies=[Depends(require_action_any_workspace("growth.write"))],
+)
+async def refresh_icp_pulse(
+    icp_id: str,
+    body: RefreshPulseRequest | None = None,
+    ctx: RequestContext = Depends(request_context),
+) -> SocialPulseResponse:
+    """Read what people matching this ICP say on Reddit / X (~1 min, in-request): themes with
+    why they matter for the hunt, outreach angles and the companies the posts name."""
+    from pocketpaw_ee.cloud.growth.social import service as social_service
+
+    return await social_service.refresh_hunt_pulse(ctx, icp_id, body or RefreshPulseRequest())
+
+
+@router.post(
+    "/icps/{icp_id}/pulse/prospects",
+    response_model=AddPulseCompaniesResponse,
+    dependencies=[Depends(require_action_any_workspace("growth.write"))],
+)
+async def add_icp_pulse_prospects(
+    icp_id: str,
+    body: AddPulseCompaniesRequest,
+    ctx: RequestContext = Depends(request_context),
+) -> AddPulseCompaniesResponse:
+    """File a theme's named companies as prospects (company-level, source post as evidence)."""
+    from pocketpaw_ee.cloud.growth.social import service as social_service
+
+    return await social_service.add_pulse_companies(ctx, icp_id, body)
+
+
+@router.post(
+    "/prospects/{prospect_id}/signals",
+    response_model=ProspectResponse,
+    dependencies=[Depends(require_action_any_workspace("growth.write"))],
+)
+async def refresh_prospect_signals(
+    prospect_id: str, ctx: RequestContext = Depends(request_context)
+) -> ProspectResponse:
+    """Read buying signals on this prospect (LinkedIn page and ads, Reddit / X mentions), each
+    with why it matters, plus a suggested first touch. 503 with no provider."""
+    return await growth_service.refresh_signals(ctx, prospect_id)

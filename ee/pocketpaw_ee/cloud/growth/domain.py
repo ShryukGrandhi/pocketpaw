@@ -154,6 +154,8 @@ MAX_ICP_MAX_PER_RUN = 100
 # Explicit + dotted like the other two, so the wire name survives a rename of
 # the Python function.
 GROWTH_DISCOVERY_SWEEP_JOB_NAME = "growth.discovery_sweep"
+# The daily Pulse refresh (Growth › Social and hunt market pulses someone used this week).
+GROWTH_PULSE_SWEEP_JOB_NAME = "growth.pulse_sweep"
 
 
 @dataclass(frozen=True)
@@ -415,6 +417,7 @@ __all__ = [
     "EMAIL_CONFIDENCE",
     "GATE_OWNED_TARGETS",
     "GROWTH_DISCOVERY_SWEEP_JOB_NAME",
+    "GROWTH_PULSE_SWEEP_JOB_NAME",
     "GROWTH_DISPATCH_JOB_NAME",
     "GROWTH_QUEUE_NAME",
     "ICP_CADENCE_ORDER",

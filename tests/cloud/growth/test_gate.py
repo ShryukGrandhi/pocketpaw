@@ -1025,6 +1025,13 @@ class TestGrowthRouteRbac:
             ("POST", "/growth/social/characters"): "growth.write",
             ("DELETE", "/growth/social/characters/{character_id}"): "growth.write",
             ("POST", "/growth/social/memes"): "growth.write",
+            ("GET", "/growth/icps/{icp_id}/pulse"): "growth.read",
+            ("POST", "/growth/icps/{icp_id}/pulse/refresh"): "growth.write",
+            ("POST", "/growth/icps/{icp_id}/pulse/prospects"): "growth.write",
+            ("POST", "/growth/prospects/{prospect_id}/signals"): "growth.write",
+            ("GET", "/growth/social/pulse"): "growth.read",
+            ("POST", "/growth/social/pulse/refresh"): "growth.write",
+            ("POST", "/growth/social/pulse/use"): "growth.write",
             ("POST", "/growth/social/ideas/{idea_id}/unschedule"): "growth.write",
         }
 

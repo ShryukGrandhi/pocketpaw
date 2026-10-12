@@ -45,6 +45,12 @@ from pocketpaw_ee.cloud.growth.social.memes import (
     set_production_character_fn,
     set_production_meme_fn,
 )
+from pocketpaw_ee.cloud.growth.social.pulse import (
+    PulseResult,
+    PulseSource,
+    PulseUnavailable,
+    set_production_pulse_fn,
+)
 from pocketpaw_ee.cloud.growth.social.router import router as social_router
 from pocketpaw_ee.cloud.license import require_license
 
@@ -115,6 +121,7 @@ def _reset_seams():
         set_production_media_fn(None)
         set_production_character_fn(None)
         set_production_meme_fn(None)
+        set_production_pulse_fn(None)
 
 
 class _FakeAnalyzer:
@@ -141,7 +148,9 @@ class _FakeIdeas:
         recent_hooks: list[str],
         *,
         platform: str | None = None,
+        pulse: list | None = None,
     ) -> tuple[GeneratedIdea, ...]:
+        self.pulse = pulse
         self.calls.append((profile, count, recent_hooks))
         if isinstance(self.result, Exception):
             raise self.result
@@ -774,3 +783,90 @@ async def test_patch_picks_which_media_goes_with_the_post(w1):
     url = f"{IDEAS}/{idea['id']}"
     assert (await w1.patch(url, json={"media_choice": "reel"})).json()["media_choice"] == "reel"
     assert (await w1.patch(url, json={"media_choice": "gif"})).status_code == 422
+
+
+THEME = {
+    "title": "Chasing invoices",
+    "why": "Your product automates reminders and people keep asking for it.",
+    "sentiment": "negative",
+    "phrases": ["clients ghost me"],
+    "evidence": [
+        {
+            "id": "r_1",
+            "platform": "reddit",
+            "url": "https://www.reddit.com/r/f/1",
+            "title": "t",
+            "text": "x",
+            "score": 9,
+            "source": "r/f",
+            "comments": ["same"],
+        }
+    ],
+    "suggestions": [
+        {
+            "platform": "reddit",
+            "hook": "How we stopped chasing",
+            "caption": "body",
+            "subreddit": "freelance",
+        }
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_pulse_refresh_use_and_ideas_read_it(w1, w2):
+    assert (await w1.post(f"{BASE}/pulse/refresh", json={})).status_code == 503
+    seen = {}
+
+    async def build(profile, sources):
+        seen["sources"] = sources
+        return PulseResult(
+            sources=(PulseSource("reddit", "subreddit", "freelance"),), themes=(THEME,)
+        )
+
+    set_production_pulse_fn(build)
+    await w1.put(PROFILE, json={"owner_name": "A", "company_name": "B"})
+    assert (await w1.post(f"{BASE}/pulse/refresh", json={})).status_code == 409
+    await _complete(w1)
+    assert (await w1.get(f"{BASE}/pulse")).json()["themes"] == []
+
+    resp = await w1.post(f"{BASE}/pulse/refresh", json={})
+    assert resp.status_code == 200, resp.text
+    pulse = resp.json()
+    assert seen["sources"] is None
+    assert pulse["themes"][0]["why"].startswith("Your product")
+    assert pulse["sources"] == [{"platform": "reddit", "kind": "subreddit", "value": "freelance"}]
+    assert (await w1.post(f"{BASE}/pulse/refresh", json={})).json()["error"][
+        "code"
+    ] == "social.pulse_cooldown"
+    assert (await w2.get(f"{BASE}/pulse")).status_code == 404
+
+    used = await w1.post(
+        f"{BASE}/pulse/use", json={"theme": 0, "suggestion": 0, "status": "approved"}
+    )
+    idea = used.json()
+    assert (idea["platform"], idea["subreddit"], idea["status"]) == (
+        "reddit",
+        "freelance",
+        "approved",
+    )
+    assert idea["why"].startswith("From your market pulse, Chasing invoices")
+    assert (
+        await w1.post(f"{BASE}/pulse/use", json={"theme": 3, "suggestion": 0})
+    ).status_code == 404
+
+    fake = _FakeIdeas()
+    set_production_ideas_fn(fake)
+    await w1.post(f"{IDEAS}/generate", json={"count": 1})
+    assert fake.pulse and fake.pulse[0]["title"] == "Chasing invoices"
+
+
+@pytest.mark.asyncio
+async def test_pulse_unavailable_provider_is_a_503(w1):
+    async def build(profile, sources):
+        raise PulseUnavailable("no social data provider is configured")
+
+    set_production_pulse_fn(build)
+    await _complete(w1)
+    resp = await w1.post(f"{BASE}/pulse/refresh", json={})
+    assert resp.status_code == 503 and resp.json()["error"]["code"] == "social.pulse_unavailable"

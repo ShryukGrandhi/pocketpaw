@@ -304,3 +304,72 @@ class MemeFormatResponse(BaseModel):
 
 class MemeFormatListResponse(BaseModel):
     items: list[MemeFormatResponse]
+
+
+class PulseSourceModel(BaseModel):
+    platform: Literal["reddit", "x"]
+    kind: Literal["subreddit", "search"]
+    value: str = Field(min_length=2, max_length=120)
+
+
+class RefreshPulseRequest(BaseModel):
+    """Sources to read; omitted = keep the last ones, or let the agent pick from the profile."""
+
+    sources: list[PulseSourceModel] | None = Field(default=None, max_length=6)
+
+
+class PulseEvidenceResponse(BaseModel):
+    id: str
+    platform: Literal["reddit", "x"]
+    url: str
+    title: str
+    text: str
+    score: int
+    source: str
+    comments: list[str]
+    new: bool = False
+
+
+class PulseSuggestionResponse(BaseModel):
+    platform: Literal["reddit", "x"]
+    hook: str
+    caption: str
+    subreddit: str
+
+
+class PulseCompanyResponse(BaseModel):
+    name: str
+    domain: str
+    reason: str
+    url: str
+
+
+class PulseThemeResponse(BaseModel):
+    title: str
+    why: str
+    sentiment: str
+    phrases: list[str]
+    evidence: list[PulseEvidenceResponse]
+    suggestions: list[PulseSuggestionResponse]
+    companies: list[PulseCompanyResponse] = Field(default_factory=list)
+
+
+class SocialPulseResponse(BaseModel):
+    sources: list[PulseSourceModel]
+    themes: list[PulseThemeResponse]
+    refreshed_at: str | None
+
+
+class UsePulseSuggestionRequest(BaseModel):
+    theme: int = Field(ge=0, le=10)
+    suggestion: int = Field(ge=0, le=5)
+    status: Literal["new", "approved"] = "new"
+
+
+class AddPulseCompaniesRequest(BaseModel):
+    theme: int = Field(ge=0, le=10)
+
+
+class AddPulseCompaniesResponse(BaseModel):
+    added: list[str]
+    skipped: list[str]

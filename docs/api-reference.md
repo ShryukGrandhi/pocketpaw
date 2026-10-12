@@ -6854,6 +6854,19 @@ bulk delete, including proposal withdrawal. Returns `204` with no body.
 Requires `growth.write`. An id that is unknown, malformed, or in another
 workspace returns `404 prospect.not_found`.
 
+### `POST /api/v1/growth/prospects/{prospect_id}/signals`
+
+No body. Reads buying signals on the prospect through ScrapeCreators: its LinkedIn company page
+(when `linkedin_url` is set: size, industry, funding, recent posts), its LinkedIn ads, and Reddit /
+X posts mentioning it. The agent turns them into `research.signals: [{kind, text, why, url}]`
+(each `why` written for the prospect's hunt) and `research.first_touch`, a suggested opening
+that cites one signal. The writer reads both. A later re-research keeps them. `503
+prospect.signals_unavailable` with no provider; `502 prospect.signals_failed` when the run fails.
+
+The growth worker refreshes every Pulse (Social and hunt) that a person refreshed in the last
+7 days and that is more than 20 hours old, daily at 05:00 UTC (`growth.pulse_sweep`), with
+its saved sources.
+
 ### `POST /api/v1/growth/prospects/{prospect_id}/research`
 
 Research one prospect with the workspace's `growth-researcher` agent (the one
@@ -7530,6 +7543,9 @@ new`; nothing is drafted or sent. Workspace-scoped: another tenant's id is a
 | `GET /api/v1/growth/icps/{icp_id}` | One hunt. |
 | `PATCH /api/v1/growth/icps/{icp_id}` | Partial update; `null`/omitted leaves a field as-is. Nothing re-runs on an edit. |
 | `POST /api/v1/growth/icps/{icp_id}/preview` | Dry run (below). |
+| `GET /api/v1/growth/icps/{icp_id}/pulse` | The hunt's market pulse: same shape as `GET /growth/social/pulse`, with each theme's `why` written for the hunt, `suggestions` as outreach angles (`hook` = the angle, `caption` = an example first line), and `companies: [{name, domain, reason, url}]` the posts name as having the need (never a person). Evidence not seen in the previous refresh carries `new: true`. |
+| `POST /api/v1/growth/icps/{icp_id}/pulse/refresh` | `{sources?}`: read Reddit / X for this ICP (ScrapeCreators; ~11 requests, ~1 min in-request). `503 social.pulse_unavailable` with no provider, `409 social.pulse_cooldown` within 10 minutes of the last refresh with the same sources. |
+| `POST /api/v1/growth/icps/{icp_id}/pulse/prospects` | `{theme}`: file that theme's companies as prospects (`source: discovery`, `icp_id`, the source post in `source_urls`). Returns `{added, skipped}`; a company with no stated website is skipped. |
 | `DELETE /api/v1/growth/icps/{icp_id}` | Delete the hunt. Prospects it already filed stay. |
 
 **Response (`IcpResponse`)** — every route above except the preview and the
@@ -7628,6 +7644,9 @@ other route `growth.write` (both MEMBER).
 | `POST /api/v1/growth/social/characters` | `{name?, description}`: the agent draws an original vector mascot (never a real person or existing franchise character), sanitised, kept on the profile (max 6, else `409 social.character_limit`). Returns the profile. |
 | `DELETE /api/v1/growth/social/characters/{character_id}` | Remove a character. Returns the profile. |
 | `POST /api/v1/growth/social/memes` | `{format?, character_id?, mention_business, prompt?, platform}`: draw a meme (character redrawn in the format's layout, as SVG) and file it as a new Blitz idea with `format: "meme"` and `poster_svg`. `409` before setup, `404` unknown character, `422` unknown format. |
+| `GET /api/v1/growth/social/pulse` | The social's latest market Pulse: `{sources, themes: [{title, why, sentiment, phrases, evidence: [{platform, url, title, text, score, source, comments}], suggestions: [{platform, hook, caption, subreddit}]}], refreshed_at}`. Empty before the first refresh. |
+| `POST /api/v1/growth/social/pulse/refresh` | `{sources?: [{platform: reddit\|x, kind: subreddit\|search, value}]}` (max 6; omitted = the last sources, or the agent picks 3 subreddits + 2 X searches from the profile). Reads public posts and top comments through ScrapeCreators (`SCRAPECREATORS_API_KEY`; ~11 requests, subreddit reads cached 1 day), then the ideas agent groups them into themes with why it matters, the audience's phrases and post suggestions. No author names are kept. `503 social.pulse_unavailable` with no provider, `409` before setup or within 10 minutes of the last refresh with the same sources, `502` when nothing usable comes back. |
+| `POST /api/v1/growth/social/pulse/use` | `{theme, suggestion, status: new\|approved}`: file a theme's suggestion as an idea (to Blitz, or approved to Content), its `why` naming the theme. |
 
 **Response (`SocialProfile`)** — every profile route returns this shape:
 

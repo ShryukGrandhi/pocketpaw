@@ -115,6 +115,16 @@ def _research_lines(prospect: Prospect) -> list[str]:
     ]
     if facts:
         lines.append("Facts: " + "; ".join(facts))
+    signals = [
+        f"{s.get('text')} ({s.get('why')})"
+        for s in research.get("signals") or []
+        if isinstance(s, dict) and s.get("text")
+    ]
+    if signals:
+        lines.append("Buying signals: " + "; ".join(signals))
+    first_touch = research.get("first_touch")
+    if isinstance(first_touch, str) and first_touch.strip():
+        lines.append(f"Suggested first touch: {first_touch.strip()}")
     if not lines and prospect.research_brief.strip():
         lines.append(prospect.research_brief.strip())
     return lines

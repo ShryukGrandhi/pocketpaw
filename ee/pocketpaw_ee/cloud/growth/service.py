@@ -1252,8 +1252,44 @@ def _apply_research(doc: _ProspectDoc, company: Any, now: datetime) -> None:
     if doc.status == "new":
         doc.status = "qualified"
 
-    doc.research = profile.model_dump()
+    kept = {k: v for k, v in (doc.research or {}).items() if k in ("signals", "first_touch") and v}
+    doc.research = {**profile.model_dump(), **kept}
     doc.researched_at = now
+
+
+async def refresh_signals(ctx: RequestContext, prospect_id: str) -> ProspectResponse:
+    """Read buying signals on one prospect (LinkedIn page and ads, Reddit / X mentions) with why
+    each matters for its hunt, plus a suggested first touch, into ``research``. The writer reads
+    them. 503 with no provider, 502 when the run fails."""
+    from pocketpaw_ee.cloud.growth.researcher import ResearchUnavailable
+    from pocketpaw_ee.cloud.growth.social import pulse
+
+    workspace_id = _require_workspace(ctx)
+    signals_fn = pulse.resolve_signals_fn()
+    if signals_fn is None:
+        raise CloudError(503, "prospect.signals_unavailable", "Signals are not configured here")
+    doc = await _fetch_in_workspace(workspace_id, prospect_id)
+    icp = await _icp_for(workspace_id, doc)
+    brief = (
+        pulse.hunt_brief(workspace_id, icp.name, icp.criteria, icp.geography, icp.exclusions)
+        if icp
+        else pulse.hunt_brief(workspace_id, "Outreach", "a company this workspace could sell to")
+    )
+    try:
+        found = await signals_fn(brief, doc.company or doc.name, doc.domain, doc.linkedin_url)
+    except pulse.PulseUnavailable as exc:
+        raise CloudError(503, "prospect.signals_unavailable", str(exc)) from exc
+    except ResearchUnavailable as exc:
+        raise CloudError(502, "prospect.signals_failed", "Reading signals failed") from exc
+    doc = await _fetch_in_workspace(workspace_id, prospect_id)
+    doc.research = {
+        **(doc.research or {}),
+        "signals": list(found.signals),
+        "first_touch": found.first_touch,
+    }
+    await doc.save()
+    # no-event: growth has no realtime subscriber in v1; the prospect view re-renders.
+    return _to_response(_to_domain(doc))
 
 
 async def research_prospect(ctx: RequestContext, prospect_id: str) -> ProspectResponse:
