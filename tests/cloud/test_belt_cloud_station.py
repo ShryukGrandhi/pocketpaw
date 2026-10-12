@@ -23,13 +23,31 @@
 # cap escalates like a refusal; a fixer that fails to launch is recorded on the
 # blob's ``fixes`` and tracking goes on. A landed run carries the PR's diff
 # (Clef's copy when the head has not moved, else fetched again) and fetches the
-# bound repo, whose failure never fails the land. ``pty_run.py`` itself runs for real:
+# bound repo, whose failure never fails the land. With the tester on and a
+# tester seat, a landed run launches ONE tester (engine brief: fuzz; app brief,
+# a ``Sources/*App`` in the clone: snapshots against docs/design.md), recorded as
+# ``tester`` with a landed/test update; off by default, none without a seat, one
+# per run, and a failed launch is recorded while the land stands. Screenshots:
+# the head's CI run with a ``snapshots`` artifact is found through gh api, its
+# real PNGs kept (sanitized, 40 files / 20 MB caps, sha on the blob) once the PR
+# is known and on land, and no artifact or a failed download never fails a land.
+# RESUME (a restart): a launched run (``headless_state="cloud"``, no diff) is
+# tracked again and lands, also when its PR merged while the backend was down;
+# nothing is launched; a run without the mark (or a failed one) is not resumed;
+# an unreadable workspace skips only itself; the run timeout counts from
+# ``cloud.launched_at``; a fixer recorded on the PR's head is not doubled.
+# LANE NUDGE: a labelled PR green and mergeable past the interval gets one
+# ``gh workflow run "Fast Lane"`` (none before it); two tracked PRs on one repo
+# share one dispatch per interval; a red, conflicting, pending, unknown or
+# unlabelled PR gets none; a failed dispatch never stops the tracker.
+# ``pty_run.py`` itself runs for real:
 # it streams the child's output as it lands and exits on the folder-trust
 # prompt instead of waiting; ``wire_from_env`` wires the cloud dispatcher only
 # with a launch clone.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import time
@@ -115,6 +133,9 @@ class FakeRunner:
         launch_code: int = 0,
         launch_lines: tuple[str, ...] = (),
         repo_fetch_code: int = 0,
+        snapshots: dict[str, bytes] | None = None,
+        download_code: int = 0,
+        workflow_code: int = 0,
     ):
         self.calls: list[tuple[list[str], Path]] = []
         # A list is consumed one entry per launch / per ``gh pr view``, holding the last.
@@ -126,6 +147,13 @@ class FakeRunner:
         self.repo_fetch_code = repo_fetch_code  # ``git fetch`` in the bound repo
         self.prs = pr if isinstance(pr, list) else [pr]
         self.run_ref = ""
+        # The PR head's CI runs: 502 carries the ``snapshots`` artifact, 501 does not.
+        self.snapshots = snapshots
+        self.download_code = download_code
+        self.also: list[str] = []  # more run refs, each with its own PR (#10, #11, ...)
+        self.workflow_code = workflow_code  # ``gh workflow run`` (the lane nudge)
+        self.clock = lambda: 0.0  # the dispatcher's clock, to stamp each dispatch
+        self.dispatched: list[float] = []
 
     @staticmethod
     def _next(seq: list):
@@ -147,13 +175,30 @@ class FakeRunner:
             if self.prs[0] is None:
                 return 0, "[]", ""
             body = f"Closes #93\n\n{MARKER} {self.run_ref}\n"
-            return 0, json.dumps([{"number": 7, "body": "other"}, {"number": 9, "body": body}]), ""
+            prs = [{"number": 7, "body": "other"}, {"number": 9, "body": body}]
+            prs += [{"number": 10 + i, "body": f"{MARKER} {r}"} for i, r in enumerate(self.also)]
+            return 0, json.dumps(prs), ""
+        if argv[:3] == ["gh", "workflow", "run"]:
+            self.dispatched.append(self.clock())
+            return self.workflow_code, "", "HTTP 403" if self.workflow_code else ""
         if argv[:3] == ["gh", "pr", "view"]:
             return 0, json.dumps(self._next(self.prs)), ""
         if argv[:3] == ["gh", "run", "view"]:
             return 0, "".join(f"build\tstep\tL{i:03d}\n" for i in range(1, 51)), ""
         if argv[:3] == ["gh", "pr", "diff"]:
             return 0, DIFF, ""
+        if argv[:2] == ["gh", "api"] and argv[2].endswith("/artifacts"):
+            names = ["snapshots"] if "/runs/502/" in argv[2] else ["coverage"]
+            return 0, json.dumps({"artifacts": [{"name": n, "expired": False} for n in names]}), ""
+        if argv[:2] == ["gh", "api"] and "/actions/runs?head_sha=" in argv[2]:
+            runs = [{"id": 501}, {"id": 502}] if self.snapshots is not None else []
+            return 0, json.dumps({"total_count": len(runs), "workflow_runs": runs}), ""
+        if argv[:3] == ["gh", "run", "download"]:
+            out = Path(argv[argv.index("-D") + 1])
+            for rel, data in (self.snapshots or {}).items():
+                (out / rel).parent.mkdir(parents=True, exist_ok=True)
+                (out / rel).write_bytes(data)
+            return self.download_code, "", "no artifact" if self.download_code else ""
         if "fetch" in argv and cwd.name == "repo":
             return self.repo_fetch_code, "", "fatal: unable to access origin"
         return 0, "", ""  # git fetch / checkout
@@ -213,7 +258,9 @@ async def test_merged_pr_lands_the_run(store, dirs, monkeypatch):
     assert cc["commit_sha"] == "abc123"
     assert cc["branch"] == "claude/g41-text"
     assert cc["files_changed"] == 2
-    assert cc["cloud"] == {"session_url": "https://claude.ai/code/session_ABC123", "pr": 9}
+    assert cc["cloud"]["session_url"] == "https://claude.ai/code/session_ABC123"
+    assert cc["cloud"]["pr"] == 9
+    assert cc["cloud"]["launched_at"] <= time.time()  # the run timeout counts from it
     assert any(a[:4] == ["gh", "pr", "view", "9"] for a, _ in runner.calls)
     assert "headless_state" not in cc
     # The merged PR's diff is on the blob for the UI, reusing Clef's fetch.
@@ -589,6 +636,258 @@ async def test_bound_repo_fetch_failure_never_fails_the_land(store, dirs):
     assert any(a[-3:] == ["fetch", "-q", "origin"] and c == repo for a, c in runner.calls)
 
 
+# -- the tester: one cloud session per landed run tries to break what it built --
+
+
+@pytest.fixture
+def updates(monkeypatch) -> list[tuple[str, str]]:
+    seen: list[tuple[str, str]] = []
+
+    async def emit(**kw) -> None:
+        seen.append((kw["status"], kw["stage"]))
+
+    monkeypatch.setattr(cloud_station, "_emit_run_updated", emit)
+    return seen
+
+
+TESTER_SEAT = {"agent_id": "t1", "name": "Tess", "setup": "", "seated_by": "u1"}
+
+
+def _tester(runner: FakeRunner, launch: Path, *, seat: dict | None = TESTER_SEAT, **kw):
+    d = _dispatcher(runner, launch, tester=True, **kw)
+
+    async def tester_for(workspace_id: str, mandate_id: str) -> dict | None:
+        assert (workspace_id, mandate_id) == (WS, "m1")
+        return seat
+
+    async def worker_for(workspace_id: str, agent_id: str, seated_by: str) -> dict:
+        assert agent_id == "t1"
+        return {"name": "Tess", "model": "", "instructions": "Be mean to edge cases."}
+
+    d.tester_for = tester_for
+    d._blobs.worker_for = worker_for
+    return d
+
+
+async def test_a_landed_run_launches_one_tester(store, dirs, updates):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=MERGED)
+    runner.run_ref = run_ref
+
+    await _tester(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    briefs = _briefs(runner)
+    assert len(briefs) == 2  # the worker, then the tester
+    brief = briefs[1]
+    assert "tester" in brief and "break" in brief
+    assert PR_URL in brief and "#93" in brief  # the merged PR and the source issue
+    assert f"{cloud_station.TEST_MARKER} {run_ref}" in brief
+    assert "`bug`" in brief and "`gap`" in brief and "`fast-lane`" in brief
+    assert "Do not fix" in brief and "Never merge" in brief
+    assert "fuzz" in brief  # engine code: no Sources/*App in the repo
+    assert "<untrusted>\nBe mean to edge cases.\n</untrusted>" in brief
+    tester = action.parameters["_code_change"]["tester"]
+    assert tester["session_url"] == "https://claude.ai/code/session_ABC123"
+    assert isinstance(tester["at"], float)
+    assert ("landed", "test") in updates
+
+
+async def test_the_tester_looks_at_snapshots_on_an_app_repo(store, dirs, updates):
+    repo, launch = dirs
+    (launch / "Sources" / "FlareApp").mkdir(parents=True)
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=MERGED)
+    runner.run_ref = run_ref
+
+    await _tester(runner, launch).run(run_ref, workspace_id=WS)
+
+    brief = _briefs(runner)[1]
+    assert "snapshots" in brief and "gh run download" in brief
+    assert "docs/design.md" in brief and "dark" in brief and "empty state" in brief
+
+
+async def test_the_tester_is_off_by_default(store, dirs, updates):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=MERGED)
+    runner.run_ref = run_ref
+
+    d = _tester(runner, launch)  # a tester seat is there; the env flag is not
+    d.tester = False
+    await d.run(run_ref, workspace_id=WS)
+
+    assert len(_briefs(runner)) == 1
+    assert "tester" not in (await store.get_action(run_ref)).parameters["_code_change"]
+    assert ("landed", "test") not in updates
+
+
+async def test_no_tester_seat_launches_no_tester(store, dirs, updates):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=MERGED)
+    runner.run_ref = run_ref
+
+    await _tester(runner, launch, seat=None).run(run_ref, workspace_id=WS)
+
+    assert len(_briefs(runner)) == 1
+    assert "tester" not in (await store.get_action(run_ref)).parameters["_code_change"]
+
+
+async def test_a_run_gets_one_tester_at_most(store, dirs, updates):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    action = await store.get_action(run_ref)
+    params = dict(action.parameters)
+    params["_code_change"] = {**params["_code_change"], "tester": {"session_url": "x", "at": 1.0}}
+    await store.update_parameters(run_ref, params)
+    runner = FakeRunner(launch_out=SESSION, pr=MERGED)
+    runner.run_ref = run_ref
+
+    await _tester(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert len(_briefs(runner)) == 1
+    assert (await store.get_action(run_ref)).parameters["_code_change"]["tester"]["at"] == 1.0
+
+
+async def test_a_failed_tester_launch_is_recorded_and_the_land_stands(store, dirs, updates):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=[SESSION, "Error: rate limited"], pr=MERGED)
+    runner.run_ref = run_ref
+
+    await _tester(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    cc = action.parameters["_code_change"]
+    assert "no cloud session started" in cc["tester"]["error"]
+    assert "session_url" not in cc["tester"] and "headless_error" not in cc
+
+
+def test_wire_cloud_reads_the_tester_flag(tmp_path, monkeypatch):
+    monkeypatch.setattr(headless, "_PRODUCTION_DISPATCHER", None)
+    monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_LAUNCH_DIR", str(tmp_path))
+    monkeypatch.delenv("POCKETPAW_FACTORY_CLOUD_TESTER", raising=False)
+    assert cloud_station.wire_cloud() is True
+    assert headless.resolve_headless_dispatcher().tester is False
+    monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_TESTER", "1")
+    assert cloud_station.wire_cloud() is True
+    assert headless.resolve_headless_dispatcher().tester is True
+
+
+# -- screenshots: the PR head's ``snapshots`` artifact, kept on the run ---------
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+HEAD = "abc1234def5678"
+LANDED = {**_open(HEAD), "state": "MERGED", "mergeCommit": {"oid": "abc123"}}
+
+
+@pytest.fixture
+def shots(tmp_path, monkeypatch) -> Path:
+    root = tmp_path / "shots"
+    monkeypatch.setenv("POCKETPAW_FACTORY_SCREENSHOT_DIR", str(root))
+    return root
+
+
+async def test_a_landed_run_keeps_its_snapshot_pngs(store, dirs, shots):
+    import hashlib
+
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(
+        launch_out=SESSION,
+        pr=LANDED,
+        snapshots={
+            "flare-empty-light.png": PNG + b"L",
+            "dark/flare empty (dark).png": PNG + b"D",
+            "notes.txt": b"not an image",
+            "fake.png": b"<html>not a png</html>",
+            ".hidden.png": PNG,
+        },
+    )
+    runner.run_ref = run_ref
+
+    await _dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    kept = action.parameters["_code_change"]["screenshots"]
+    assert [k["name"] for k in kept] == ["flare-empty-light.png", "flare_empty__dark_.png"]
+    assert kept[0] == {
+        "name": "flare-empty-light.png",
+        "bytes": len(PNG) + 1,
+        "sha": hashlib.sha256(PNG + b"L").hexdigest(),
+    }
+    assert sorted(p.name for p in (shots / run_ref).iterdir()) == [k["name"] for k in kept]
+    assert (shots / run_ref / "flare_empty__dark_.png").read_bytes() == PNG + b"D"
+    api = [a[2] for a, _ in runner.calls if a[:2] == ["gh", "api"]]
+    assert api[0] == f"repos/{SLUG}/actions/runs?head_sha={HEAD}"
+    (download,) = [a for a, _ in runner.calls if a[:3] == ["gh", "run", "download"]]
+    assert download[3:8] == ["502", "-R", SLUG, "-n", "snapshots"]
+    assert not Path(download[-1]).exists()  # the temp download dir is gone
+
+
+async def test_screenshots_are_capped_by_count_and_bytes(store, dirs, shots, monkeypatch):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    many = {f"s{i:02d}.png": PNG for i in range(45)}
+    runner = FakeRunner(launch_out=SESSION, pr=LANDED, snapshots=many)
+    runner.run_ref = run_ref
+
+    await _dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+    kept = (await store.get_action(run_ref)).parameters["_code_change"]["screenshots"]
+    assert len(kept) == 40 and len(list((shots / run_ref).iterdir())) == 40
+
+    run_ref = await _queue(store, repo)
+    runner.run_ref = run_ref
+    monkeypatch.setattr(cloud_station, "_SHOT_BYTES", len(PNG) * 3)
+    await _dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+    kept = (await store.get_action(run_ref)).parameters["_code_change"]["screenshots"]
+    assert len(kept) == 3
+
+
+async def test_screenshots_are_fetched_once_the_pr_is_known(store, dirs, shots):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=_open(HEAD), snapshots={"a.png": PNG})
+    runner.run_ref = run_ref
+
+    await _dispatcher(runner, launch, timeout_seconds=0).run(run_ref, workspace_id=WS)
+
+    cc = (await store.get_action(run_ref)).parameters["_code_change"]
+    assert [k["name"] for k in cc["screenshots"]] == ["a.png"]
+    assert "no PR" not in cc["headless_error"]  # it timed out on the open PR
+
+
+async def test_no_snapshots_artifact_and_a_failed_download_never_fail_the_land(store, dirs, shots):
+    repo, launch = dirs
+    for runner in (
+        FakeRunner(launch_out=SESSION, pr=LANDED),
+        FakeRunner(launch_out=SESSION, pr=LANDED, snapshots={"a.png": PNG}, download_code=1),
+    ):
+        run_ref = await _queue(store, repo)
+        runner.run_ref = run_ref
+        await _dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+        action = await store.get_action(run_ref)
+        assert action.status == ActionStatus.EXECUTED
+        assert "screenshots" not in action.parameters["_code_change"]
+
+
+async def test_the_app_tester_brief_names_the_snapshots_run(store, dirs, shots, updates):
+    repo, launch = dirs
+    (launch / "Sources" / "FlareApp").mkdir(parents=True)
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=LANDED, snapshots={"a.png": PNG})
+    runner.run_ref = run_ref
+
+    await _tester(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert f"gh run download 502 -R {SLUG} -n snapshots" in _briefs(runner)[1]
+
+
 def _pty_child(script: str) -> list[str]:
     return [sys.executable, cloud_station.PTY_RUN, sys.executable, "-c", script]
 
@@ -623,3 +922,238 @@ async def test_pty_run_fails_fast_at_the_folder_trust_prompt(tmp_path):
     assert code not in (0, -1)  # pty_run bailed on its own, not via the timeout
     assert time.monotonic() - started < 20
     assert "Quick safety check" in out
+
+
+# -- resume after a restart -------------------------------------------------
+
+CLOUD_URL = "https://claude.ai/code/session_ABC123"
+
+
+async def _launched(store: InstinctStore, repo: Path, **cloud) -> str:
+    """A queued run as ``run()`` leaves it once launched, its tracker gone."""
+    run_ref = await _queue(store, repo)
+    await cloud_station._patch(
+        store, run_ref, headless_state="cloud", cloud={"session_url": CLOUD_URL, **cloud}
+    )
+    return run_ref
+
+
+def _resumer(runner: FakeRunner, launch: Path, **kw) -> CloudTaskDispatcher:
+    async def workspaces() -> list[str]:
+        return [WS]
+
+    return _dispatcher(runner, launch, workspaces_for=workspaces, **kw)
+
+
+async def test_resume_tracks_a_launched_run_and_lands_it(store, dirs):
+    repo, launch = dirs
+    run_ref = await _launched(store, repo, launched_at=time.time())
+    runner = FakeRunner(launch_out=SESSION, pr=[_open("h1"), MERGED])
+    runner.run_ref = run_ref
+
+    assert await _resumer(runner, launch).resume_all() == 1
+
+    assert not _briefs(runner)  # the worker exists: nothing is launched
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    cc = action.parameters["_code_change"]
+    assert cc["pr_url"] == PR_URL and cc["cloud"]["pr"] == 9
+    assert "headless_state" not in cc
+
+
+async def test_resume_lands_a_pr_that_merged_while_the_backend_was_down(store, dirs):
+    repo, launch = dirs
+    run_ref = await _launched(store, repo)  # no launched_at: an older run
+    runner = FakeRunner(launch_out=SESSION, pr=MERGED)
+    runner.run_ref = run_ref
+
+    assert await _resumer(runner, launch).resume_all() == 1
+
+    views = [a for a, _ in runner.calls if a[:3] == ["gh", "pr", "view"]]
+    assert len(views) == 1  # the first poll saw MERGED and landed it
+    assert not _briefs(runner)
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    assert action.approved_by == "system:fast-lane"
+
+
+async def test_resume_skips_runs_without_the_cloud_mark(store, dirs):
+    repo, launch = dirs
+    await _queue(store, repo)  # queued, never launched
+    failed = await _queue(store, repo)  # a tracker that gave up keeps only its session
+    await cloud_station._patch(
+        store, failed, cloud={"session_url": CLOUD_URL}, headless_error="TRACK: no PR"
+    )
+    runner = FakeRunner(launch_out=SESSION, pr=MERGED)
+
+    assert await _resumer(runner, launch).resume_all() == 0
+
+    assert runner.calls == []
+    assert (await store.get_action(failed)).status == ActionStatus.PENDING
+
+
+async def test_resume_survives_a_store_error(store, dirs, monkeypatch):
+    repo, launch = dirs
+    run_ref = await _launched(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=MERGED)
+    runner.run_ref = run_ref
+
+    def get_store(*, workspace_id=None):
+        if workspace_id == "broken":
+            raise OSError("disk I/O error")
+        return store
+
+    async def workspaces() -> list[str]:
+        return ["broken", WS]
+
+    monkeypatch.setattr("pocketpaw.stores.get_instinct_store", get_store)
+    assert await _dispatcher(runner, launch, workspaces_for=workspaces).resume_all() == 1
+    assert (await store.get_action(run_ref)).status == ActionStatus.EXECUTED
+
+    async def no_workspaces() -> list[str]:
+        raise RuntimeError("mongo is down")
+
+    assert await _dispatcher(runner, launch, workspaces_for=no_workspaces).resume_all() == 0
+
+
+async def test_resume_counts_the_timeout_from_the_launch(store, dirs):
+    repo, launch = dirs
+    run_ref = await _launched(store, repo, launched_at=time.time() - 5 * 3600)
+    runner = FakeRunner(launch_out=SESSION, pr=None)
+    runner.run_ref = run_ref
+
+    await _resumer(runner, launch).resume_all()  # the 4 h timeout already ran out
+
+    assert sum(a[:3] == ["gh", "pr", "list"] for a, _ in runner.calls) == 1
+    cc = (await store.get_action(run_ref)).parameters["_code_change"]
+    assert "no PR" in cc["headless_error"] and cc["station_pending"] is True
+
+
+async def test_resume_does_not_double_a_fixer_on_the_same_head(store, dirs, stages):
+    repo, launch = dirs
+    fix = {"kind": "ci", "at": time.time(), "head": "h1", "session_url": CLOUD_URL}
+    run_ref = await _launched(store, repo, launched_at=time.time())
+    await cloud_station._patch(store, run_ref, fixes=[fix])
+    red = _open("h1", red=True)  # the fixer is still working on h1
+    runner = FakeRunner(launch_out=SESSION, pr=[red] * 6 + [MERGED])
+    runner.run_ref = run_ref
+
+    await _resumer(runner, launch, poll_seconds=60, fix_grace_seconds=100).resume_all()
+
+    assert not _briefs(runner)
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    assert action.parameters["_code_change"]["fixes"] == [fix]
+
+
+# -- lane nudge: a green PR the lane left open gets its workflow dispatched ----
+
+LANE = [{"name": "fast-lane"}]
+NUDGE = ["gh", "workflow", "run", "Fast Lane", "-R", SLUG]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_lane_gate(monkeypatch) -> None:
+    monkeypatch.setattr(cloud_station, "_LANE_NUDGED", {})
+
+
+def _ready(**kw) -> dict:
+    return {**_open(**kw), "labels": LANE}
+
+
+def _nudger(runner: FakeRunner, launch: Path, **kw) -> CloudTaskDispatcher:
+    # Polls every 60 s, the default 300 s nudge interval, and no fixer in reach.
+    d = _dispatcher(runner, launch, poll_seconds=60, fix_grace_seconds=10**9, **kw)
+    runner.clock = d.clock
+    return d
+
+
+async def test_a_green_pr_left_open_gets_one_lane_nudge(store, dirs):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    # Green at t=0..300, merged at 360: due at 300, not before.
+    runner = FakeRunner(launch_out=SESSION, pr=[_ready()] * 6 + [MERGED])
+    runner.run_ref = run_ref
+
+    await _nudger(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert runner.dispatched == [300.0]
+    assert [a for a, _ in runner.calls if a[:3] == ["gh", "workflow", "run"]] == [NUDGE]
+    view = next(a for a, _ in runner.calls if a[:3] == ["gh", "pr", "view"])
+    assert "labels" in view[view.index("--json") + 1].split(",")
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    (at,) = action.parameters["_code_change"]["lane_nudges"]
+    assert at <= time.time()
+
+
+async def test_two_prs_on_one_repo_share_one_nudge_per_interval(store, dirs):
+    repo, launch = dirs
+    first, second = await _queue(store, repo), await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=[_ready()] * 14 + [MERGED])
+    runner.run_ref, runner.also = first, [second]
+    d = _nudger(runner, launch)
+    inner = d.sleep
+
+    async def sleep(seconds: float) -> None:  # yield, so the two trackers interleave
+        await inner(seconds)
+        await asyncio.sleep(0)
+
+    d.sleep = sleep
+
+    await asyncio.gather(d.run(first, workspace_id=WS), d.run(second, workspace_id=WS))
+
+    times = runner.dispatched
+    assert times and all(b - a >= 300 for a, b in zip(times, times[1:]))
+    blobs = [(await store.get_action(r)).parameters["_code_change"] for r in (first, second)]
+    assert sum(len(b.get("lane_nudges") or []) for b in blobs) == len(times)
+    assert all(b["cloud"]["pr"] in {9, 10} for b in blobs)
+
+
+@pytest.mark.parametrize(
+    "pr",
+    [
+        _ready(red=True),
+        _ready(mergeable="CONFLICTING"),
+        _ready(mergeable="UNKNOWN"),
+        {**_ready(), "statusCheckRollup": [{**GREEN_CHECK, "status": "IN_PROGRESS"}]},
+        _open(),  # green, but not labelled for the lane
+    ],
+    ids=["red", "conflicting", "unknown", "pending", "unlabelled"],
+)
+async def test_a_pr_the_lane_should_not_merge_gets_no_nudge(store, dirs, pr):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=[pr] * 12 + [MERGED])
+    runner.run_ref = run_ref
+
+    await _nudger(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert runner.dispatched == []
+    cc = (await store.get_action(run_ref)).parameters["_code_change"]
+    assert "lane_nudges" not in cc
+
+
+async def test_a_failed_lane_nudge_never_stops_the_tracker(store, dirs):
+    repo, launch = dirs
+    run_ref = await _queue(store, repo)
+    runner = FakeRunner(launch_out=SESSION, pr=[_ready()] * 6 + [MERGED], workflow_code=1)
+    runner.run_ref = run_ref
+
+    await _nudger(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert runner.dispatched == [300.0]
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    cc = action.parameters["_code_change"]
+    assert "lane_nudges" not in cc and "headless_error" not in cc
+
+
+def test_wire_cloud_reads_the_lane_nudge_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(headless, "_PRODUCTION_DISPATCHER", None)
+    monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_LAUNCH_DIR", str(tmp_path))
+    monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_LANE_NUDGE", "120")
+    monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_LANE_WORKFLOW", "Lane")
+    assert cloud_station.wire_cloud() is True
+    d = headless.resolve_headless_dispatcher()
+    assert (d.lane_nudge_seconds, d.lane_workflow) == (120.0, "Lane")

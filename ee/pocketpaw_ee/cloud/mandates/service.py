@@ -4,55 +4,46 @@
 # that imports those Beanie classes, per the 4-file entity rule).
 #
 # Public API (module-level ``async def op(workspace_id, user_id, body) -> dict``):
-# create (the repo must sit inside the workspace's belt allowlist roots)/list/get
-# mandates; file_feedback, list_sightings, run_patrols (patrols
-# that accept ``workspace_id`` / ``user_id`` / ``upstream`` get them via
-# signature inspection; sightings dedup on ``_dedup_signal``); trigger_shift
-# (sense → foreman → plan gate; a proposed plan is also handed to
-# ``belt.clef.shadow_plan``, which scores it in the background and gates
-# nothing, unless ``POCKETPAW_BELT_PLAN_GATE=auto``: then the trigger awaits the
-# score and ``plan_policy.decide`` approves the plan as ``system:belt-policy`` or
-# leaves it for a human); prepare_plan_resolution + resolve_plan (the one
-# resolve path, shared by the ``plan/resolve`` route and the auto gate); get_pawprints;
-# set_autopilot; set_crew (the roster; each NEW agent must be one the caller can
-# read in this workspace, enabled); digest (the morning report, composed only
-# from the read functions above plus the belt runs list).
+# create (the repo must sit inside the workspace's belt allowlist roots) / list /
+# get mandates; file_feedback, list_sightings; run_patrols (each patrol gets the
+# ``workspace_id`` / ``user_id`` / ``upstream`` / ``issue_labels`` its signature
+# names; a draft is skipped when its patrol already filed the same
+# ``_dedup_signal``, or when its ``dedup_key`` is any sighting's ``source`` or
+# ``dedup_key``, so a hand-filed ``github:<owner>/<repo>#<n>`` is not re-sighted);
+# trigger_shift (sense → foreman → plan gate; Clef's ``shadow_plan`` scores the
+# plan in the background, or, under ``POCKETPAW_BELT_PLAN_GATE=auto``, inline for
+# ``plan_policy.decide``); prepare_plan_resolution + resolve_plan (the one resolve
+# path, shared by the ``plan/resolve`` route and the auto gate); get_pawprints;
+# set_autopilot; set_crew (each NEW agent must be readable by the caller, in this
+# workspace, enabled); digest (the morning report, from the reads above plus the
+# belt runs list).
 #
-# The CREW: a roster of cloud Agents on the mandate (``MandateDoc.crew``). The
-# dispatcher seats each plan task on a dev (``crew_seat_for_task``: live dev
-# seats in roster order, ``pick_dev`` round-robin by task index); the headless
-# runner then reads that agent's CURRENT model + instructions
-# (``crew_worker``) so an edit in the agent editor reaches the next develop.
-# Every read is ``agents.service.get_for_viewer`` as the seat's ``seated_by``
-# (the admin who seated that agent; a later roster save keeps it), so an agent
-# that admin can no longer read is a gone seat. Agents are read through
-# ``agents.service`` (never its Beanie doc).
+# The CREW (``MandateDoc.crew``): ``crew_seat_for_task`` seats a plan task on a
+# live dev (roster order, ``pick_dev`` round-robin), or with ``role`` finds
+# another live seat (the cloud station's tester); ``crew_worker`` reads that
+# agent's CURRENT model + instructions at develop time. Every read is
+# ``agents.service.get_for_viewer`` as the seat's ``seated_by``, so an agent that
+# admin can no longer read is a gone seat.
 #
-# The BACKLOG (``_backlog``): a sighting stays open until a task citing it lands.
-# The foreman and the digest both read it by joining the mandate's belt run rows
-# (``plan_action_id`` + ``task_index``) to the ``belt_plan`` tasks' evidence refs;
-# the shift trigger persists what it finds resolved on the sighting
-# (``resolved_by_run``), because the runs list only reaches the newest actions.
-# A task landed on the mandate's line is built either way; its ``line`` says
-# whether the base holds it yet (``belt.executor.line_merged``). The detail's
-# ``line`` block and the Foreman's THE LINE read git (``line_status``).
+# The BACKLOG (``_backlog``): a sighting stays open until a task citing it lands
+# (the mandate's run rows joined to the plan tasks' evidence refs). The shift
+# trigger persists what it finds resolved (``resolved_by_run``), since the runs
+# list only reaches the newest actions. The detail's ``line`` block and the
+# foreman's THE LINE read git (``belt.executor.line_status`` / ``line_merged``).
 #
 # System/executor reads (no Beanie leaks out): repo_for_mandate,
-# charter_for_mandate (the develop station's checks/recipes/goal read),
-# crew_seat_for_task, crew_worker, file_station_sighting (the develop station's
-# line conflict, deduped like a patrol's), list_autopilot_enabled,
-# executor_revalidate, mark_shift, has_continuous_mandate, and list_cadence_due —
-# the cadence scheduler's cross-workspace read of ACTIVE mandates that are due:
-# daily / weekly once that interval has elapsed since the last shift, continuous
-# once the last shift's work is finished and open work remains (``_continuous_due``),
-# manual never (N+1, one shift read per mandate; fine at current mandate counts).
+# charter_for_mandate, crew_seat_for_task, crew_worker, file_station_sighting,
+# list_autopilot_enabled, mandate_workspace_ids (the cloud station's startup
+# resume), executor_revalidate, mark_shift, has_continuous_mandate, and
+# list_cadence_due: the scheduler's cross-workspace read of ACTIVE mandates
+# that are due (daily / weekly by interval; continuous by ``_continuous_due``,
+# which first runs the ``issues`` patrol on a mandate that toggles it; manual
+# never; N+1 reads, fine at current mandate counts).
 #
-# Conventions (cloud entity rules): validate body at entry
-# (``Schema.model_validate(body)``); tenant filter ``workspace=...`` on EVERY
-# request-path find; emit an event on every write (or ``# no-event: <reason>``);
-# errors via ``_core.errors`` CloudError subclasses (never HTTPException). The
-# Action-blob back-write goes through ``InstinctStore.update_parameters`` via the
-# shared ``cloud/_core/proposals.update_action_blob``.
+# Conventions (cloud entity rules): validate body at entry; tenant filter
+# ``workspace=...`` on EVERY request-path find; emit an event on every write (or
+# ``# no-event: <reason>``); errors via ``_core.errors`` CloudError subclasses.
+# Action-blob back-writes go through ``InstinctStore.update_parameters``.
 
 from __future__ import annotations
 
@@ -106,6 +97,7 @@ def _charter_from_request(req: CreateMandateRequest) -> Charter:
         cadence=req.charter.cadence,
         checks=list(req.charter.checks),
         recipes=dict(req.charter.recipes),
+        issue_labels=list(req.charter.issue_labels),
     )
 
 
@@ -124,6 +116,7 @@ def _charter_to_wire(charter: Charter) -> dict[str, Any]:
         "cadence": charter.cadence,
         "checks": list(charter.checks),
         "recipes": dict(charter.recipes),
+        "issue_labels": list(charter.issue_labels),
     }
 
 
@@ -355,6 +348,7 @@ async def _mandate_detail_wire(doc: MandateDoc) -> dict[str, Any]:
                 "state": s.state,
                 "plan_action_id": s.plan_action_id,
                 "created_at": s.createdAt,
+                **await _plan_decision(workspace_id, s.plan_action_id),
             }
             for s in recent_shifts
         ],
@@ -362,6 +356,30 @@ async def _mandate_detail_wire(doc: MandateDoc) -> dict[str, Any]:
         "created_at": doc.createdAt,
         "line": await line_status(doc.surface.repo_id, mandate_id),
     }
+
+
+async def _plan_decision(workspace_id: str, plan_action_id: str | None) -> dict[str, Any]:
+    """Who decided a shift's plan: ``approved_by`` (the plan Action's approver,
+    a user id or ``system:belt-policy``; ``None`` while undecided or rejected)
+    and ``policy`` (the auto plan gate's ``{decision, reason}`` off the plan
+    blob, ``None`` when the gate never looked)."""
+    approved_by, policy = None, None
+    if plan_action_id:
+        from pocketpaw.stores import get_instinct_store
+        from pocketpaw_ee.cloud.mandates.executor import BELT_PLAN_PARAM_KEY
+
+        try:
+            action = await get_instinct_store(workspace_id=workspace_id or None).get_action(
+                plan_action_id
+            )
+            approved_by = getattr(action, "approved_by", None) or None
+            blob = (getattr(action, "parameters", None) or {}).get(BELT_PLAN_PARAM_KEY) or {}
+            found = blob.get("policy") if isinstance(blob, dict) else None
+            if isinstance(found, dict):
+                policy = {"decision": found.get("decision"), "reason": found.get("reason")}
+        except Exception:  # noqa: BLE001 — the detail degrades, never fails
+            logger.debug("mandate: plan decision read failed", exc_info=True)
+    return {"approved_by": approved_by, "policy": policy}
 
 
 # ---------------------------------------------------------------------------
@@ -477,14 +495,20 @@ def _dedup_signal(evidence: dict[str, Any] | None, summary: str | None) -> str:
     return str(signal)
 
 
-async def run_patrols(workspace_id: str, user_id: str, mandate_id: str) -> dict[str, Any]:
-    """Run every registered patrol over the mandate's surface and persist the
-    resulting Sightings.
+async def run_patrols(
+    workspace_id: str, user_id: str, mandate_id: str, *, only: frozenset[str] | None = None
+) -> dict[str, Any]:
+    """Run every registered patrol over the mandate's surface (or just the
+    toggled ones named in ``only``) and persist the resulting Sightings.
 
     Dedup: a draft whose dedup signal (``evidence.iid`` for issues,
     ``evidence.package`` for deps, else the summary) already has a sighting from
     the same patrol on this mandate is skipped — repeated shift triggers must not
-    spam the foreman with identical signals. Returns the NEW sightings only."""
+    spam the foreman with identical signals. A draft whose ``evidence.dedup_key``
+    is any existing sighting's ``source`` or ``dedup_key`` is skipped too,
+    whatever patrol filed it: a GitHub issue (``github:<owner>/<repo>#<n>``)
+    filed by hand through the feedback intake is not sighted again by the
+    ``issues`` patrol. Returns the NEW sightings only."""
     from pocketpaw_ee.cloud.mandates.patrols import PATROLS
 
     doc = await _fetch_mandate(workspace_id, mandate_id)
@@ -493,6 +517,12 @@ async def run_patrols(workspace_id: str, user_id: str, mandate_id: str) -> dict[
         SightingDoc.workspace == workspace_id, SightingDoc.mandate_id == mandate_id
     ).to_list()
     seen_keys = {(s.patrol, _dedup_signal(s.evidence, s.summary)) for s in existing}
+    seen_refs = {
+        str(ref)
+        for s in existing
+        for ref in ((s.evidence or {}).get("source"), (s.evidence or {}).get("dedup_key"))
+        if ref
+    }
 
     created: list[SightingDoc] = []
     enabled = set(doc.patrols or [])
@@ -500,7 +530,7 @@ async def run_patrols(workspace_id: str, user_id: str, mandate_id: str) -> dict[
         # UI contract — the mandate's ``patrols`` toggles scope the sense loop;
         # an un-toggled patrol never runs. (The "feedback" intake endpoint is a
         # human channel and stays open regardless — it has no sense callable.)
-        if patrol_name not in enabled:
+        if patrol_name not in enabled or (only is not None and patrol_name not in only):
             continue
         try:
             # Patrols take ``repo_id`` positionally; a LIVE patrol (e.g. ``issues``)
@@ -516,6 +546,8 @@ async def run_patrols(workspace_id: str, user_id: str, mandate_id: str) -> dict[
                 kwargs["user_id"] = user_id
             if "upstream" in params:
                 kwargs["upstream"] = [u.model_dump() for u in doc.upstream]
+            if "issue_labels" in params:
+                kwargs["issue_labels"] = list(doc.charter.issue_labels)
             drafts = await patrol(doc.surface.repo_id, **kwargs)
         except Exception:  # noqa: BLE001 — a broken patrol must not wedge the shift
             logger.warning("mandate: patrol %r raised — skipping", patrol_name, exc_info=True)
@@ -525,9 +557,12 @@ async def run_patrols(workspace_id: str, user_id: str, mandate_id: str) -> dict[
                 str(draft.get("patrol") or patrol_name),
                 _dedup_signal(draft.get("evidence"), draft.get("summary")),
             )
-            if key in seen_keys:
+            ref = str((draft.get("evidence") or {}).get("dedup_key") or "")
+            if key in seen_keys or (ref and ref in seen_refs):
                 continue
             seen_keys.add(key)
+            if ref:
+                seen_refs.add(ref)
             sighting = SightingDoc(
                 workspace=workspace_id,
                 mandate_id=mandate_id,
@@ -776,12 +811,12 @@ async def _live_agent(workspace_id: str, agent_id: str, seated_by: str) -> Any |
 
 
 async def crew_seat_for_task(
-    workspace_id: str, mandate_id: str, index: int
+    workspace_id: str, mandate_id: str, index: int, *, role: str = "dev"
 ) -> dict[str, Any] | None:
-    """The dev seat plan task ``index`` runs on: ``{agent_id, name, setup,
-    seated_by}``,
-    or ``None`` (no crew, or no live dev) so the factory's env defaults apply.
-    Dead seats (deleted / disabled agents) are skipped before ``pick_dev``."""
+    """The ``role`` seat (a dev by default) plan task ``index`` runs on:
+    ``{agent_id, name, setup, seated_by}``, or ``None`` (no crew, or no live
+    seat in that role) so the factory's env defaults apply. Dead seats (deleted
+    / disabled agents) are skipped before ``pick_dev``."""
     # no-event: read-only path; emit only on writes.
     try:
         doc = await MandateDoc.find_one(
@@ -793,7 +828,7 @@ async def crew_seat_for_task(
         return None
     live = []
     for seat in doc.crew:
-        if seat.role != "dev":
+        if seat.role != role:
             continue
         agent = await _live_agent(workspace_id, seat.agent_id, seat.seated_by)
         if agent is not None:
@@ -1110,6 +1145,7 @@ async def trigger_shift(workspace_id: str, user_id: str, mandate_id: str) -> dic
             }
         )
     )
+    await _emit_mandate_updated(workspace_id, mandate_id, shift_no, "planning")
 
     # 3. JUDGE — assemble the context and make the ONE foreman call. The
     #    foreman reads the open backlog (every sighting no landed task has
@@ -1172,13 +1208,21 @@ async def trigger_shift(workspace_id: str, user_id: str, mandate_id: str) -> dic
     except Exception as exc:  # noqa: BLE001 — surface a clean upstream failure
         from pocketpaw_ee.cloud._core.errors import CloudError
 
-        # Failure path keeps the state UNCHANGED ("planning") and only records
-        # the failure on ``outcome`` — the shift never advances on a bad call.
+        # A failed call FINISHES the shift (``done``, no plan) with the failure
+        # as its outcome, so a continuous mandate retries after the minimum gap
+        # (``_continuous_due`` backs off after ``_FOREMAN_FAILURE_RUN`` in a row).
+        logger.warning(
+            "mandate: foreman call failed for mandate %s shift %s (prompt %d chars): %s",
+            mandate_id,
+            shift_no,
+            len(foreman_mod.build_prompt(context)),
+            exc,
+        )
         await mark_shift(
             workspace_id=workspace_id,
             shift_id=str(shift.id),
-            state="planning",
-            outcome=f"foreman call failed: {exc}",
+            state="done",
+            outcome=f"{_FOREMAN_FAILED}: {exc}",
         )
         raise CloudError(
             502, "mandate.foreman_failed", f"The foreman's judgment call failed: {exc}"
@@ -1768,9 +1812,12 @@ async def prepare_plan_resolution(
         return {
             "action_id": str(shift.plan_action_id),
             "shift_id": str(shift.id),
+            "shift_no": shift.no,
             "mode": "reject",
             "edited": True,
             "reject_reason": reasons or "all tasks rejected at the gate",
+            "approved": 0,
+            "rejected": len(rejected),
         }
 
     new_blob = dict(blob)
@@ -1782,9 +1829,12 @@ async def prepare_plan_resolution(
     return {
         "action_id": str(shift.plan_action_id),
         "shift_id": str(shift.id),
+        "shift_no": shift.no,
         "mode": "approve",
         "edited": edited,
         "parameters": new_params,
+        "approved": len(kept),
+        "rejected": len(rejected),
     }
 
 
@@ -1795,7 +1845,8 @@ async def resolve_plan(
     Instinct approve (with edits when any task was edited or dropped) or reject.
     The ``plan/resolve`` route and the auto plan gate both run this, so there is
     one resolve path. ``approver`` is the actor the Instinct router records
-    (anything with an ``id``). Returns ``{"shift": <shift wire>}``."""
+    (anything with an ``id``). Announces ``belt_plan_resolved`` once the gate
+    took the decision. Returns ``{"shift": <shift wire>}``."""
     orders = await prepare_plan_resolution(workspace_id, user_id, mandate_id, body)
 
     # Lazy import — the mandates package must not put a module-top dependency
@@ -1823,6 +1874,19 @@ async def resolve_plan(
             user=approver,
             workspace_id=workspace_id,
         )
+    await emit(
+        mandate_events.BeltPlanResolved(
+            data={
+                "workspace_id": workspace_id,
+                "mandate_id": mandate_id,
+                "plan_action_id": orders["action_id"],
+                "shift_no": orders["shift_no"],
+                "resolved_by": str(getattr(approver, "id", "") or ""),
+                "approved": orders["approved"],
+                "rejected": orders["rejected"],
+            }
+        )
+    )
     return {"shift": await shift_wire(workspace_id, orders["shift_id"])}
 
 
@@ -1939,6 +2003,11 @@ async def get_pawprints(workspace_id: str, user_id: str, mandate_id: str) -> dic
             if shift.outcome:
                 summary = f"Shift {shift.no}: plan did not reach the gate — {shift.outcome}"
             prints.append(_item(shift, "planning", summary, [], shift.updatedAt))
+            continue
+        if shift.state == "done" and not shift.plan_action_id:
+            # A failed foreman call finished the shift with no plan.
+            summary = f"Shift {shift.no}: plan did not reach the gate — {shift.outcome or ''}"
+            prints.append(_item(shift, "failed", summary.rstrip(" —"), [], shift.updatedAt))
             continue
 
         # in_gate / executing / done — read the plan Action for status + refs.
@@ -2257,6 +2326,18 @@ async def list_autopilot_enabled() -> list[dict[str, Any]]:
     ]
 
 
+async def mandate_workspace_ids() -> list[str]:
+    """Every workspace holding a mandate, paused ones included (a paused
+    mandate's PR can still merge): the cloud station's startup resume read
+    (``cloud_station.resume_all``). DELIBERATELY cross-workspace, a SYSTEM
+    boot read like ``list_autopilot_enabled``."""
+    # global-read: system boot read, same posture as list_autopilot_enabled.
+    # no-event: read-only path.
+    # ponytail: loads every mandate row; a distinct() read when mandates number thousands.
+    docs = await MandateDoc.find_all().to_list()
+    return sorted({d.workspace for d in docs if d.workspace})
+
+
 # Cadence → due-interval. A mandate is due once its last shift is older than its
 # interval; "manual" mandates are never scheduled (no entry → not due).
 _CADENCE_INTERVALS: dict[str, timedelta] = {
@@ -2267,6 +2348,11 @@ _CADENCE_INTERVALS: dict[str, timedelta] = {
 # The SYSTEM actor a scheduled shift runs as (no human user_id on a cadence fire).
 _SCHEDULER_ACTOR = "system:scheduler"
 
+
+# A shift whose foreman call failed is ``done`` with this outcome prefix; after
+# this many in a row a continuous mandate waits the stall timeout.
+_FOREMAN_FAILED = "foreman call failed"
+_FOREMAN_FAILURE_RUN = 3
 
 # CONTINUOUS cadence knobs (env): the minimum gap between two shifts, and how
 # old a shift must be before its unfinished runs (or a stuck ``planning`` /
@@ -2293,7 +2379,10 @@ async def _continuous_due(doc: MandateDoc, last: ShiftDoc | None, now: datetime)
     same backlog), none of its runs is still in flight, and an open sighting no
     task is working remains. A shift older than the stall timeout stops holding
     the next one through in-flight runs or a stuck ``planning`` / ``executing``
-    state; a plan waiting ``in_gate`` for a human always holds it."""
+    state; a plan waiting ``in_gate`` for a human always holds it, and so do
+    ``_FOREMAN_FAILURE_RUN`` failed foreman calls in a row. A mandate that toggles
+    the ``issues`` patrol runs it before the in-flight hold, so a new GitHub issue
+    (work, or a tester's bug) is sighted even while the line is busy."""
     from pocketpaw_ee.cloud.belt import service as belt_service
 
     gap = timedelta(
@@ -2314,8 +2403,31 @@ async def _continuous_due(doc: MandateDoc, last: ShiftDoc | None, now: datetime)
             return False
         if last.state in ("planning", "executing") and not stalled:
             return False
+        if not stalled and (last.outcome or "").startswith(_FOREMAN_FAILED):
+            recent = (
+                await ShiftDoc.find(
+                    ShiftDoc.workspace == doc.workspace, ShiftDoc.mandate_id == str(doc.id)
+                )
+                .sort("-no")
+                .limit(_FOREMAN_FAILURE_RUN)
+                .to_list()
+            )
+            if len(recent) == _FOREMAN_FAILURE_RUN and all(
+                (s.outcome or "").startswith(_FOREMAN_FAILED) for s in recent
+            ):
+                return False  # the foreman keeps failing: back off to the stall timeout
 
     mandate_id = str(doc.id)
+    if "issues" in (doc.patrols or []):
+        # The due check senses new issues itself (one ``gh issue list``), before the
+        # in-flight check: a busy line must still see new work and bug reports.
+        try:
+            await run_patrols(
+                doc.workspace, _SCHEDULER_ACTOR, mandate_id, only=frozenset({"issues"})
+            )
+        except Exception:  # noqa: BLE001 — a failed sense never sinks the due check
+            logger.warning("mandate: issues patrol failed for %s", mandate_id, exc_info=True)
+
     runs = [
         r
         for r in (await belt_service.list_runs(doc.workspace))["runs"]
@@ -2424,8 +2536,9 @@ async def mark_shift(
 ) -> None:
     """State-transition a shift row (tenant-scoped). Used by the trigger path
     and (via a best-effort wrapper) the plan executor + the router's reject
-    hook. Unknown shift ids are a logged no-op — the Instinct outcome stays the
-    source of truth."""
+    hook. Each write announces ``belt_mandate_updated`` for the live UI. Unknown
+    shift ids are a logged no-op — the Instinct outcome stays the source of
+    truth."""
     try:
         doc = await ShiftDoc.find_one(
             ShiftDoc.workspace == workspace_id, ShiftDoc.id == _as_object_id(shift_id)
@@ -2448,6 +2561,23 @@ async def mark_shift(
                 "mandate_id": doc.mandate_id,
                 "shift_id": shift_id,
                 "no": doc.no,
+                "state": state,
+            }
+        )
+    )
+    await _emit_mandate_updated(workspace_id, doc.mandate_id, doc.no, state)
+
+
+async def _emit_mandate_updated(
+    workspace_id: str, mandate_id: str, shift_no: int, state: str
+) -> None:
+    """``belt_mandate_updated`` — the UI's live shift-state topic (workspace fan-out)."""
+    await emit(
+        mandate_events.BeltMandateUpdated(
+            data={
+                "workspace_id": workspace_id,
+                "mandate_id": mandate_id,
+                "shift_no": shift_no,
                 "state": state,
             }
         )

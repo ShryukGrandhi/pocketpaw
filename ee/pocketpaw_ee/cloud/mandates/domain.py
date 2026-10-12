@@ -22,7 +22,7 @@
 # ``MandateDoc.upstream`` is the ``upstream`` patrol's config: pinned GitHub
 # dependencies (``{repo, pin_file}``) whose new commits the patrol reports.
 # ``MandateDoc.crew`` is the roster: cloud Agents on the mandate, each with a
-# role (``dev`` / ``reviewer`` / ``foreman``), a concurrency and an optional
+# role (``dev`` / ``reviewer`` / ``foreman`` / ``tester``), a concurrency and an optional
 # Claude setup (``owner`` / ``strict``; unset = the factory env). A crew member
 # IS an Agent; the roster holds only the link plus the seat, never a copy of the
 # agent's model or instructions.
@@ -44,7 +44,7 @@ from pocketpaw_ee.cloud.models.base import TimestampedDocument
 
 KpiDirection = Literal["up", "down"]
 Cadence = Literal["daily", "weekly", "continuous", "manual"]
-CrewRole = Literal["dev", "reviewer", "foreman"]
+CrewRole = Literal["dev", "reviewer", "foreman", "tester"]
 CrewSetup = Literal["owner", "strict"]
 MandateStatus = Literal["active", "paused"]
 ShiftState = Literal["planning", "in_gate", "executing", "done", "stood_down"]
@@ -98,6 +98,10 @@ class Charter(BaseModel):
     deterministic command a plan task can run instead of an LLM develop (e.g.
     ``{"bump-photo": "node scripts/bump-craft-engine.mjs photo"}``). Both are
     argv strings split with ``shlex`` — never run through a shell.
+
+    ``issue_labels`` scopes the ``issues`` patrol on a GitHub-bound repo: an
+    open issue is sighted when it carries one of these labels (e.g.
+    ``["line:flare"]``). Empty = the GitHub patrol takes nothing.
     """
 
     goal: str
@@ -108,6 +112,7 @@ class Charter(BaseModel):
     cadence: Cadence = "weekly"
     checks: list[str] = Field(default_factory=list)
     recipes: dict[str, str] = Field(default_factory=dict)
+    issue_labels: list[str] = Field(default_factory=list)
 
 
 class Surface(BaseModel):
@@ -131,8 +136,9 @@ class CrewMember(BaseModel):
     """One seat on a mandate's crew: a cloud Agent and how it works here.
 
     ``agent_id`` is the Agent (its model, instructions and soul live there).
-    ``role`` is the seat; only ``dev`` seats take plan tasks today (round-robin,
-    see ``mandates.service.pick_dev``). ``concurrency`` is how many develops the
+    ``role`` is the seat; only ``dev`` seats take plan tasks (round-robin, see
+    ``mandates.service.pick_dev``), and the first live ``tester`` seat runs the
+    cloud station's tester on a landed run. ``concurrency`` is how many develops the
     worker may run at once (recorded; the factory still runs one at a time).
     ``setup`` picks the develop station's Claude setup for this worker's runs;
     ``None`` keeps the factory's ``POCKETPAW_FACTORY_CLAUDE_SETUP``.

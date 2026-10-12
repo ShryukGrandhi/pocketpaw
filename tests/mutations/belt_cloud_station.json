@@ -111,8 +111,8 @@
   {
     "label": "the seated dev's instructions are left out of the brief",
     "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
-    "find": "f\"{_task_block(request)}\\n\\n{_worker_block(request)}\"",
-    "replace": "f\"{_task_block(request)}\\n\\n\"",
+    "find": "f\"You are a Belt cloud worker on {slug}. Do the one task below, then stop.\\n\\n\"\n        f\"{_task_block(request)}\\n\\n{_worker_block(request)}\"",
+    "replace": "f\"You are a Belt cloud worker on {slug}. Do the one task below, then stop.\\n\\n\"\n        f\"{_task_block(request)}\\n\\n\"",
     "tests": [
       "tests/cloud/test_belt_cloud_station.py::test_seated_dev_instructions_ride_the_brief"
     ]
@@ -160,6 +160,78 @@
     "replace": "_TRUST_PROMPT = b\"neverseen\"",
     "tests": [
       "tests/cloud/test_belt_cloud_station.py::test_pty_run_fails_fast_at_the_folder_trust_prompt"
+    ]
+  },
+  {
+    "label": "resume tracks any queued run with a session, not only a live cloud one",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "and blob.get(\"headless_state\") == \"cloud\"",
+    "replace": "and True",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_resume_skips_runs_without_the_cloud_mark"
+    ]
+  },
+  {
+    "label": "resume relaunches the worker instead of tracking it",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "self._guard(store, action.id, self._retrack(store, action.id, dict(blob))),",
+    "replace": "self.run(action.id, workspace_id=ws),",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_resume_tracks_a_launched_run_and_lands_it"
+    ]
+  },
+  {
+    "label": "a resumed run gets a fresh timeout despite its launched_at",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "deadline = self.clock() + self.timeout_seconds - spent",
+    "replace": "deadline = self.clock() + self.timeout_seconds",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_resume_counts_the_timeout_from_the_launch"
+    ]
+  },
+  {
+    "label": "a resumed tracker forgets the head its last fixer was launched on",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "for f in reversed(fixes) if f.get(\"session_url\")), \"\"",
+    "replace": "for f in reversed(fixes) if False), \"\"",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_resume_does_not_double_a_fixer_on_the_same_head"
+    ]
+  },
+  {
+    "label": "a green PR is nudged before the lane-nudge interval",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "elif self.clock() - green_since >= self.lane_nudge_seconds:",
+    "replace": "elif True:",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_a_green_pr_left_open_gets_one_lane_nudge"
+    ]
+  },
+  {
+    "label": "every tracked PR on a repo dispatches the lane on its own",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "if last is not None and now - last < self.lane_nudge_seconds:",
+    "replace": "if False:",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_two_prs_on_one_repo_share_one_nudge_per_interval"
+    ]
+  },
+  {
+    "label": "a PR the lane should not merge is nudged anyway",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "and pr.get(\"mergeable\") == \"MERGEABLE\"\n        and all(",
+    "replace": "and True\n        and all(",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_a_pr_the_lane_should_not_merge_gets_no_nudge"
+    ]
+  },
+  {
+    "label": "the lane label is never read from gh",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "\"mergeable,statusCheckRollup,labels\",",
+    "replace": "\"mergeable,statusCheckRollup\",",
+    "tests": [
+      "tests/cloud/test_belt_cloud_station.py::test_a_green_pr_left_open_gets_one_lane_nudge"
     ]
   }
 ]
