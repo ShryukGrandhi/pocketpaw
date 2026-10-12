@@ -36,6 +36,10 @@
 # A ``map`` keeps OSM tiles, plain-text pins, ask-only marker clicks and capped sizes,
 # in parity with ripple's card-policy.ts rule 14; tests/fixtures/ripple_map_route_card.json
 # is a live Haiku card (2026-10-12, a walking route in Lisbon) that must pass.
+# The drawing widgets: ripple's hand-written iso-scene gallery cards and its heart-pump
+# figure (tests/fixtures/ripple_drawing_cards.json) must pass, and each rule of
+# ``_check_iso_scene`` and ``_check_figure`` has a refusal
+# (tests/mutations/concierge_drawings.json).
 
 # ruff: noqa: F811 — pytest fixtures imported by name
 
@@ -65,7 +69,7 @@ _FIXTURE = Path(__file__).parents[1] / "fixtures" / "ripple_explainer_card.json"
 # Refreshing ripple-manifest.json: see ee/pocketpaw_ee/paw_bar/ripple-manifest.json.source
 # (vendored from ripple branch feat/play-wave pending a release; drop the widget examples,
 # update the pins below).
-_RIPPLE_MANIFEST_SHA256 = "3dc2a1170009f12c4f865efa551de8dced084f07e5ae19cb99244fea2156308b"
+_RIPPLE_MANIFEST_SHA256 = "a4c8fb9dfce333624a848d3df285e35c4668cbb36a47f52cbfdfd7448e1182c6"
 
 
 def _pin_ops(monkeypatch, *site_ids: str, cap: float | None = None) -> None:
@@ -105,7 +109,7 @@ def test_the_vendored_ripple_manifest_has_not_drifted():
     raw = card_spec.RIPPLE_MANIFEST_PATH.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(raw).hexdigest() == _RIPPLE_MANIFEST_SHA256
     assert card_spec.RIPPLE_MANIFEST["version"] == "0.8.0"
-    assert len(card_spec.RIPPLE_MANIFEST["widgets"]) == 213
+    assert len(card_spec.RIPPLE_MANIFEST["widgets"]) == 215
     # Every trimmed or typed name is a real widget (a typo would trim nothing).
     every = {w["type"] for w in card_spec.RIPPLE_MANIFEST["widgets"]}
     chrome, deferred = card_spec.RIPPLE_CHROME, card_spec.RIPPLE_DEFERRED
@@ -113,7 +117,7 @@ def test_the_vendored_ripple_manifest_has_not_drifted():
     r = card_spec.RIPPLE_PROFILE
     assert r.typed.keys() <= r.detailed <= r.widget_types
     assert {"illustration", "bill-split"} <= every & r.widget_types
-    assert len(r.widget_types) == 213 - len(deferred) - len(chrome)
+    assert len(r.widget_types) == 215 - len(deferred) - len(chrome)
 
 
 def test_the_pawbar_profile_is_todays_rules():
@@ -251,9 +255,9 @@ def test_the_ripple_listing_is_bounded_and_covers_every_widget():
     assert {line[2:].split(":")[0].split(" {")[0] for line in lines} == (
         RIPPLE_PROFILE.widget_types
     )
-    # 20,809 with the games' and habit-tracker's typed lines; the rules shrank by more,
-    # and the whole paragraph's 32,000 bound is the one that holds.
-    assert len(text) < 21_000
+    # 21,039 with the games' and habit-tracker's typed lines and the figure and
+    # iso-scene brief lines; the whole paragraph's 32,000 bound is the one that holds.
+    assert len(text) < 21_500
     # The rules' widgets carry their props (each's node fields too).
     assert "- stat {label?, value" in text
     assert "- each {items, item_as?, index_as?}" in text
@@ -3607,3 +3611,158 @@ def test_realistic_new_data_widget_cards_pass():
 )
 def test_new_data_widgets_hold_to_their_enums_counts_and_plain_text(why, spec):
     assert _ripple(spec) is None, why
+
+
+# --------------------------------------------------------------------------- #
+# iso-scene and figure (ripple #236, #237): the drawing widgets
+# --------------------------------------------------------------------------- #
+
+_DRAWINGS = Path(__file__).parents[1] / "fixtures" / "ripple_drawing_cards.json"
+
+
+def _drawing(key: str) -> dict:
+    return json.loads(_DRAWINGS.read_text(encoding="utf-8"))[key]
+
+
+def test_the_vendored_ripple_figures_parse():
+    from pocketpaw_ee.paw_bar.card_spec import RIPPLE_FIGURES
+
+    assert list(RIPPLE_FIGURES) == ["heart"]
+    heart = RIPPLE_FIGURES["heart"]
+    assert [p["key"] for p in heart["params"]] == ["bpm", "stroke"]
+    assert heart["params"][0] == {"key": "bpm", "min": 40, "max": 180}
+    assert len(heart["anchors"]) == 14
+    assert heart["anchors"][:2] == ["right-atrium", "right-ventricle"]
+
+
+@pytest.mark.parametrize("key", ["iso-bike", "iso-heart", "iso-engine", "heart-pump"])
+def test_ripples_hand_written_drawings_pass(key):
+    from pocketpaw_ee.paw_bar.card_spec import RIPPLE_PROFILE, render_card
+
+    assert render_card(_body(_drawing(key)), [], profile=RIPPLE_PROFILE) is not None
+
+
+def _iso(**change) -> dict:
+    """The bike card with one change: ``change`` maps a dotted path under props
+    (``parts.0.kind``) to its new value."""
+    card = _drawing("iso-bike")
+    for path, value in change.items():
+        *head, last = path.split(".")
+        at = card["ui"]["props"]
+        for step in head:
+            at = at[int(step)] if step.isdigit() else at[step]
+        if isinstance(at, list) and int(last) == len(at):
+            at.append(value)  # one past the end adds a row
+        else:
+            at[int(last) if last.isdigit() else last] = value
+    return card
+
+
+_PART = {"id": "x", "kind": "box", "at": [0, 0, 0], "w": 4, "d": 4, "h": 4}
+
+
+@pytest.mark.parametrize(
+    "why, change",
+    [
+        ("an unknown part kind", {"parts.1.kind": "wheel"}),
+        ("an unknown color role", {"parts.1.color": "#ff0000"}),
+        ("a part key it does not take", {"parts.1.svg": "<path/>"}),
+        ("a coordinate past 500", {"parts.0.at": [9999, 0, 0]}),
+        ("a coordinate that is not a number", {"parts.0.at": [0, "1", 0]}),
+        ("a two-number point", {"parts.0.at": [0, 0]}),
+        ("a size past 400", {"parts.0.w": 401}),
+        ("a gear with 200 teeth", {"parts.5.teeth": 200}),
+        ("an on that names no part", {"parts.4.on": "nowhere"}),
+        ("two parts with one id", {"parts.1.id": "ground"}),
+        ("151 parts", {"parts": [{**_PART, "id": f"p{i}"} for i in range(151)]}),
+        ("a motion on a missing part", {"motions.0.part": "flywheel"}),
+        ("an unknown motion kind", {"motions.0.kind": "orbit"}),
+        ("21 motions", {"motions": [{"part": "ring", "kind": "spin", "speed": 1}] * 21}),
+        ("a speed past 20", {"motions.0.speed": 50}),
+        ("a speed calling a function", {"motions.0.speed": "max(cadence, 60)"}),
+        ("a speed calling a param", {"motions.0.speed": "cadence (60)"}),
+        ("a speed naming no param", {"motions.0.speed": "window / 60"}),
+        ("a speed reading state", {"motions.0.speed": "state.x / 60"}),
+        ("a speed in braces", {"motions.0.speed": "{cadence / 60}"}),
+        ("a speed holding a string", {"motions.0.speed": "'a' + cadence"}),
+        ("a speed over 80 chars", {"motions.0.speed": "cadence " + "+ 1 " * 40}),
+        ("a readout over a function", {"readouts.0.value": "Math.round(cadence)"}),
+        ("5 readouts", {"readouts": [{"label": "a", "value": 1}] * 5}),
+        ("a param key that is not an identifier", {"params.0.key": "ca-dence"}),
+        (
+            "a param named state",
+            {"params.1": {"key": "state", "label": "s", "min": 0, "max": 1, "value": 0}},
+        ),
+        ("a param value outside its range", {"params.0.value": 500}),
+        ("a param min above its max", {"params.0.min": 200}),
+        (
+            "7 params",
+            {
+                "params": [
+                    {"key": f"k{i}", "label": "k", "min": 0, "max": 1, "value": 0} for i in range(7)
+                ]
+            },
+        ),
+        ("a URL in a label", {"labels.0.label": "https://evil.example/x"}),
+        ("a URL in a note", {"labels.0.note": "see https://evil.example/x"}),
+        ("markup in a note", {"labels.0.note": "<b>hi</b>"}),
+        ("a label expression", {"labels.0.label": "{state.x}"}),
+        ("a label over 40", {"labels.0.label": "x" * 41}),
+        ("a note over 280", {"labels.0.note": "x" * 281}),
+        ("a label on a missing part", {"labels.0.part": "frame"}),
+        ("11 labels", {"labels": [{"part": "ring", "label": "a"}] * 11}),
+        ("a title expression", {"title": "{state.title}"}),
+        ("a scale of 10", {"scale": 10}),
+        ("an unknown look", {"look": "neon"}),
+        ("no parts", {"parts": []}),
+    ],
+)
+def test_an_iso_scene_holds_to_its_parts_motions_and_plain_text(why, change):
+    from pocketpaw_ee.paw_bar.card_spec import RIPPLE_PROFILE, render_card
+
+    assert render_card(_body(_iso(**change)), [], profile=RIPPLE_PROFILE) is None, why
+
+
+def test_an_iso_scene_takes_a_handler_never():
+    from pocketpaw_ee.paw_bar.card_spec import RIPPLE_PROFILE, render_card
+
+    card = _drawing("iso-bike")
+    card["ui"]["on_change"] = {"action": "emit", "target": "ask", "value": {"text": "x"}}
+    assert render_card(_body(card), [], profile=RIPPLE_PROFILE) is None
+
+
+def _figure(**props) -> dict:
+    card = _drawing("heart-pump")
+    card["ui"]["props"].update(props)
+    return card
+
+
+@pytest.mark.parametrize(
+    "why, props",
+    [
+        ("an unknown figure id", {"figure": "lungs", "params": {}, "labels": []}),
+        ("a figure expression", {"figure": "{state.figure}"}),
+        ("an unknown param", {"params": {"rpm": 72}}),
+        ("a param outside its range", {"params": {"bpm": 400}}),
+        ("a param that is not a number", {"params": {"bpm": "72"}}),
+        ("an unknown anchor", {"labels": [{"anchor": "spleen", "note": "x"}]}),
+        ("no anchor", {"labels": [{"note": "x"}]}),
+        ("a URL in a note", {"labels": [{"anchor": "aorta", "note": "https://evil.example/"}]}),
+        ("markup in a label", {"labels": [{"anchor": "aorta", "label": "<i>A</i>"}]}),
+        ("a label over 40", {"labels": [{"anchor": "aorta", "label": "x" * 41}]}),
+        ("11 labels", {"labels": [{"anchor": "aorta"}] * 11}),
+        ("a label key it does not take", {"labels": [{"anchor": "aorta", "at": [1, 2]}]}),
+        ("a caption expression", {"caption": "{state.caption}"}),
+    ],
+)
+def test_a_figure_holds_to_the_figure_catalog(why, props):
+    from pocketpaw_ee.paw_bar.card_spec import RIPPLE_PROFILE, render_card
+
+    assert render_card(_body(_figure(**props)), [], profile=RIPPLE_PROFILE) is None, why
+
+
+def test_a_figure_without_labels_or_params_passes():
+    from pocketpaw_ee.paw_bar.card_spec import RIPPLE_PROFILE, render_card
+
+    card = {"state": {}, "ui": {"type": "figure", "props": {"figure": "heart"}}}
+    assert render_card(_body(card), [], profile=RIPPLE_PROFILE) is not None
