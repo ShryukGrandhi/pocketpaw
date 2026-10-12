@@ -65,7 +65,7 @@ _FIXTURE = Path(__file__).parents[1] / "fixtures" / "ripple_explainer_card.json"
 # Refreshing ripple-manifest.json: see ee/pocketpaw_ee/paw_bar/ripple-manifest.json.source
 # (vendored from ripple branch feat/play-wave pending a release; drop the widget examples,
 # update the pins below).
-_RIPPLE_MANIFEST_SHA256 = "6329126fc5274eecb234d98545ee5fe7f1e5b8c7fc55c62f95345ab596045054"
+_RIPPLE_MANIFEST_SHA256 = "21829be61e0b2c82066ed18c4c0e5af98f3221326327cc31209224176721f066"
 
 
 def _pin_ops(monkeypatch, *site_ids: str, cap: float | None = None) -> None:
@@ -105,7 +105,7 @@ def test_the_vendored_ripple_manifest_has_not_drifted():
     raw = card_spec.RIPPLE_MANIFEST_PATH.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(raw).hexdigest() == _RIPPLE_MANIFEST_SHA256
     assert card_spec.RIPPLE_MANIFEST["version"] == "0.8.0"
-    assert len(card_spec.RIPPLE_MANIFEST["widgets"]) == 205
+    assert len(card_spec.RIPPLE_MANIFEST["widgets"]) == 207
     # Every trimmed or typed name is a real widget (a typo would trim nothing).
     every = {w["type"] for w in card_spec.RIPPLE_MANIFEST["widgets"]}
     chrome, deferred = card_spec.RIPPLE_CHROME, card_spec.RIPPLE_DEFERRED
@@ -113,7 +113,7 @@ def test_the_vendored_ripple_manifest_has_not_drifted():
     r = card_spec.RIPPLE_PROFILE
     assert r.typed.keys() <= r.detailed <= r.widget_types
     assert {"illustration", "bill-split"} <= every & r.widget_types
-    assert len(r.widget_types) == 205 - len(deferred) - len(chrome)
+    assert len(r.widget_types) == 207 - len(deferred) - len(chrome)
 
 
 def test_the_pawbar_profile_is_todays_rules():
@@ -310,7 +310,8 @@ def test_the_ripple_paragraph_details_the_data_widgets_at_the_landings_width():
     # drops what the typed lines say, brief lines 73 chars) with their mapping added;
     # 33,627 with the 3D line (the model library's 31 ids and anchors, 1,332 chars of
     # it), then 31,750 with brief lines at 50 chars and the illustration line shorter;
-    # 31,889 with the map line.
+    # 31,889 with the map line; 32,415 with notes and music-player typed, then 31,855
+    # with brief lines at 44 chars, two rule-10 sentences shorter and their mapping added.
     assert len(text) < 32_000
 
 
@@ -3182,3 +3183,73 @@ def test_the_prompt_carries_the_map_hint():
         "paths[{id,points:[[lat,lng]...]}]" in text
     )
     assert 'tiles "osm"' in text and "approximate" in text
+
+
+# --------------------------------------------------------------------------- #
+# notes and music-player: plain-text notes, preset sounds only, no URLs
+# --------------------------------------------------------------------------- #
+
+
+def _notes(*notes, **props) -> dict:
+    return {"ui": {"type": "notes", "props": {"notes": list(notes), **props}}, "state": {}}
+
+
+def _music(*tracks, **props) -> dict:
+    return {"ui": {"type": "music-player", "props": {"tracks": list(tracks), **props}}, "state": {}}
+
+
+def _track(**extra) -> dict:
+    return {"title": "Soft rain", "sound": "rain", **extra}
+
+
+def test_realistic_notes_and_music_cards_pass():
+    assert _ripple(_DATA_CARDS["notes"]) is not None
+    assert _ripple(_DATA_CARDS["music-player"]) is not None
+    assert _ripple(_notes()) is not None  # a blank pad
+    assert _ripple(_notes(*[{"text": "x"}] * 50)) is not None
+    assert _ripple(_notes({"title": "t" * 80, "text": "a < b, x" * 250})) is not None
+    sounds = ("rain", "brown-noise", "white-noise", "ocean", "forest", "lofi", "drone", "piano")
+    assert _ripple(_music(*(_track(sound=s, minutes=60) for s in sounds))) is not None
+
+
+@pytest.mark.parametrize(
+    ("why", "spec"),
+    [
+        ("a track src", _music(_track(src="https://cdn.example.com/a.mp3"))),
+        ("a track url", _music(_track(url="/a.mp3"))),
+        ("a track cover image", _music(_track(cover="/a.png"))),
+        ("a player src", _music(_track(), src="/a.mp3")),
+        ("an unknown sound", _music(_track(sound="jazz"))),
+        ("a sound expression", _music(_track(sound="{state.s}"))),
+        ("no tracks", _music()),
+        ("31 tracks", _music(*[_track()] * 31)),
+        ("a track over 60 minutes", _music(_track(minutes=61))),
+        ("a track title expression", _music(_track(title="{state.t}"))),
+        ("html in a track title", _music(_track(title="<b>Rain</b>"))),
+        ("html in a note", _notes({"text": "<img src=x onerror=alert(1)>"})),
+        ("html in a note title", _notes({"title": "<i>hi</i>", "text": "x"})),
+        ("an expression in a note", _notes({"text": "{state.secret}"})),
+        ("a note link", _notes({"text": "x", "link": "/a"})),
+        ("51 notes", _notes(*[{"text": "x"}] * 51)),
+        ("a note title over 80", _notes({"title": "t" * 81, "text": "x"})),
+        ("a note over 2000", _notes({"text": "x" * 2001})),
+        ("a hashed tag", _notes({"text": "x", "tags": ["#idea"]})),
+        ("a long tag", _notes({"text": "x", "tags": ["t" * 25]})),
+        ("a note without text", _notes({"title": "t"})),
+        ("html in a suggested tag", _notes(tags=["<b>"])),
+        (
+            "a handler on notes",
+            {"ui": {**_notes()["ui"], "on_change": {"action": "set", "target": "x", "value": 1}}},
+        ),
+    ],
+)
+def test_notes_and_music_hold_to_plain_text_and_preset_sounds(why, spec):
+    assert _ripple(spec) is None, why
+
+
+def test_the_rules_send_notes_and_music_to_their_widgets():
+    from pocketpaw_ee.paw_bar.concierge_runtime import _RIPPLE_RULES
+
+    rule = next(r for r in _RIPPLE_RULES if "Match the card to the answer" in r)
+    assert "a notes card, never inputs and buttons" in rule
+    assert "a music-player of its preset sounds" in rule
