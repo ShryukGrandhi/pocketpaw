@@ -100,6 +100,45 @@ def test_the_core_widgets_carry_their_steering_hints_on_every_turn():
     assert "short phrases" not in _section(_paragraph("review this NDA as a table"))
 
 
+_PICKED = "I'd like to book Dental cleaning on Tue, Oct 20 at 10:00 AM."
+_NOTE = "already picked and confirmed this slot on the card"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        _PICKED,
+        "I'd like to book Teeth cleaning on Tue 14 Oct at 10:30 (3 people). Note: first visit",
+        "I\u2019d like to book Haircut at 4:00 PM.",
+    ],
+)
+def test_a_picked_slot_turn_gets_a_text_only_instruction_and_no_card_grammar(message):
+    """The landing sends this when a visitor confirms a slot on a booking card the
+    store does not back; the concierge answered with the same booking card again,
+    even with a note telling it not to. That turn's cards paragraph is now the
+    text-only instruction alone. THE MUTATION THAT BREAKS THIS: drop the
+    picked-slot early return from _cards_paragraph."""
+    text = _paragraph(message)
+    assert _NOTE in text and "never send them back to the card" in text
+    assert "a reminder note" in text
+    for card_grammar in (_SECTION, "Every widget by category", '{"ui"', "   - stat ", "   - "):
+        assert card_grammar not in text
+    assert "Dental" not in text and "Teeth" not in text and "Haircut" not in text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Book a dentist appointment",
+        "book a dentist appointment",
+        "I'd like to book",
+        "I'd like to book a table at Nobu",
+    ],
+)
+def test_a_booking_request_gets_no_picked_slot_note(message):
+    assert _NOTE not in _paragraph(message)
+
+
 def test_the_illustration_rule_asks_for_a_compact_svg_and_a_node_level_on_select():
     """The bike gears turn: the first SVG was cut off mid-JSON and the restart was
     refused for an on_select written inside the illustration's props."""
