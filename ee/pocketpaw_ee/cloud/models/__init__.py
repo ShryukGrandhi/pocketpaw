@@ -319,6 +319,7 @@ from pocketpaw_ee.cloud.models.site_secret import SiteSecret
 from pocketpaw_ee.cloud.models.site_template import SiteTemplate
 from pocketpaw_ee.cloud.models.social_idea import SocialIdea
 from pocketpaw_ee.cloud.models.social_profile import SocialProfile
+from pocketpaw_ee.cloud.models.social_pulse import SocialPulse
 from pocketpaw_ee.cloud.models.spend_reconciliation import SpendReconciliation
 from pocketpaw_ee.cloud.models.studio_generation import StudioGeneration
 from pocketpaw_ee.cloud.models.studio_template import StudioTemplate
@@ -710,6 +711,7 @@ def get_all_documents():
         # ideas. Only ``ee.cloud.growth.social.service`` imports these.
         SocialProfile,
         SocialIdea,
+        SocialPulse,
         PushSubscription,
         VapidKeypair,
         WorkspaceSensePreference,

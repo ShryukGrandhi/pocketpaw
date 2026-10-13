@@ -54,6 +54,8 @@ from pocketpaw_ee.cloud.growth.social.domain import (
     SocialProfile,
 )
 from pocketpaw_ee.cloud.growth.social.dto import (
+    AddPulseCompaniesRequest,
+    AddPulseCompaniesResponse,
     AnalysisPatch,
     CharacterResponse,
     CreateCharacterRequest,
@@ -63,17 +65,23 @@ from pocketpaw_ee.cloud.growth.social.dto import (
     MakeMemeRequest,
     MemeFormatListResponse,
     MemeFormatResponse,
+    PulseSourceModel,
+    PulseThemeResponse,
+    RefreshPulseRequest,
     ScheduleIdeasRequest,
     SocialAnalysisResponse,
     SocialIdeaListResponse,
     SocialIdeaResponse,
     SocialProfileListResponse,
     SocialProfileResponse,
+    SocialPulseResponse,
     UpdateIdeaRequest,
     UpsertProfileRequest,
+    UsePulseSuggestionRequest,
 )
 from pocketpaw_ee.cloud.models.social_idea import SocialIdea as _IdeaDoc
 from pocketpaw_ee.cloud.models.social_profile import SocialProfile as _ProfileDoc
+from pocketpaw_ee.cloud.models.social_pulse import SocialPulse as _PulseDoc
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +466,7 @@ async def generate_ideas(
             body.count,
             await _recent_hooks(workspace_id, profile_key),
             platform=body.platform,
+            pulse=await _pulse_themes(workspace_id, profile_key),
         )
     except ResearchUnavailable as exc:
         raise CloudError(502, "social.ideas_failed", f"Idea generation failed: {exc}") from exc
@@ -696,6 +705,285 @@ async def make_meme(
     return _idea_to_response(_idea_to_domain(idea))
 
 
+# ---------------------------------------------------------------------------
+# Pulse
+# ---------------------------------------------------------------------------
+
+PULSE_COOLDOWN_SECONDS = 600
+
+
+async def _pulse_doc(workspace_id: str, profile: str) -> _PulseDoc | None:
+    return await _PulseDoc.find_one({"workspace": workspace_id, "profile": profile})
+
+
+async def _pulse_themes(workspace_id: str, profile: str) -> list[dict[str, Any]]:
+    doc = await _pulse_doc(workspace_id, profile)
+    return list(doc.themes) if doc else []
+
+
+def _pulse_response(doc: _PulseDoc | None) -> SocialPulseResponse:
+    if doc is None:
+        return SocialPulseResponse(sources=[], themes=[], refreshed_at=None)
+    return SocialPulseResponse(
+        sources=[PulseSourceModel(**s) for s in doc.sources],
+        themes=[PulseThemeResponse(**t) for t in doc.themes],
+        refreshed_at=iso_utc(doc.refreshed_at),
+    )
+
+
+async def get_pulse(ctx: RequestContext, profile_id: str | None = None) -> SocialPulseResponse:
+    workspace_id = _require_workspace(ctx)
+    profile = await _require_profile_doc(workspace_id, profile_id)
+    return _pulse_response(await _pulse_doc(workspace_id, str(profile.id)))
+
+
+def _pulse_sources(body_sources: Any, doc: _PulseDoc | None) -> tuple[Any, ...] | None:
+    from pocketpaw_ee.cloud.growth.social import pulse as social_pulse
+
+    if body_sources is not None:
+        cleaned = [social_pulse.clean_source(s.platform, s.kind, s.value) for s in body_sources]
+        return tuple(s for s in cleaned if s is not None)
+    if doc and doc.sources:
+        return tuple(social_pulse.PulseSource(**s) for s in doc.sources)
+    return None
+
+
+async def _rebuild_pulse(
+    doc: _PulseDoc, brief: Any, sources: tuple[Any, ...] | None, *, manual: bool
+) -> _PulseDoc:
+    """Run the Pulse for ``brief`` and replace ``doc``'s themes. Evidence not seen in the previous
+    Pulse is marked ``new``. Raises CloudError (503 no provider, 502 failed or no themes)."""
+    from pocketpaw_ee.cloud.growth.researcher import ResearchUnavailable
+    from pocketpaw_ee.cloud.growth.social import pulse as social_pulse
+
+    build = social_pulse.resolve_pulse_fn()
+    if build is None:
+        raise CloudError(503, "social.pulse_unavailable", "Market research is not configured here")
+    try:
+        result = await build(brief, sources or None)
+    except social_pulse.PulseUnavailable as exc:
+        raise CloudError(503, "social.pulse_unavailable", str(exc)) from exc
+    except ResearchUnavailable as exc:
+        raise CloudError(502, "social.pulse_failed", "Reading the market failed") from exc
+    if not result.themes:
+        raise CloudError(502, "social.pulse_failed", "No clear themes came back; try other sources")
+    seen = {ev.get("url") for t in doc.themes for ev in t.get("evidence") or []}
+    themes = []
+    for theme in result.themes:
+        evidence = [
+            {**ev, "new": bool(seen) and ev.get("url") not in seen} for ev in theme["evidence"]
+        ]
+        themes.append({**theme, "evidence": evidence})
+    now = datetime.now(UTC)
+    doc.sources = [s.__dict__ for s in result.sources]
+    doc.themes = themes
+    doc.refreshed_at = now
+    if manual:
+        doc.manual_refreshed_at = now
+    await doc.save()
+    return doc
+
+
+def _check_cooldown(doc: _PulseDoc | None, sources: tuple[Any, ...] | None, changed: bool) -> None:
+    if doc is None or doc.refreshed_at is None or changed:
+        return
+    last = doc.refreshed_at if doc.refreshed_at.tzinfo else doc.refreshed_at.replace(tzinfo=UTC)
+    if (datetime.now(UTC) - last).total_seconds() < PULSE_COOLDOWN_SECONDS:
+        raise ConflictError(
+            "social.pulse_cooldown", "The Pulse was just refreshed; try again in a few minutes"
+        )
+
+
+async def refresh_pulse(
+    ctx: RequestContext, body: RefreshPulseRequest, profile_id: str | None = None
+) -> SocialPulseResponse:
+    """Read the market (Reddit / X) and replace this social's Pulse. In-request, ~1 min."""
+    from pocketpaw_ee.cloud.growth.social import pulse as social_pulse
+
+    body = RefreshPulseRequest.model_validate(body)
+    workspace_id = _require_workspace(ctx)
+    if social_pulse.resolve_pulse_fn() is None:
+        raise CloudError(503, "social.pulse_unavailable", "Market research is not configured here")
+    profile_doc = await _profile_doc(workspace_id, profile_id)
+    if profile_doc is None or profile_doc.onboarding_completed_at is None:
+        raise ConflictError("social.onboarding_incomplete", "Finish the Social setup first")
+    key = str(profile_doc.id)
+    doc = await _pulse_doc(workspace_id, key)
+    sources = _pulse_sources(body.sources, doc)
+    changed = body.sources is not None and [s.__dict__ for s in sources or ()] != (
+        doc.sources if doc else []
+    )
+    _check_cooldown(doc, sources, changed)
+    doc = doc or _PulseDoc(workspace=workspace_id, profile=key)
+    brief = social_pulse.social_brief(_profile_to_domain(profile_doc))
+    doc = await _rebuild_pulse(doc, brief, sources, manual=True)
+    # no-event: Growth › Social has no realtime subscriber; the Pulse page re-renders.
+    return _pulse_response(doc)
+
+
+# --- Hunt (ICP) market pulse: same Pulse, keyed "icp:<icp_id>", read for outreach ---
+
+
+def _hunt_key(icp_id: str) -> str:
+    return f"icp:{icp_id}"
+
+
+def _icp_brief(workspace_id: str, icp: Any) -> Any:
+    from pocketpaw_ee.cloud.growth.social import pulse as social_pulse
+
+    return social_pulse.hunt_brief(
+        workspace_id, icp.name, icp.criteria, icp.geography, icp.exclusions
+    )
+
+
+async def get_hunt_pulse(ctx: RequestContext, icp_id: str) -> SocialPulseResponse:
+    from pocketpaw_ee.cloud.growth import service as growth_service
+
+    workspace_id = _require_workspace(ctx)
+    await growth_service.get_icp(ctx, icp_id)
+    return _pulse_response(await _pulse_doc(workspace_id, _hunt_key(icp_id)))
+
+
+async def refresh_hunt_pulse(
+    ctx: RequestContext, icp_id: str, body: RefreshPulseRequest
+) -> SocialPulseResponse:
+    """Read what people matching this ICP say on Reddit / X: themes with why they matter for the
+    hunt, outreach angles, and companies the posts name as having the need."""
+    from pocketpaw_ee.cloud.growth import service as growth_service
+
+    body = RefreshPulseRequest.model_validate(body)
+    workspace_id = _require_workspace(ctx)
+    icp = await growth_service.get_icp(ctx, icp_id)
+    key = _hunt_key(icp_id)
+    doc = await _pulse_doc(workspace_id, key)
+    sources = _pulse_sources(body.sources, doc)
+    changed = body.sources is not None and [s.__dict__ for s in sources or ()] != (
+        doc.sources if doc else []
+    )
+    _check_cooldown(doc, sources, changed)
+    doc = doc or _PulseDoc(workspace=workspace_id, profile=key)
+    doc = await _rebuild_pulse(doc, _icp_brief(workspace_id, icp), sources, manual=True)
+    # no-event: growth has no realtime subscriber in v1; the Hunt page re-renders.
+    return _pulse_response(doc)
+
+
+async def add_pulse_companies(
+    ctx: RequestContext, icp_id: str, body: AddPulseCompaniesRequest
+) -> AddPulseCompaniesResponse:
+    """File the companies a hunt theme names as prospects (company-level only, with the source
+    post as evidence). Companies with no stated website are skipped and reported."""
+    from pocketpaw_ee.cloud.growth import service as growth_service
+    from pocketpaw_ee.cloud.growth.dto import CreateProspectRequest
+
+    body = AddPulseCompaniesRequest.model_validate(body)
+    workspace_id = _require_workspace(ctx)
+    icp = await growth_service.get_icp(ctx, icp_id)
+    doc = await _pulse_doc(workspace_id, _hunt_key(icp_id))
+    themes = doc.themes if doc else []
+    if body.theme >= len(themes):
+        raise NotFound("social_pulse_theme", str(body.theme))
+    theme = themes[body.theme]
+    added: list[str] = []
+    skipped: list[str] = []
+    for company in theme.get("companies") or []:
+        if not company.get("domain"):
+            skipped.append(company.get("name", ""))
+            continue
+        await growth_service.upsert_by_domain(
+            workspace_id,
+            CreateProspectRequest(
+                company=company.get("name", ""),
+                domain=company["domain"],
+                source="discovery",
+                project_id=icp.project_id,
+                icp_id=icp.id,
+                research_brief=(
+                    f"From the {icp.name} market pulse, {theme.get('title', '')}: "
+                    f"{company.get('reason', '')}"
+                )[:2000],
+                source_urls=[company["url"]] if company.get("url") else [],
+            ),
+        )
+        added.append(company.get("name", ""))
+    # no-event: upsert_by_domain owns the prospect writes; the Hunt page re-renders.
+    return AddPulseCompaniesResponse(added=added, skipped=skipped)
+
+
+# --- Daily refresh ---
+
+PULSE_STALE_HOURS = 20
+PULSE_ACTIVE_DAYS = 7
+
+
+async def refresh_due_pulses(now: datetime | None = None) -> dict[str, int]:
+    """Re-read every Pulse a person refreshed in the last week that is older than a day, with its
+    saved sources. One failure never stops the sweep. Runs from the growth worker's cron."""
+    from datetime import timedelta
+
+    from pocketpaw_ee.cloud.growth import service as growth_service
+    from pocketpaw_ee.cloud.growth.social import pulse as social_pulse
+
+    now = now or datetime.now(UTC)
+    if social_pulse.resolve_pulse_fn() is None:
+        return {"due": 0, "refreshed": 0, "failed": 0}
+    # global-read: the sweep runs for every workspace; each doc carries its own tenant.
+    docs = await _PulseDoc.find(
+        {
+            "manual_refreshed_at": {"$gte": now - timedelta(days=PULSE_ACTIVE_DAYS)},
+            "refreshed_at": {"$lte": now - timedelta(hours=PULSE_STALE_HOURS)},
+        }
+    ).to_list()
+    refreshed = failed = 0
+    for doc in docs:
+        try:
+            if doc.profile.startswith("icp:"):
+                icp = await growth_service.get_icp_system(doc.workspace, doc.profile[4:])
+                brief = _icp_brief(doc.workspace, icp)
+            else:
+                profile = await _require_profile_doc(doc.workspace, doc.profile)
+                brief = social_pulse.social_brief(_profile_to_domain(profile))
+            await _rebuild_pulse(doc, brief, _pulse_sources(None, doc), manual=False)
+            refreshed += 1
+        except Exception:  # noqa: BLE001
+            failed += 1
+            logger.warning("pulse sweep: %s failed", doc.profile, exc_info=True)
+    logger.info("pulse sweep: due=%d refreshed=%d failed=%d", len(docs), refreshed, failed)
+    return {"due": len(docs), "refreshed": refreshed, "failed": failed}
+
+
+async def use_pulse_suggestion(
+    ctx: RequestContext, body: UsePulseSuggestionRequest, profile_id: str | None = None
+) -> SocialIdeaResponse:
+    """File one of a theme's post suggestions as an idea (to Blitz, or approved to Content)."""
+    body = UsePulseSuggestionRequest.model_validate(body)
+    workspace_id = _require_workspace(ctx)
+    profile = await _require_profile_doc(workspace_id, profile_id)
+    doc = await _pulse_doc(workspace_id, str(profile.id))
+    themes = doc.themes if doc else []
+    if body.theme >= len(themes):
+        raise NotFound("social_pulse_theme", str(body.theme))
+    theme = themes[body.theme]
+    suggestions = theme.get("suggestions") or []
+    if body.suggestion >= len(suggestions):
+        raise NotFound("social_pulse_suggestion", str(body.suggestion))
+    s = suggestions[body.suggestion]
+    reddit = s.get("platform") == "reddit"
+    idea = _IdeaDoc(
+        workspace=workspace_id,
+        profile=str(profile.id),
+        format="reddit_post" if reddit else "x_post",
+        hook=s.get("hook") or theme.get("title", ""),
+        caption=s.get("caption") or "",
+        why=f"From your market pulse, {theme.get('title', '')}: {theme.get('why', '')}"[:400],
+        platform="reddit" if reddit else "x",
+        subreddit=s.get("subreddit") or "",
+        status=body.status,
+    )
+    await idea.insert()
+    # no-event: Growth › Social has no realtime subscriber; Blitz / Content re-fetch.
+    return _idea_to_response(_idea_to_domain(idea))
+
+
 SOCIAL_CALENDAR_ID = "growth-social"
 _PLATFORM_NAMES = {"x": "X", "reddit": "Reddit"}
 
@@ -800,6 +1088,13 @@ __all__ = [
     "create_character",
     "delete_character",
     "get_idea",
+    "add_pulse_companies",
+    "get_hunt_pulse",
+    "get_pulse",
+    "refresh_due_pulses",
+    "refresh_hunt_pulse",
+    "refresh_pulse",
+    "use_pulse_suggestion",
     "list_meme_formats",
     "make_meme",
     "list_profiles",

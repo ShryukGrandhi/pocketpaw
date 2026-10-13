@@ -21,13 +21,16 @@ from pocketpaw_ee.cloud.growth.social.dto import (
     MakeMediaRequest,
     MakeMemeRequest,
     MemeFormatListResponse,
+    RefreshPulseRequest,
     ScheduleIdeasRequest,
     SocialIdeaListResponse,
     SocialIdeaResponse,
     SocialProfileListResponse,
     SocialProfileResponse,
+    SocialPulseResponse,
     UpdateIdeaRequest,
     UpsertProfileRequest,
+    UsePulseSuggestionRequest,
 )
 from pocketpaw_ee.cloud.license import require_license
 
@@ -261,3 +264,44 @@ async def make_meme(
 ) -> SocialIdeaResponse:
     """Draw a meme with a format and character and file it as a new Blitz idea."""
     return await social_service.make_meme(ctx, body, profile_id)
+
+
+@router.get(
+    "/pulse",
+    response_model=SocialPulseResponse,
+    dependencies=[Depends(require_action_any_workspace("growth.read"))],
+)
+async def get_pulse(
+    profile_id: str | None = _PROFILE_ID, ctx: RequestContext = Depends(request_context)
+) -> SocialPulseResponse:
+    """The social's latest market Pulse (empty before the first refresh)."""
+    return await social_service.get_pulse(ctx, profile_id)
+
+
+@router.post(
+    "/pulse/refresh",
+    response_model=SocialPulseResponse,
+    dependencies=[Depends(require_action_any_workspace("growth.write"))],
+)
+async def refresh_pulse(
+    body: RefreshPulseRequest | None = None,
+    profile_id: str | None = _PROFILE_ID,
+    ctx: RequestContext = Depends(request_context),
+) -> SocialPulseResponse:
+    """Read Reddit / X for this social's market and replace its Pulse (~1 min, in-request).
+    503 with no provider, 409 before setup or within the refresh cooldown, 502 on no themes."""
+    return await social_service.refresh_pulse(ctx, body or RefreshPulseRequest(), profile_id)
+
+
+@router.post(
+    "/pulse/use",
+    response_model=SocialIdeaResponse,
+    dependencies=[Depends(require_action_any_workspace("growth.write"))],
+)
+async def use_pulse_suggestion(
+    body: UsePulseSuggestionRequest,
+    profile_id: str | None = _PROFILE_ID,
+    ctx: RequestContext = Depends(request_context),
+) -> SocialIdeaResponse:
+    """File a theme's post suggestion as an idea: to Blitz (new) or straight to Content."""
+    return await social_service.use_pulse_suggestion(ctx, body, profile_id)

@@ -284,6 +284,27 @@ class ResearchFact(BaseModel):
         }
 
 
+class ResearchSignal(BaseModel):
+    """One buying signal on a prospect (Pulse signals), with why it matters for the hunt."""
+
+    kind: str = ""
+    text: str = ""
+    why: str = ""
+    url: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data: Any) -> dict[str, Any]:
+        d = _raw(data)
+        url = _text(d.get("url"), 2048)
+        return {
+            "kind": _text(d.get("kind"), RESEARCH_SHORT_CAP),
+            "text": _text(d.get("text"), RESEARCH_PROSE_CAP),
+            "why": _text(d.get("why"), RESEARCH_PROSE_CAP),
+            "url": url if url.lower().startswith("https://") else "",
+        }
+
+
 class ProspectResearch(BaseModel):
     """The structured profile a single-prospect research run produced."""
 
@@ -299,6 +320,8 @@ class ProspectResearch(BaseModel):
     channels: list[ResearchChannel] = Field(default_factory=list)
     facts: list[ResearchFact] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
+    signals: list[ResearchSignal] = Field(default_factory=list)
+    first_touch: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -317,6 +340,8 @@ class ProspectResearch(BaseModel):
             "people": _rows(d.get("people")),
             "channels": _rows(d.get("channels")),
             "facts": _rows(d.get("facts")),
+            "signals": _rows(d.get("signals")),
+            "first_touch": _text(d.get("first_touch"), RESEARCH_PROSE_CAP),
             "sources": [
                 u
                 for u in _texts(d.get("sources"), 2048)
