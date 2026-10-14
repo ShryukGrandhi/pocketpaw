@@ -29,6 +29,13 @@
 # failure or a required setting without a valid value; so an embed is
 # ``connected`` exactly when its link is valid), the provider's ``site_status``
 # hook, connected.
+#
+# Row writes are atomic ``$set``s of the fields a call changed (``_persist``), and
+# settings are written key by key, so a stale request can never wipe a value
+# another writer (a provider's setup, its encrypted secret) stored meanwhile.
+#
+# Unlinking a site, or purging it, runs the provider's optional ``site_teardown``
+# hook (best effort) for state the provider created elsewhere (a Turnstile widget).
 
 from __future__ import annotations
 
@@ -203,15 +210,44 @@ async def run_setup(binding: Any, provider: IntegrationProvider, conn: Any | Non
         logger.info("integrations: %s site_setup failed: %s", provider.id, type(exc).__name__)
         settings, error = dict(binding.settings or {}), "setup_failed"
     update: dict[str, Any] = {}
-    if settings != dict(binding.settings or {}):
-        update["settings"] = settings
+    current = dict(binding.settings or {})
+    for key, value in settings.items():
+        if current.get(key) != value:
+            update[f"settings.{key}"] = value
     if error != (getattr(binding, "setup_error", "") or ""):
         update["setup_error"] = error
     if not update:
         return
     await _doc().get_pymongo_collection().update_one({"_id": binding.id}, {"$set": update})
-    for key, value in update.items():
-        setattr(binding, key, value)
+    binding.settings = settings
+    binding.setup_error = error
+
+
+async def _persist(row: Any, settings_before: dict | None, *fields: str) -> None:
+    """Insert a new row, or ``$set`` only ``fields`` on an existing one. ``settings``
+    is written key by key against ``settings_before`` (removed keys are unset)."""
+    from datetime import UTC, datetime
+
+    if row.id is None:
+        await row.insert()
+        return
+    now = datetime.now(UTC)
+    set_: dict[str, Any] = {"updatedAt": now}
+    unset: dict[str, str] = {}
+    for name in fields:
+        if name != "settings":
+            set_[name] = getattr(row, name)
+            continue
+        before, after = settings_before or {}, dict(row.settings or {})
+        for key, value in after.items():
+            if before.get(key) != value:
+                set_[f"settings.{key}"] = value
+        unset.update({f"settings.{key}": "" for key in before if key not in after})
+    update: dict[str, Any] = {"$set": set_}
+    if unset:
+        update["$unset"] = unset
+    await _doc().get_pymongo_collection().update_one({"_id": row.id}, update)
+    row.updatedAt = now
 
 
 async def connection_for(binding: Any):
@@ -333,6 +369,7 @@ async def upsert(
     # Setup re-runs on link, on enable (disabled -> any action on) and on a settings
     # change; a pure enabled_actions toggle does not touch the provider.
     setup = row.id is None
+    before = dict(row.settings or {})
     was_enabled = bool(row.enabled_actions) or not provider.actions
     if "connection_id" in body.model_fields_set:
         if body.connection_id:
@@ -350,7 +387,7 @@ async def upsert(
     if body.enabled_actions is not None:
         row.enabled_actions = _check_actions(provider, body.enabled_actions)
         setup = setup or (not was_enabled and bool(row.enabled_actions))
-    await row.save()
+    await _persist(row, before, "connection_id", "settings", "enabled_actions")
     await ensure_gateway_token(workspace_id, pocket_id)
     if setup:
         await run_setup(row, provider, await connection_for(row), user_id)
@@ -373,7 +410,7 @@ async def link_connection(*, workspace_id: str, user_id: str, pocket_id: str, co
             created_by=user_id,
         )
     row.connection_id = str(conn.id)
-    await row.save()
+    await _persist(row, None, "connection_id")
     await ensure_gateway_token(workspace_id, pocket_id)
     await run_setup(row, provider, conn, user_id)
     view = await to_view(row)
@@ -399,7 +436,7 @@ async def request_from_agent(
             created_by=user_id,
         )
     row.purpose = (purpose or "").strip()[:MAX_PURPOSE_CHARS]
-    await row.save()
+    await _persist(row, None, "purpose")
     await ensure_gateway_token(workspace_id, pocket_id)
     if created:
         await run_setup(row, provider, await connection_for(row), user_id)
@@ -416,7 +453,19 @@ async def unlink(*, workspace_id: str, user_id: str, pocket_id: str, provider_id
     if row is None:
         raise NotFound("site_integration", provider_id)
     await row.delete()
+    await run_teardown(row)
     await emit_changed(pocket, provider_id, "unlinked", user_id)
+
+
+async def run_teardown(row: Any) -> None:
+    """The provider's optional ``site_teardown(binding)``. Never raises."""
+    hook = getattr(get_provider(row.provider), "site_teardown", None)
+    if hook is None:
+        return
+    try:
+        await hook(row)
+    except Exception:  # noqa: BLE001 - an unlink never fails on provider cleanup
+        logger.info("integrations: %s site_teardown failed", row.provider, exc_info=True)
 
 
 async def ensure_gateway_token(workspace_id: str, pocket_id: str) -> None:
@@ -475,7 +524,7 @@ async def revoke_connection(*, workspace_id: str, user_id: str, connection_id: s
     await vault.mark_revoked(conn)
     for row in rows:
         row.connection_id = None
-        await row.save()
+        await _persist(row, None, "connection_id")
         try:
             pocket = await pocket_in_workspace(row.workspace, row.pocket_id)
         except NotFound:
@@ -520,6 +569,10 @@ async def purge_for_pocket(*, workspace_id: str, pocket_id: str) -> int:
         SiteOrder,
     )
 
+    for row in await SiteIntegration.find(
+        SiteIntegration.workspace == workspace_id, SiteIntegration.pocket_id == pocket_id
+    ).to_list():
+        await run_teardown(row)
     removed = 0
     for doc in (SiteIntegration, NewsletterSubscriber, SiteOrder, IntegrationDemoRecord):
         result = await doc.find(doc.workspace == workspace_id, doc.pocket_id == pocket_id).delete()
