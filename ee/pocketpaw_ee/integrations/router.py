@@ -19,6 +19,13 @@
 #   GET  /integrations/{provider}/callback   single-use state + the matching cookie
 #   POST /sites/{site_id}/x/{provider}/{action}   site key or PAW_GATEWAY_TOKEN
 #   POST /integrations/webhooks/{provider}   provider signature
+#   GET  /integrations/social/{provider}/authorize   visitor sign-in consent page
+#                                            (site binding + own-host return_to)
+#   POST /integrations/social/{provider}/authorize   Continue / Cancel from that page
+#                                            (single-use token + SameSite=Strict cookie)
+#   GET  /integrations/social/{provider}/callback    single-use broker state
+#   POST /integrations/social/redeem          PAW_GATEWAY_TOKEN + ticket + nonce
+#                                            (all three: social_broker.py)
 #
 # Wire shapes are pinned by the Wave 0 contract and its Wave 1 addendum; see dto.py. Mounted in
 # ``cloud.mount_cloud``; both routers are in tests/cloud/auth/test_route_auth_audit.py.
@@ -34,7 +41,7 @@ from pocketpaw_ee.cloud._core.deps import (
     require_action_any_workspace,
     require_plan_feature,
 )
-from pocketpaw_ee.integrations import bindings, gateway, oauth, vault, webhooks
+from pocketpaw_ee.integrations import bindings, gateway, oauth, social_broker, vault, webhooks
 from pocketpaw_ee.integrations.dto import (
     ConnectBody,
     ConnectionView,
@@ -280,3 +287,37 @@ async def gateway_call(site_id: str, provider: str, action: str, request: Reques
 async def provider_webhook(provider: str, request: Request) -> JSONResponse:
     """Provider-signed webhook ingress. See webhooks.py."""
     return await webhooks.ingest(provider, request)
+
+
+@public_router.get("/integrations/social/{provider}/authorize")
+async def social_authorize(
+    provider: str,
+    request: Request,
+    site_id: str = "",
+    return_to: str = "",
+    nonce: str = "",
+    next: str = "/",  # noqa: A002 - the wire name
+) -> Response:
+    """Visitor sign-in for a project site: checks the binding and return_to, then
+    shows a page naming the site; nothing goes to the provider before Continue."""
+    return await social_broker.authorize(request, provider, site_id, return_to, nonce, next)
+
+
+@public_router.post("/integrations/social/{provider}/authorize")
+async def social_authorize_decide(provider: str, request: Request) -> Response:
+    """Continue (-> provider) or Cancel (-> the site) from the consent page."""
+    return await social_broker.decide(request, provider)
+
+
+@public_router.get("/integrations/social/{provider}/callback")
+async def social_callback(
+    provider: str, request: Request, code: str = "", state: str = ""
+) -> Response:
+    """Provider redirect: single-use state -> ticket -> back to the site's callback."""
+    return await social_broker.callback(request, provider, code, state)
+
+
+@public_router.post("/integrations/social/redeem")
+async def social_redeem(request: Request) -> JSONResponse:
+    """The site Worker trades a ticket (+ its nonce) for the visitor's profile."""
+    return await social_broker.redeem(request)
