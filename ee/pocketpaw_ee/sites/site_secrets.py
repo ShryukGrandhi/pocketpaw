@@ -23,6 +23,13 @@
 #     (the integrations gateway's ``PAW_GATEWAY_TOKEN``). The first skips the owner
 #     gate, so its callers authorize first; the second compares in constant time
 #     here, so the value still never leaves this module.
+#   * ``set_managed_secret`` / ``delete_managed_secrets`` serve integration-written
+#     secrets (Supabase's project keys), tagged ``managed_by``. They skip the owner
+#     gate too (the caller is an integration hook the owner set up) but are audited
+#     (names only). A managed write never replaces a value it does not own (an
+#     owner-set or another integration's); it only fills an empty / pending row or
+#     its own. Deletes only touch rows carrying the tag. An owner ``set_secret``
+#     clears the tag: the value is the owner's from then on.
 """Per-site secret storage: request, set, delete, list names, resolve for deploy."""
 
 from __future__ import annotations
@@ -61,6 +68,8 @@ class SiteSecretView(BaseModel):
     requested_by: Requester | None = None
     requested_at: datetime | None = None
     updated_at: datetime | None = None
+    # "integration:<provider>" when an integration wrote the value; None otherwise.
+    managed_by: str | None = None
 
 
 class SiteSecretsView(BaseModel):
@@ -91,6 +100,17 @@ def validate_name(name: str) -> str:
     return name
 
 
+def _check_value(name: str, value: str) -> None:
+    """A non-empty string within the size cap, else an owner-facing error."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("sites.secret_value_empty", f"{name} needs a non-empty value.")
+    if len(value.encode("utf-8")) > MAX_VALUE_BYTES:
+        raise PayloadTooLarge(
+            "sites.secret_too_large",
+            f"{name} is over the {MAX_VALUE_BYTES // 1024} KB limit for a site secret.",
+        )
+
+
 def _doc():
     from pocketpaw_ee.cloud.models.site_secret import SiteSecret
 
@@ -105,6 +125,7 @@ def _view(row) -> SiteSecretView:
         requested_by=row.requested_by if row.requested_by in ("agent", "user") else None,
         requested_at=row.requested_at,
         updated_at=row.value_set_at,
+        managed_by=getattr(row, "managed_by", None) or None,
     )
 
 
@@ -224,13 +245,7 @@ async def set_secret(
 ) -> SiteSecretView:
     """Encrypt and store a value (owner only). Fills a pending request if there is one."""
     name = validate_name(name)
-    if not isinstance(value, str) or not value.strip():
-        raise ValidationError("sites.secret_value_empty", f"{name} needs a non-empty value.")
-    if len(value.encode("utf-8")) > MAX_VALUE_BYTES:
-        raise PayloadTooLarge(
-            "sites.secret_too_large",
-            f"{name} is over the {MAX_VALUE_BYTES // 1024} KB limit for a site secret.",
-        )
+    _check_value(name, value)
     pocket = await _require_owner(workspace_id, user_id, pocket_id)
     token = crypto.encrypt(value)
     now = datetime.now(UTC)
@@ -242,6 +257,7 @@ async def set_secret(
     row.encrypted_value = token
     row.value_set_by = user_id
     row.value_set_at = now
+    row.managed_by = None
     await row.save()
 
     _audit(user_id, workspace_id, pocket_id, "sites.secret.set", name)
@@ -364,6 +380,58 @@ async def ensure_generated_secret(
     await row.save()
     logger.info("site_secrets: generated %s on pocket %s", name, pocket_id)
     return True
+
+
+async def set_managed_secret(
+    *, workspace_id: str, pocket_id: str, name: str, value: str, managed_by: str, description: str
+) -> bool:
+    """Write ``value`` for ``name`` on behalf of an integration, tagged ``managed_by``.
+
+    True when written. False (nothing changes) when the row already holds a value
+    that ``managed_by`` does not own: an owner's value is never replaced. A pending
+    request is filled. Skips the owner gate and the cap; the caller authorized the
+    link that needs it."""
+    name = validate_name(name)
+    if not managed_by:
+        raise ValueError("managed_by is required")
+    _check_value(name, value)
+    row = await _row(workspace_id, pocket_id, name)
+    if row is None:
+        row = _doc()(workspace=workspace_id, pocket_id=pocket_id, name=name)
+    elif row.encrypted_value and getattr(row, "managed_by", None) != managed_by:
+        logger.info("site_secrets: %s kept on pocket %s (not %s's)", name, pocket_id, managed_by)
+        return False
+    row.encrypted_value = crypto.encrypt(value)
+    row.description = description[:MAX_DESCRIPTION_CHARS]
+    row.value_set_by = "system"
+    row.value_set_at = datetime.now(UTC)
+    row.managed_by = managed_by
+    await row.save()
+    _audit(managed_by, workspace_id, pocket_id, "sites.secret.set_managed", name)
+    logger.info("site_secrets: %s set by %s on pocket %s", name, managed_by, pocket_id)
+    return True
+
+
+async def delete_managed_secrets(
+    *, workspace_id: str, pocket_id: str, managed_by: str, keep: frozenset[str] = frozenset()
+) -> list[str]:
+    """Delete the rows tagged ``managed_by`` whose name is not in ``keep``.
+
+    Returns the deleted names. Rows without that tag (owner-set, agent-requested,
+    another integration's) are never touched."""
+    if not managed_by:
+        return []
+    gone: list[str] = []
+    for row in await _rows(workspace_id, pocket_id):
+        if getattr(row, "managed_by", None) == managed_by and row.name not in keep:
+            await row.delete()
+            gone.append(row.name)
+            _audit(managed_by, workspace_id, pocket_id, "sites.secret.delete_managed", row.name)
+    if gone:
+        logger.info(
+            "site_secrets: %s removed %s from pocket %s", managed_by, ",".join(gone), pocket_id
+        )
+    return gone
 
 
 async def secret_matches(*, workspace_id: str, pocket_id: str, name: str, candidate: str) -> bool:
