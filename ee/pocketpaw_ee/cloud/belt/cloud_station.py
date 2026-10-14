@@ -59,7 +59,8 @@
 #           ``Belt-Contact-Sheet:`` issue comment since the launch. STALL: no
 #           ``lead/<feature>`` commit, PR update or issue comment for LEAD_STALL:
 #           a ``claude -p --cloud`` nudge, then a resume relaunch, then
-#           ``needs-human`` and the run released. LEAD_TIMEOUT (8 h), no no-PR rule.
+#           ``needs-human`` and the run released. LEAD_TIMEOUT (8 h) settles the same
+#           way (labelled and released, never a develop failure); no no-PR rule.
 # Only git, gh and the launcher run locally; an approved escalated diff lands on the line.
 
 from __future__ import annotations
@@ -80,7 +81,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 from pocketpaw_ee.cloud.belt import clef, orient
 from pocketpaw_ee.cloud.belt.develop_station import (
@@ -235,6 +236,22 @@ def _tester_resumable(blob: dict[str, Any], timeout: float) -> bool:
     )
 
 
+_COUNTS = {1: "a", 2: "two", 3: "three"}
+
+
+def _rungs(ladder: list[dict[str, Any]]) -> str:
+    """The stall rungs that ran, in order: ``a nudge and a relaunch``, ``two nudges``."""
+    seen: dict[str, int] = {}
+    for rung in ladder:
+        kind = str(rung.get("kind") or "rung")
+        seen[kind] = seen.get(kind, 0) + 1
+    parts = []
+    for kind, n in seen.items():
+        plural = kind + ("es" if kind.endswith("h") else "s")
+        parts.append(f"{_COUNTS.get(n, str(n))} {kind if n == 1 else plural}")
+    return " and ".join(parts)
+
+
 def _is_lead(blob: dict[str, Any]) -> bool:
     return str(blob.get("recipe") or "") == LEAD_RECIPE
 
@@ -276,6 +293,8 @@ class CloudTaskDispatcher:
     """The headless dispatcher's cloud twin: files the queued run, launches a
     cloud session for it and tracks the session's PR (see the header)."""
 
+    # Runs ``feature-lead`` tasks (``headless.lead_station_wired``).
+    runs_leads: ClassVar[bool] = True
     launch_dir: str = ""
     runner: Runner = run_subprocess
     background: bool = False
@@ -581,7 +600,8 @@ class CloudTaskDispatcher:
                 # GitHub is down past the retries: skip this poll, not the lead.
                 logger.warning("belt cloud: lead %s poll skipped: %s", run_ref, exc)
                 if expired:
-                    raise self._lead_timeout(lead, issue) from exc
+                    await self._lead_expired(store, run_ref, blob, slug, cwd)
+                    return
                 await self.sleep(self.poll_seconds)
                 continue
             comments = raw.get("comments") or []
@@ -598,7 +618,8 @@ class CloudTaskDispatcher:
                 await self._land_lead(store, run_ref, blob, slug, done, sheet)
                 return
             if expired:
-                raise self._lead_timeout(lead, issue)
+                await self._lead_expired(store, run_ref, blob, slug, cwd)
+                return
             said = max((_epoch(c.get("createdAt")) for c in comments), default=0.0)
             branch = await self._branch_at(slug, str(lead.get("branch") or ""), cwd)
             # The lead's own signs of work; a stall rung or a relaunch is Belt's.
@@ -615,11 +636,21 @@ class CloudTaskDispatcher:
                     return
             await self.sleep(self.poll_seconds)
 
-    def _lead_timeout(self, lead: dict[str, Any], issue: str) -> CloudStationError:
+    async def _lead_expired(
+        self, store: Any, run_ref: str, blob: dict[str, Any], slug: str, cwd: Path
+    ) -> None:
+        """Out of time: settle like the stall ladder's last rung (label the issue
+        ``needs-human``, release the run). Never as a develop failure: a failed
+        run stops counting in flight while its session may still be committing,
+        and the next shift would launch a second lead on the same feature."""
+        lead = blob["lead"]
+        lead["stalls"] = [*(lead.get("stalls") or []), {"kind": "timeout", "at": self.wall()}]
+        await _patch(store, run_ref, lead=lead)
+        await self._flag_issue(slug, str(lead.get("issue") or ""), cwd)
         session = (lead.get("sessions") or [{}])[-1].get("session_url")
-        return CloudStationError(
-            f"TRACK: feature lead #{issue} not done after "
-            f"{self.lead_timeout_seconds:.0f}s (session {session})"
+        hours = self.lead_timeout_seconds / 3600
+        await self._release(
+            store, run_ref, blob, f"feature lead not done after {hours:g}h (session {session})"
         )
 
     async def _lead_prs(
@@ -715,7 +746,7 @@ class CloudTaskDispatcher:
                 store,
                 run_ref,
                 blob,
-                f"feature lead silent {minutes:.0f}m after a nudge and a relaunch",
+                f"feature lead silent {minutes:.0f}m after {_rungs(ladder)}",
             )
             return False
         if not ladder or not delivered:

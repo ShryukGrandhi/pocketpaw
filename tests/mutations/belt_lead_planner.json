@@ -1,0 +1,317 @@
+[
+  {
+    "label": "a lead line still calls the foreman",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "    lead = doc.charter.run_kind == LEAD_RUN_KIND\n",
+    "replace": "    lead = False\n",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "every mandate is a lead line",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "    lead = doc.charter.run_kind == LEAD_RUN_KIND\n",
+    "replace": "    lead = True\n",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the run kind is dropped on create",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "        run_kind=req.charter.run_kind,\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the run kind is left off the wire",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "        \"run_kind\": charter.run_kind,\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the lead plan waits for a human",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "    if lead:\n        state = await _lead_gate(",
+    "replace": "    if False:\n        state = await _lead_gate(",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the lead plan is approved as the belt policy",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "APPROVER = \"system:lead-planner\"",
+    "replace": "APPROVER = \"system:belt-policy\"",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the lead gate approves without recording its policy",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "    if not await _record_policy(workspace_id, action_id, record):\n        return \"in_gate\"\n    return await _approve_plan(\n        workspace_id=workspace_id,\n        mandate_id=mandate_id,\n        shift_no=shift_no,\n        task_count=task_count,",
+    "replace": "    return await _approve_plan(\n        workspace_id=workspace_id,\n        mandate_id=mandate_id,\n        shift_no=shift_no,\n        task_count=task_count,",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the lead recipe fails validation",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "            \"recipes\": {**charter_wire[\"recipes\"], LEAD_RUN_KIND: \"\"},",
+    "replace": "            \"recipes\": charter_wire[\"recipes\"],",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "blocked and in-flight issues are planned",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "        plan = await _lead_plan(\n            workspace_id, mandate_id, shift_no, free, capacity[\"budget\"], doc.surface.repo_id\n        )",
+    "replace": "        plan = await _lead_plan(\n            workspace_id, mandate_id, shift_no, backlog[\"open\"], capacity[\"budget\"], doc.surface.repo_id\n        )",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the lead plan ignores the line's headroom",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "        plan = await _lead_plan(\n            workspace_id, mandate_id, shift_no, free, capacity[\"budget\"], doc.surface.repo_id\n        )",
+    "replace": "        plan = await _lead_plan(\n            workspace_id, mandate_id, shift_no, free, doc.charter.budget.max_tasks_per_shift, doc.surface.repo_id\n        )",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "priority labels are ignored",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    return min(ranks, default=_UNRANKED)",
+    "replace": "    return _UNRANKED",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "priority labels match case-sensitively",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "_PRIORITY.get(str(lb).strip().lower(), _UNRANKED)",
+    "replace": "_PRIORITY.get(str(lb).strip(), _UNRANKED)",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the first priority label wins, not the highest",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    return min(ranks, default=_UNRANKED)",
+    "replace": "    return next((r for r in ranks if r != _UNRANKED), _UNRANKED)",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "newest first within a priority",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "            _aware(pair[0][\"ts\"]),",
+    "replace": "            -_aware(pair[0][\"ts\"]).timestamp(),",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the budget is not applied",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    tasks = [_task(s, number) for s, number in issues[: max(0, budget)]]",
+    "replace": "    tasks = [_task(s, number) for s, number in issues]",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "a sighting without an issue is planned",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "        if found and not _held(s):\n            issues.append((s, found[2]))",
+    "replace": "        if not _held(s):\n            issues.append((s, found[2] if found else \"0\"))",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the task carries no recipe",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "        recipe=LEAD_RUN_KIND,",
+    "replace": "        recipe=None,",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the why does not point at the issue",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "        why=f\"Feature issue #{number}\" + (f\": {url}\" if url else \"\"),",
+    "replace": "        why=f\"Feature issue {url}\",",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the released lead's reason always names a relaunch",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "                f\"feature lead silent {minutes:.0f}m after {_rungs(ladder)}\",",
+    "replace": "                f\"feature lead silent {minutes:.0f}m after a nudge and a relaunch\",",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "a needs-human issue is planned again",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    if _NEEDS_HUMAN in {str(lb).strip().lower() for lb in _labels(sighting)}:\n        return True",
+    "replace": "    if False:\n        return True",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "needs-human matches case-sensitively",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    if _NEEDS_HUMAN in {str(lb).strip().lower() for lb in _labels(sighting)}:",
+    "replace": "    if _NEEDS_HUMAN in {str(lb).strip() for lb in _labels(sighting)}:",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the filed labels win over the live ones",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    return list(live if live is not None else (sighting.get(\"evidence\") or {}).get(\"labels\") or [])",
+    "replace": "    return list((sighting.get(\"evidence\") or {}).get(\"labels\") or [])",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "a rejected or failed lead is planned again",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    return any(str(t.get(\"status\") or \"\") in _ENDED for t in sighting.get(\"tasks\") or [])",
+    "replace": "    return False",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "a develop failure is not an ended lead",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "_ENDED = frozenset({\"rejected\", \"failed\", \"develop failed\"})",
+    "replace": "_ENDED = frozenset({\"rejected\", \"failed\"})",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the planner never sees the live labels",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "                \"labels\": live.get(int(number)) if number.isdigit() else None,",
+    "replace": "                \"labels\": None,",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the planner never sees the citing tasks",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "                \"tasks\": list(entry.get(\"tasks\") or []),",
+    "replace": "                \"tasks\": [],",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "a title naming another issue keeps it first",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    if first and first[1] != number:\n        title = f\"#{number} {title}\"",
+    "replace": "    if False:\n        title = f\"#{number} {title}\"",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "a title naming its own issue is prefixed again",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "    if first and first[1] != number:",
+    "replace": "    if first:",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "a lead mandate is created without the cloud station",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "    charter = _charter_from_request(body)\n    _require_lead_station(charter)\n",
+    "replace": "    charter = _charter_from_request(body)\n",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "a lead shift runs without the cloud station",
+    "file": "ee/pocketpaw_ee/cloud/mandates/service.py",
+    "find": "    _require_lead_station(doc.charter)\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "any headless dispatcher counts as the lead station",
+    "file": "ee/pocketpaw_ee/cloud/belt/headless.py",
+    "find": "    return choice == \"headless\" and bool(getattr(_PRODUCTION_DISPATCHER, \"runs_leads\", False))",
+    "replace": "    return choice == \"headless\" and _PRODUCTION_DISPATCHER is not None",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the lead station counts under any dispatcher choice",
+    "file": "ee/pocketpaw_ee/cloud/belt/headless.py",
+    "find": "    return choice == \"headless\" and bool(getattr(_PRODUCTION_DISPATCHER, \"runs_leads\", False))",
+    "replace": "    return bool(getattr(_PRODUCTION_DISPATCHER, \"runs_leads\", False))",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "the cloud station does not run leads",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "    runs_leads: ClassVar[bool] = True",
+    "replace": "    runs_leads: ClassVar[bool] = False",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py"
+    ]
+  },
+  {
+    "label": "a timed-out lead is not labelled needs-human",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "        await _patch(store, run_ref, lead=lead)\n        await self._flag_issue(slug, str(lead.get(\"issue\") or \"\"), cwd)\n        session = (lead.get(\"sessions\") or [{}])[-1].get(\"session_url\")",
+    "replace": "        await _patch(store, run_ref, lead=lead)\n        session = (lead.get(\"sessions\") or [{}])[-1].get(\"session_url\")",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "a timed-out lead ends as a develop failure",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "            if expired:\n                await self._lead_expired(store, run_ref, blob, slug, cwd)\n                return\n            said =",
+    "replace": "            if expired:\n                raise CloudStationError(\"TRACK: feature lead not done\")\n            said =",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  }
+]

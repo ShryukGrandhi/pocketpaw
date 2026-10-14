@@ -17,8 +17,10 @@
 # any one missing keeps the run tracking.
 # STALL: 30 min with no lead-branch commit, PR update or issue comment: a
 # ``claude -p --cloud <session>`` nudge, then a relaunch with the resume brief,
-# then ``needs-human`` on the issue and the run released. Activity holds it off.
-# TIMEOUT: 8 h from the launch, and no 1 h no-PR rule.
+# then ``needs-human`` on the issue and the run released, the reason naming the
+# rungs that ran ("after two nudges" when no relaunch did). Activity holds it off.
+# TIMEOUT: 8 h from the launch, and no 1 h no-PR rule; a timed-out lead is
+# labelled ``needs-human`` and released like the ladder's last rung.
 # RESUME: a launched lead is tracked again as a lead, never relaunched.
 # LESSON 42: a transient gh failure is retried with backoff; a permanent one
 # fails at once; a transient one past the retries ends the tracker.
@@ -441,6 +443,7 @@ async def test_silent_lead_is_nudged_then_relaunched_then_flagged(store, dirs, p
     assert any(a[:3] == ["gh", "issue", "edit"] and "needs-human" in a for a, _ in runner.calls)
     action = await store.get_action(run_ref)
     assert action.status == ActionStatus.REJECTED
+    assert action.rejected_reason == "feature lead silent 30m after a nudge and a relaunch"
     lead = action.parameters["_code_change"]["lead"]
     assert [s["kind"] for s in lead["stalls"]] == ["nudge", "relaunch", "needs-human"]
     assert [s["session_url"] for s in lead["sessions"]] == [
@@ -481,9 +484,18 @@ async def test_lead_has_8h_and_no_no_pr_rule(store, dirs, playbook):
     assert len(_launch_briefs(runner)) == 1 and not _nudges(runner)  # no 1 h relaunch
     polls = sum(a[:3] == ["gh", "pr", "list"] for a, _ in runner.calls)
     assert 8 * 60 <= polls <= 8 * 60 + 2
-    cc = (await store.get_action(run_ref)).parameters["_code_change"]
-    assert cc["headless_error"].startswith("TRACK:") and "28800" in cc["headless_error"]
-    assert cc["station_pending"] is True
+    # Out of time it settles like the ladder's last rung, never as a develop
+    # failure: a failed run stops counting in flight while its session may still
+    # commit, and the next shift would launch a second lead on the feature.
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.REJECTED
+    assert action.rejected_reason == (
+        "feature lead not done after 8h (session https://claude.ai/code/session_L1)"
+    )
+    assert any(a[:3] == ["gh", "issue", "edit"] and "needs-human" in a for a, _ in runner.calls)
+    cc = action.parameters["_code_change"]
+    assert "headless_error" not in cc and cc.get("headless_state") is None
+    assert cc["lead"]["stalls"][-1]["kind"] == "timeout"
     # A lead with no PR change for hours still writes its row once per stall
     # window, so the line's headroom (it drops rows unwritten for 3 h) counts it.
     assert runner.wall() - cc["lead"]["heartbeat_at"] <= 1800
@@ -837,6 +849,8 @@ async def test_a_failed_nudge_never_leads_to_a_relaunch(store, dirs, playbook):
     assert "session not found" in stalls[0]["error"] and "error" not in stalls[1]
     assert len(_launch_briefs(runner)) == 1  # never relaunched
     assert action.status == ActionStatus.REJECTED
+    # The reason names the rungs that ran: no relaunch on this path.
+    assert action.rejected_reason == "feature lead silent 30m after two nudges"
 
 
 async def test_the_nudge_holds_the_launch_lock(store, dirs, playbook):
@@ -892,5 +906,9 @@ async def test_an_outage_past_the_lead_timeout_still_ends_it(store, dirs, playbo
 
     await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
 
-    cc = (await store.get_action(run_ref)).parameters["_code_change"]
-    assert cc["headless_error"].startswith("TRACK:") and "28800" in cc["headless_error"]
+    # Released and labelled like any timed-out lead, never left as a failure.
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.REJECTED
+    assert action.rejected_reason.startswith("feature lead not done after 8h")
+    assert any(a[:3] == ["gh", "issue", "edit"] and "needs-human" in a for a, _ in runner.calls)
+    assert "headless_error" not in action.parameters["_code_change"]
