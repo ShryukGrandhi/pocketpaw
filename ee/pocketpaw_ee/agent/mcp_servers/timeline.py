@@ -36,6 +36,8 @@ import logging
 import re
 from typing import Any
 
+from pocketpaw_ee.agent.mcp_servers.ripple_beats import RIPPLE_BEATS_BRIEF, validate_ripple_beats
+
 logger = logging.getLogger(__name__)
 
 SERVER_NAME = "pocketpaw_timeline"
@@ -168,6 +170,10 @@ def validate_motion_graphic(html: Any, fps: Any) -> tuple[dict | None, str | Non
                     "renders with no base URL, so every asset must be inline or absolute: "
                     "use an https:// URL (e.g. a pinned CDN) or a data: URL."
                 )
+
+    ripple_error = validate_ripple_beats(html)
+    if ripple_error is not None:
+        return None, ripple_error
 
     width, height = dims["data-width"], dims["data-height"]
     return {
@@ -431,9 +437,9 @@ Runs in the user's browser and can take minutes. Never call this in the same
 turn as an edit — it would render a half-built timeline."""
 
 ADD_MOTION_GRAPHIC_DESCRIPTION = """\
-Create a motion graphic — title card, kinetic type, animated stat, logo sting
-— and put it on the open /studio/editor timeline. It renders full frame and
-opaque, so overlays like lower thirds are not possible yet.
+Create a motion graphic — title card, kinetic type, animated stat, logo sting,
+explainer figure — and put it on the open /studio/editor timeline. It renders
+full frame and opaque, so overlays like lower thirds are not possible yet.
 
 Author it as a HyperFrames composition per the `hyperframes-core` skill: ONE
 self-contained HTML file whose root element carries data-composition-id,
@@ -459,7 +465,10 @@ To PLACE a new one, pass at most one of:
 Neither combines with replace_asset_id.
 
 Returns once the composition is validated and dispatched, NOT once it has
-rendered. Tell the user it is rendering, never that it is done."""
+rendered. Tell the user it is rendering, never that it is done.
+
+"""
+ADD_MOTION_GRAPHIC_DESCRIPTION += RIPPLE_BEATS_BRIEF
 
 
 def _edit_timeline_parameters() -> dict[str, Any]:

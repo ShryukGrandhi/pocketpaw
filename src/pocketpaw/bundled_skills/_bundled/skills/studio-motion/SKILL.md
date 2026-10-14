@@ -48,6 +48,18 @@ sets hard limits:
 You have no shell, so skip every `npx hyperframes` step. The tool validates
 the root and the timeline; fix whatever it names.
 
+## Explainer diagrams (Ripple)
+
+When the user wants to show how something works, one beat can be a live
+Ripple drawing: an `iso-scene` you describe as parts and motions (any
+product, machine, building part or process), or one of the curated figures
+(heart, bike gears, rocket engine, ion thruster, tokamak, fission reactor,
+particle collider). Write only the host element from the add_motion_graphic
+description; the render draws it frame by frame, so the source stays small.
+Each pin is drawn with its own short label, revealed on `data-reveal`, so
+let the diagram carry the explanation and keep your own text to a title.
+Give the drawing at least four seconds on screen so it reads as moving.
+
 ## The house shape
 
 Gallery output arrives minified on a few lines; the examples in
