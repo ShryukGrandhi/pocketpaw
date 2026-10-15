@@ -1670,6 +1670,46 @@ base branch's tip, so a model changed there after the run maps the run's
 files by the new model; recording the run's start sha on the blob would pin
 it.
 
+### The app blueprint
+
+A repo's planned apps, read off `docs/blueprints/<app>/` on `origin/dev`
+(`c4-planned.json` and `features/<feature>.wave.json`) and joined to GitHub
+issues, merged `feature-done` PRs, dev CI, lead branches and the workspace's
+lead runs. Design: workspace `docs/design/drafts/2026-10-15-belt-blueprint-line-view.md`
+(sections 1 and 5 hold the status rules and the full wire shape). Code:
+`belt/app_blueprint.py` derives, `belt/app_blueprint_read.py` reads and caches.
+
+`GET /api/v1/belt/blueprints?repo=<path>` (`belt.read`) returns the graph:
+
+| Field | Shape |
+|---|---|
+| `repo`, `slug`, `sha` | the resolved clone, its GitHub `owner/repo`, the `origin/dev` sha read |
+| `stale`, `read_at` | `stale: true` when the last refresh failed and this is the previous graph |
+| `dev_ci` | `{sha, state: green\|red\|pending, url}` of dev's latest run, or `null` |
+| `layers` | the band order: `tests, app, shell, model, engine, other` |
+| `apps` | `[{id, counts: {total, done, built, building, stuck, filed, planned, gap}, journeys: {named, existing, passing}}]` |
+| `features` | `[{id: "<app>/<feature>", app, title, wave, order, status, claimed, issue, waits_on: [{ref, state}], depends, run, tasks, layers, components, journeys, gaps}]` |
+| `components` | `[{id: "<app>/<component>", container, layer, status: built\|partial\|planned, present, total, features}]` |
+| `journeys` | `[{id, file, state: named\|existing\|passing, features}]` |
+| `in_flight` | this workspace's unsettled runs on the repo: `[{action_id, kind: lead\|task, feature, layers}]` |
+| `gaps` | `[{kind, ref}]`, kinds `claimed_ahead`, `issue_closed_not_done`, `component_missing`, `journey_no_test`, ... |
+
+`GET /api/v1/belt/blueprints/c4?repo=<path>&app=<app>` (`belt.read`) returns
+`{app, model: {scope, model}, status}`. `model` has the shape of the run
+blueprint's `model` above, so the same adapters draw it. `status` maps each
+component id (bare, as in the model) to `failed` when a stuck feature owns it,
+`changing` when a building one does, `landed` when every path is on dev, else
+`planned`.
+
+Both reads are cached for 60 s per (workspace, repo) behind one lock; a read
+inside the window makes no git or gh call. A failed refresh (git ref lock, gh
+rate limit) serves the last graph with `stale: true`. Errors carry the cloud
+envelope plus `detail`: 404 `belt.repo_not_found` for a repo outside the
+allowlist, 404 `belt.app_not_found` for an app with no `c4-planned.json`, 422
+for an `app` that is not `^[a-z0-9][a-z0-9-]*$` (checked before anything is
+read), and 503 `belt.blueprint_unavailable` when the first read fails. Files
+are parsed as data and capped at 1 MB; nothing from the repo runs.
+
 ### Runs read model
 
 `GET /api/v1/belt/runs` and `GET /api/v1/belt/runs/{id}` rows carry, besides
