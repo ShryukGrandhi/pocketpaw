@@ -1,19 +1,15 @@
 # ee/pocketpaw_ee/cloud/belt/app_blueprint.py — the Belt blueprint's pure derivation.
 #
-# Turns one app's planning files, plus the GitHub and Belt evidence the caller
-# already read, into the feature rows of ``GET /belt/blueprints``. No I/O, no
-# clock, no network; size caps and id validation belong to the readers.
-#
-# Parsers: ``parse_wave`` (a feature's .wave.json) and ``parse_record`` (a lead's
-# RECORD.md, ``Stage:``/``Next:`` and the task table read by header name); the
-# app's c4-planned.json goes through ``orient.load_model``. Unreadable input gives
-# ``None`` fields, never a guess. Layers (design doc, section 3): a container maps
-# by id, first match wins, and an external system's is engine; a file under
-# ``Tests/`` or ``UITests/`` is tests first. A task sits where most of its non-test
-# files sit, a feature on its ``owned`` paths' layers, else its tasks', else
-# "unknown". Status (section 1): the first rule that holds wins; the wave.json
-# ``status`` is only a claim, and a built or done claim with no merged
-# feature-done PR is the ``claimed_ahead`` gap.
+# Turns one app's plan files (.wave.json, c4-planned.json via ``orient.load_model``,
+# a lead's RECORD.md read by header name) plus the GitHub and Belt evidence the
+# caller already read into the feature rows of ``GET /belt/blueprints``. No I/O, no
+# clock, no network; size caps and id validation belong to the readers. Unreadable
+# input gives ``None`` fields, never a guess. Layers follow the design doc's
+# section 3 (container id, first match wins; ``Tests/``/``UITests/`` files are tests
+# first; a feature sits on its ``owned`` paths, else its tasks, else "unknown").
+# Status follows section 1: the first rule that holds wins, and the wave.json
+# ``status`` is only a claim (a built or done claim with no merged feature-done PR
+# is the ``claimed_ahead`` gap).
 
 from __future__ import annotations
 
@@ -47,7 +43,7 @@ def parse_wave(text: str) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     issue = re.fullmatch(r"#(\d+)", str(raw.get("feature_issue") or "").strip())
-    waits = str(raw.get("waits_on") or "").split(";")
+    waits = [c for c in str(raw.get("waits_on") or "").split(";") if "not blocking" not in c]
     owned = raw.get("owned")
     return {
         "title": raw.get("title"),
@@ -57,9 +53,7 @@ def parse_wave(text: str) -> dict[str, Any] | None:
         "issue": int(issue.group(1)) if issue else None,
         "depends": [d for d in raw.get("depends") or [] if isinstance(d, str)],
         # ponytail: refs are plain numbers; B3 resolves which repo each lives in
-        "waits_on": [
-            int(n) for c in waits if "not blocking" not in c for n in re.findall(r"#(\d+)", c)
-        ],
+        "waits_on": [int(n) for c in waits for n in re.findall(r"#(\d+)", c)],
         "owned": [p for p in owned if isinstance(p, str)] if isinstance(owned, list) else [],
     }
 
@@ -68,7 +62,7 @@ def parse_record(text: str | None) -> dict[str, Any]:
     """A lead's RECORD.md: ``stage`` and ``next`` from their header lines (``None``
     when absent), and the rows of the table whose header has ``id`` and
     ``files``. A ``same as <id>`` files cell takes that task's files."""
-    if not isinstance(text, str) or "\x00" in text:
+    if not isinstance(text, str):
         return {"stage": None, "next": None, "tasks": []}
     fields = dict(_FIELD.findall(text))
     tasks: list[dict[str, Any]] = []
@@ -158,9 +152,8 @@ def feature_status(
     issue, run = issue or {}, run or {}
     lead = run.get("lead") or {}
     closed = str(issue.get("state") or "").lower() == "closed"
-    done_pr = any(
-        p.get("done") and p.get("state") == "MERGED" for p in [*prs, *(lead.get("prs") or [])]
-    )
+    prs = [*prs, *(lead.get("prs") or [])]
+    done_pr = any(p.get("done") and p.get("state") == "MERGED" for p in prs)
     ahead = claimed in ("built", "done") and not done_pr
     stuck = "needs-human" in (issue.get("labels") or []) or len(lead.get("stalls") or []) >= 2
     rules = (

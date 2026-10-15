@@ -33,8 +33,8 @@ DONE_PR = {"number": 1129, "state": "MERGED", "done": True}
 
 
 def derive(wave=LAYER_KEYS, record=RECORD, app="halo", fid="layer-keys", **kw):
-    kw = {"issue": OPEN, "run": RUNNING, **kw}
-    return ab.derive_feature(app, fid, wave, record, model=MODEL, tree=TREE, **kw)
+    kw = {"issue": OPEN, "run": RUNNING, "tree": TREE, **kw}
+    return ab.derive_feature(app, fid, wave, record, model=MODEL, **kw)
 
 
 def test_layer_keys_is_building_with_each_task_on_its_layer():
@@ -75,6 +75,11 @@ def test_record_task_files_resolve_against_the_dev_tree():
         "Tests/HaloModelTests/LayerPlacingContractTests.swift",
     ]
     assert len(rec["tasks"]) == 15  # the Rounds table is not read as tasks
+    assert ab.resolve_files(["Keys"], ["A/HaloWindow+Keys.swift", "B/Keys.swift"]) == [
+        "B/Keys.swift"
+    ]
+    off_dev = {t["id"]: t["layer"] for t in derive(tree=[])["tasks"]}  # owned paths resolve them
+    assert (off_dev["LK-9"], off_dev["LK-12"]) == ("app", "tests")
 
 
 def test_a_built_claim_with_no_done_pr_is_claimed_ahead():
@@ -116,6 +121,8 @@ def test_a_feature_with_no_owned_list_is_placed_by_its_record_tasks_else_unknown
         ("done", OPEN, {"status": "landed"}, [], "building", 1),
         ("done", {"state": "closed"}, None, [DONE_PR], "planned", 1),
         ("built", OPEN, RUNNING, [DONE_PR], "building", 1),
+        ("built", OPEN, {"status": "running", "lead": {"prs": [DONE_PR]}}, [], "building", 1),
+        ("gap", {**OPEN, "labels": ["needs-human"]}, None, [], "built", 1),
         ("gap", {"state": "CLOSED"}, None, [], "planned", 1),
         ("stuck", {**OPEN, "labels": ["needs-human"]}, RUNNING, [], "building", 1),
         ("stuck", OPEN, {"status": "running", "lead": {"stalls": [{}, {}]}}, [], "building", 1),
@@ -135,6 +142,7 @@ def test_issue_closed_without_done_is_a_gap_kind():
     closed = {"state": "closed"}
     assert ab.feature_status("planned", 1, closed, None, [])[1] == ["issue_closed_not_done"]
     assert ab.feature_status("done", 1, closed, None, [DONE_PR])[1] == []
+    assert ab.feature_status("done", 1, OPEN, None, []) == ("gap", ["claimed_ahead"])
 
 
 def test_feature_issue_must_be_a_number_to_count_as_filed():
@@ -145,6 +153,7 @@ def test_feature_issue_must_be_a_number_to_count_as_filed():
         "#12 soon": None,
     }.items():
         assert ab.parse_wave(f'{{"feature_issue": "{raw}"}}')["issue"] == num
+    assert ab.parse_wave((FX / "halo-easing.wave.json").read_text())["waits_on"] == [333]
     assert ab.parse_wave("[1]") is None and ab.parse_wave("{") is None
 
 
