@@ -11,7 +11,8 @@
 # ``TTL`` behind a single-flight lock; a failed read (git, any gh list, a rate
 # limit) serves the last graph with ``stale: True``, 503 with none yet. App and
 # feature ids match ``_ID`` before any path or ref is built; a file over
-# ``MAX_MODEL_BYTES`` is refused unread.
+# ``MAX_MODEL_BYTES`` is refused unread. ``read_c4`` serves one app's planned
+# model off the same cache entry, with a status per component.
 
 from __future__ import annotations
 
@@ -41,6 +42,9 @@ _DONE_BY = re.compile(r"^Feature:\s*(?:[\w-]+/)?([\w-]+)", re.M)
 _GREP = ["grep", "-E", "/// [A-Z]+-[JP][0-9]+", "origin/dev", "--", "UITests/"]
 _LIST = "--state all --limit 500 --json".split()
 _STATUSES = ("done", "built", "building", "stuck", "filed", "planned", "gap")
+_UNREADY = "belt.blueprint_unavailable"
+# A component's C4 status by its owners' feature status, first match wins.
+_PAINT = {"stuck": "failed", "building": "changing"}
 _LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
 _CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 # ponytail: one entry per blueprint file version ever read; LRU if it matters
@@ -67,7 +71,7 @@ async def read_blueprint(
 
     path, _err = _re_resolve_repo(repo)
     if path is None:
-        raise BeltConsoleError(404, "Repo not found.")
+        raise BeltConsoleError(404, "Repo not found.", "belt.repo_not_found")
     key = (workspace_id, str(path))
     async with _LOCKS.setdefault(key, asyncio.Lock()):
         hit = _CACHE.get(key)
@@ -78,10 +82,31 @@ async def read_blueprint(
             entry = await _read(workspace_id, path, *io, hit or {})
         except ReadFailed:
             if hit is None:
-                raise BeltConsoleError(503, "Blueprint not readable yet.") from None
+                raise BeltConsoleError(503, "Blueprint not readable yet.", _UNREADY) from None
             entry = {**hit, "graph": {**hit["graph"], "stale": True}}
         _CACHE[key] = {**entry, "at": now()}
         return entry["graph"]
+
+
+async def read_c4(workspace_id: str, repo: str, app: str, **io: Any) -> dict[str, Any]:
+    """One app's ``c4-planned.json`` as ``{scope, model}`` and a status per
+    component id: ``failed`` when a stuck feature owns it, ``changing`` when a
+    building one does, ``landed`` when every path is on dev, else ``planned``."""
+    graph = await read_blueprint(workspace_id, repo, **io)
+    model = _CACHE[(workspace_id, graph["repo"])]["models"].get(app)
+    if model is None:
+        raise BeltConsoleError(404, "No C4 model for this app.", "belt.app_not_found")
+    feats = {f["id"]: f["status"] for f in graph["features"]}
+    status = {}
+    for c in graph["components"]:
+        if c["id"].startswith(f"{app}/"):
+            owners = {feats.get(f) for f in c["features"]}
+            built = "landed" if c["status"] == "built" else "planned"
+            status[c["id"][len(app) + 1 :]] = next(
+                (v for k, v in _PAINT.items() if k in owners), built
+            )
+    scoped = {"scope": model.get("scope"), "model": model["model"]}
+    return {"app": app, "model": scoped, "status": status}
 
 
 def _git(path: Path) -> Run:
@@ -229,8 +254,9 @@ async def _read(
             )
 
     features, components, journeys, gaps, app_rows, models = [], [], [], [], [], []
+    c4: dict[str, dict[str, Any] | None] = {}
     for app, files in sorted(apps.items()):
-        model = load_model(await blob(files.get("")) or "")
+        model = c4[app] = load_model(await blob(files.get("")) or "")
         owned = _owned_system(model) if model else None
         systems = _dicts(((model or {}).get("model") or {}).get("systems"))
         external = {str(s.get("id")) for s in systems if s is not owned}
@@ -303,4 +329,4 @@ async def _read(
     graph |= {"read_at": datetime.now(UTC).isoformat(), "layers": list(ab.LAYERS)}
     graph |= {"apps": app_rows, "features": features, "components": components}
     graph |= {"journeys": journeys, "in_flight": in_flight, "gaps": gaps}
-    return {"graph": graph, "slug": slug, "heads": heads, "records": records}
+    return {"graph": graph, "slug": slug, "heads": heads, "records": records, "models": c4}

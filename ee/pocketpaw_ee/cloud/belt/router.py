@@ -23,12 +23,10 @@
 #                                 them; GET .../reviews/{review_id}/video and
 #                                 .../frames/{t_ms}.png serve its media
 #                                 (``belt/review.py`` has the rules)
-#   * POST|GET /belt/runs/{action_id}/try — open the run's CI-built app on this
-#                                 Mac (start 202 / join 200), and poll its state
-#   * POST|GET /belt/runs/{action_id}/reviews — record a review (multipart), list
-#                                 them; GET .../reviews/{review_id}/video and
-#                                 .../frames/{t_ms}.png serve its media
-#                                 (``belt/review.py`` has the rules)
+#   * GET  /belt/blueprints?repo= — one repo's app blueprint graph: apps, features,
+#                                 components, journeys, gaps (``app_blueprint_read``)
+#   * GET  /belt/blueprints/c4?repo=&app= — one app's planned C4 model with a
+#                                 status per component
 #
 # Routes are THIN: they read identity (workspace + user) from the cloud deps,
 # delegate to ``ee.cloud.belt.service``, and return what the service built. RBAC
@@ -54,6 +52,7 @@ from pocketpaw_ee.cloud._core.deps import (
     require_action_any_workspace,
 )
 from pocketpaw_ee.cloud._core.errors import CloudError
+from pocketpaw_ee.cloud.belt import app_blueprint_read
 from pocketpaw_ee.cloud.belt import review as belt_review
 from pocketpaw_ee.cloud.belt import service as belt_service
 from pocketpaw_ee.cloud.license import require_license
@@ -282,6 +281,37 @@ async def get_run_blueprint(
     component}``. A foreign or non-belt run is a 404."""
     try:
         return await belt_service.get_run_blueprint(workspace_id, action_id)
+    except belt_service.BeltConsoleError as exc:
+        raise _to_cloud_error(exc) from exc
+
+
+@router.get("/blueprints")
+async def get_app_blueprint(
+    repo: str = Query(min_length=1),
+    _user: Any = Depends(require_action_any_workspace("belt.read")),
+    workspace_id: str = Depends(current_workspace_id),
+) -> dict[str, Any]:
+    """The repo's app blueprint graph (design doc 2026-10-15, section 5), cached
+    60 s. 404 ``belt.repo_not_found`` outside the allowlist; a failed refresh
+    serves the last graph with ``stale: true``, 503 when there is none yet."""
+    try:
+        return await app_blueprint_read.read_blueprint(workspace_id, repo)
+    except belt_service.BeltConsoleError as exc:
+        raise _to_cloud_error(exc) from exc
+
+
+@router.get("/blueprints/c4")
+async def get_app_blueprint_c4(
+    repo: str = Query(min_length=1),
+    app: str = Query(pattern=r"^[a-z0-9][a-z0-9-]*$"),
+    _user: Any = Depends(require_action_any_workspace("belt.read")),
+    workspace_id: str = Depends(current_workspace_id),
+) -> dict[str, Any]:
+    """One app's planned C4 view: ``{app, model: {scope, model}, status}``,
+    ``status`` mapping each component id to planned, landed, changing or
+    failed. A bad ``app`` is 422; an app with no model is 404."""
+    try:
+        return await app_blueprint_read.read_c4(workspace_id, repo, app)
     except belt_service.BeltConsoleError as exc:
         raise _to_cloud_error(exc) from exc
 
