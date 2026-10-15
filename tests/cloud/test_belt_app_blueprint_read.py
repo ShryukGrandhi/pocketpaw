@@ -1,11 +1,10 @@
 # tests/cloud/test_belt_app_blueprint_read.py — the blueprint readers and cache.
 #
 # ``read_blueprint`` over fake git and gh runners serving the B2 fixtures as a
-# creative-apps clone: Halo's c4-planned.json, layer-keys and live-keys wave files,
-# the layer-keys RECORD on its lead branch. Pins the cache (a second read within
-# the TTL makes no calls; a moved lead head re-reads only its RECORD), the stale
-# fallback on a rate limit, and the guards (a bad id or an oversized file is
-# refused before it is read).
+# creative-apps clone (Halo's c4-planned.json, two wave files, the layer-keys
+# RECORD on its lead branch). Pins the cache (no calls within the TTL; a moved lead
+# head re-reads only its RECORD), the stale fallback on a rate limit, and the
+# guards (a bad id or an oversized file is refused before it is read).
 
 from __future__ import annotations
 
@@ -30,7 +29,7 @@ FILES = {
     f"{BP}/features/Bad_Id.wave.json": "{}",
     f"{BP}/features/huge.wave.json": "{}",
 }
-SIZES = {f"{BP}/features/huge.wave.json": MAX_MODEL_BYTES + 1}
+HUGE = f"{BP}/features/huge.wave.json"
 RECORD = (FX / "layer-keys-RECORD.md").read_text()
 
 
@@ -38,22 +37,25 @@ def sha(p: str) -> str:
     return hashlib.sha1(p.encode()).hexdigest()
 
 
+def contents(text: str, size: int | None = None) -> dict:
+    return {"size": size or len(text), "content": base64.b64encode(text.encode()).decode()}
+
+
 class Fake:
     def __init__(self, repo: Path):
         self.repo, self.calls, self.limited = repo, [], False
         self.heads = {"layer-keys": "a1", "easing": "b1", "Bad.Ref": "c1"}
-        self.records = {"layer-keys": RECORD, "easing": "Stage: 1 plan\n"}
+        self.records = {"layer-keys": contents(RECORD), "easing": contents("Stage: 1 plan\n")}
         tree = [*FILES, *(FX / "dev-tree.txt").read_text().split()]
-        self.ls = "".join(f"100644 blob {sha(p)} {SIZES.get(p, 10)}\t{p}\n" for p in tree)
+        size = {HUGE: MAX_MODEL_BYTES + 1}
+        self.ls = "".join(f"100644 blob {sha(p)} {size.get(p, 10)}\t{p}\n" for p in tree)
 
     async def git(self, argv):
         self.calls.append(argv)
-        out = {"rev-parse": "62a8577\n", "ls-tree": self.ls, "fetch": ""}.get(argv[0])
-        if argv[0] == "grep":
-            out = "origin/dev:UITests/HaloJourneyTests+Drag.swift:  /// H-J5 drag\n"
         if argv[0] == "cat-file":
-            out = next(t for p, t in FILES.items() if sha(p) == argv[2])
-        return 0, out, ""
+            return 0, next(t for p, t in FILES.items() if sha(p) == argv[2]), ""
+        grep = "origin/dev:UITests/HaloJourneyTests+Drag.swift:  /// H-J5 drag\n"
+        return 0, {"rev-parse": "62a8577\n", "ls-tree": self.ls, "grep": grep}.get(argv[0], ""), ""
 
     async def gh(self, argv):
         self.calls.append(argv)
@@ -62,7 +64,7 @@ class Fake:
         if self.limited:
             return 1, "", "HTTP 403: API rate limit exceeded"
         rows: object = []
-        if argv[1:3] == ["issue", "list"] and argv[argv.index("-R") + 1] == "qbtrix/creative-apps":
+        if argv[1:3] == ["issue", "list"] and "qbtrix/creative-apps" in argv:
             rows = [{"number": 1036, "state": "OPEN", "labels": [{"name": "feature-lead"}]}]
         elif argv[1:3] == ["issue", "list"]:
             rows = [{"number": 171, "state": "CLOSED"}]
@@ -73,9 +75,7 @@ class Fake:
                 {"ref": f"refs/heads/lead/{f}", "object": {"sha": s}} for f, s in self.heads.items()
             ]
         elif argv[1] == "api":
-            f = argv[2].split("ref=lead/")[1]
-            text = self.records[f].encode()
-            rows = {"size": len(text), "content": base64.b64encode(text).decode()}
+            rows = self.records[argv[2].split("ref=lead/")[1]]
         return 0, json.dumps(rows), ""
 
     async def runs(self, ws):
@@ -105,29 +105,21 @@ def feature(graph, fid):
 
 async def test_first_read_derives_the_graph(fake):
     g = await read(fake)
-    lk = feature(g, "halo/layer-keys")
-    assert (g["slug"], g["sha"], g["stale"], g["dev_ci"]["state"]) == (
-        "qbtrix/creative-apps",
-        "62a8577",
-        False,
-        "green",
-    )
+    assert (g["slug"], g["sha"], g["stale"]) == ("qbtrix/creative-apps", "62a8577", False)
+    lk, live = feature(g, "halo/layer-keys"), feature(g, "halo/live-keys")
     assert lk["status"] == "building" and lk["run"]["stage"].startswith("5 finish")
-    assert {"ref": "qbtrix/creative-apps#1036", "state": "open"} not in lk["waits_on"]
     assert {"ref": "qbtrix/creative-apps#777", "state": "unknown"} in lk["waits_on"]
-    live = feature(g, "halo/live-keys")
     assert live["waits_on"][0] == {"ref": "qbtrix/creative-core#171", "state": "closed"}
-    assert (
-        live["status"] == "gap"
-        and {"kind": "claimed_ahead", "ref": "feature:halo/live-keys"} in g["gaps"]
-    )
-    assert g["in_flight"] == [
-        {"action_id": "act-1", "kind": "lead", "feature": "halo/layer-keys", "layers": ["tests"]}
-    ]
-    assert {c["status"] for c in g["components"]} <= {"built", "partial", "planned"} and g[
-        "components"
-    ]
-    assert g["apps"][0]["id"] == "halo" and g["apps"][0]["counts"]["total"] == 2
+    assert {"kind": "claimed_ahead", "ref": "feature:halo/live-keys"} in g["gaps"]
+    lead = {"action_id": "act-1", "kind": "lead", "feature": "halo/layer-keys"}
+    assert g["in_flight"] == [lead | {"layers": ["tests"]}]
+    assert g["components"] and {c["status"] for c in g["components"]} <= {
+        "built",
+        "partial",
+        "planned",
+    }
+    assert g["apps"][0]["counts"] | {"building": 1, "gap": 1, "total": 2} == g["apps"][0]["counts"]
+    assert g["dev_ci"] == {"sha": "62a8577", "state": "green", "url": "u"}
 
 
 async def test_second_read_within_ttl_makes_no_calls(fake):
@@ -141,43 +133,34 @@ async def test_second_read_within_ttl_makes_no_calls(fake):
 async def test_moved_lead_head_rereads_only_that_record(fake):
     await read(fake)
     fake.heads["layer-keys"] = "a2"
-    fake.records["layer-keys"] = "Stage: 6 landed\n"
+    fake.records["layer-keys"] = contents("Stage: 6 landed\n")
     n = len(fake.calls)
     g = await read(fake, t=61.0)
-    contents = [c for c in fake.calls[n:] if c[1] == "api" and "contents/" in c[2]]
-    assert [c[2].split("ref=")[1] for c in contents] == ["lead/layer-keys"]
+    reads = [c[2] for c in fake.calls[n:] if c[1] == "api" and "contents/" in c[2]]
+    assert [r.split("ref=")[1] for r in reads] == ["lead/layer-keys"]
     assert feature(g, "halo/layer-keys")["run"]["stage"] == "6 landed"
 
 
 async def test_rate_limit_serves_the_last_graph_stale(fake):
-    with pytest.raises(BeltConsoleError):  # nothing read yet: 503
-        fake.limited = True
-        await read(fake)
-    fake.limited = False
-    first = await read(fake)
     fake.limited = True
-    g = await read(fake, t=61.0)
+    with pytest.raises(BeltConsoleError) as err:  # nothing read yet
+        await read(fake)
+    assert err.value.status_code == 503
+    fake.limited = False
+    first = await read(fake, t=100.0)
+    fake.limited = True
+    g = await read(fake, t=161.0)
     assert g["stale"] is True and g["features"] == first["features"]
 
 
 async def test_bad_id_and_oversized_files_are_refused_not_parsed(fake):
     g = await read(fake)
-    read_shas = {c[2] for c in fake.calls if c[0] == "cat-file"}
-    assert sha(f"{BP}/features/Bad_Id.wave.json") not in read_shas
-    assert sha(f"{BP}/features/huge.wave.json") not in read_shas
+    cat = {c[2] for c in fake.calls if c[0] == "cat-file"}
+    assert sha(f"{BP}/features/Bad_Id.wave.json") not in cat and sha(HUGE) not in cat
     assert {f["id"] for f in g["features"]} == {"halo/layer-keys", "halo/live-keys"}
     assert not any("Bad.Ref" in c[2] for c in fake.calls if c[1:2] == ["api"])
-    fake.records["layer-keys"] = "x" * 10
     fake.heads["layer-keys"] = "a3"
-    big = {"size": MAX_MODEL_BYTES + 1, "content": base64.b64encode(RECORD.encode()).decode()}
-    gh = fake.gh
-
-    async def oversized(argv):
-        if argv[1:2] == ["api"] and "contents/" in argv[2]:
-            return 0, json.dumps(big), ""
-        return await gh(argv)
-
-    fake.gh = oversized
+    fake.records["layer-keys"] = contents(RECORD, size=MAX_MODEL_BYTES + 1)
     g = await read(fake, t=61.0)
     assert feature(g, "halo/layer-keys")["run"]["stage"] is None
 

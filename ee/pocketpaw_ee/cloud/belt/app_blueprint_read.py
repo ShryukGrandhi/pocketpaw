@@ -2,17 +2,16 @@
 # ``GET /belt/blueprints``: one repo's graph, derived by ``app_blueprint``.
 #
 # Plan files come from git on the bound clone (``_READ_GIT`` through executor
-# ``_run``; ``_re_resolve_repo`` keeps the repo inside the allowlist): one fetch of
-# dev, ``ls-tree -r -l`` for the tree and sizes, ``cat-file`` per blueprint file
-# (cached by blob sha), and a ``git grep`` of UITests for existing journeys. GitHub
-# comes through the patrols gh runner: issues, merged feature-done PRs, dev CI, all
-# lead heads in one call, a RECORD.md only for a lead whose head moved, and one
-# issue list per dependency repo a ``waits_on`` names. Lead runs come from
-# ``service.list_runs``. The graph is cached per (workspace, repo) for ``TTL``
-# behind a single-flight lock; a failed read (git error, any gh failure on a list,
-# a rate limit) serves the last graph with ``stale: True``, a 503 with none yet.
-# Guards: app and feature ids match ``_ID`` before any path or ref is built, and a
-# file over ``MAX_MODEL_BYTES`` is refused before it is read. Files are data.
+# ``_run``, inside ``_re_resolve_repo``'s allowlist): a fetch of dev, ``ls-tree -r
+# -l`` for paths and sizes, ``cat-file`` per blueprint file (cached by blob sha) and
+# a ``git grep`` of UITests for existing journeys. GitHub comes through the patrols
+# gh runner: issues, merged feature-done PRs, dev CI, every lead head in one call, a
+# RECORD.md only for a lead whose head moved, one issue list per dependency repo.
+# Lead runs come from ``service.list_runs``. Cached per (workspace, repo) for
+# ``TTL`` behind a single-flight lock; a failed read (git, any gh list, a rate
+# limit) serves the last graph with ``stale: True``, 503 with none yet. App and
+# feature ids match ``_ID`` before any path or ref is built; a file over
+# ``MAX_MODEL_BYTES`` is refused unread.
 
 from __future__ import annotations
 
@@ -21,6 +20,7 @@ import base64
 import json
 import re
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from fnmatch import fnmatch
@@ -29,7 +29,7 @@ from typing import Any
 
 from . import app_blueprint as ab
 from .executor import _re_resolve_repo, _run
-from .orient import _dicts, _owned_system, component_for, load_model, path_index
+from .orient import _dicts, _owned_system, load_model, path_index
 from .service import _READ_GIT, MAX_MODEL_BYTES, BeltConsoleError
 
 Run = Callable[[list[str]], Awaitable[tuple[int, str, str]]]
@@ -37,10 +37,13 @@ TTL = 60.0
 _ID = re.compile(r"[a-z0-9][a-z0-9-]*")
 _FILE = re.compile(r"docs/blueprints/([^/]+)/(?:features/([^/]+)\.wave\.json|c4-planned\.json)")
 _JID = re.compile(r"[A-Z]+-[JP][0-9]+")
+_DONE_BY = re.compile(r"^Feature:\s*(?:[\w-]+/)?([\w-]+)", re.M)
+_GREP = ["grep", "-E", "/// [A-Z]+-[JP][0-9]+", "origin/dev", "--", "UITests/"]
+_LIST = "--state all --limit 500 --json".split()
 _STATUSES = ("done", "built", "building", "stuck", "filed", "planned", "gap")
 _LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
 _CACHE: dict[tuple[str, str], dict[str, Any]] = {}
-# ponytail: grows by one entry per blueprint file version read; LRU if it matters
+# ponytail: one entry per blueprint file version ever read; LRU if it matters
 _BLOBS: dict[str, str] = {}
 
 
@@ -58,8 +61,8 @@ async def read_blueprint(
     touched: Callable[[str, str], Awaitable[list[str]]] | None = None,
     now: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    """The repo's blueprint graph (the design doc's section 5 shape). 404 for a
-    repo outside the allowlist; 503 when the first read fails."""
+    """The repo's blueprint graph (design doc section 5). 404 for a repo outside
+    the allowlist; 503 when the first read fails."""
     from pocketpaw_ee.cloud.mandates.patrols import _default_gh
 
     path, _err = _re_resolve_repo(repo)
@@ -139,16 +142,15 @@ def _waits(raw: Any, slug: str, external: set[str]) -> list[str]:
     id in the app's model (``creative-core #171``) is that sibling repo's."""
     out: list[str] = []
     for chunk in str(raw or "").split(";"):
-        if "not blocking" in chunk:
-            continue
         head = re.match(r"\s*([a-z0-9][a-z0-9-]*) #", chunk)
-        repo = f"{slug.split('/')[0]}/{head[1]}" if head and head[1] in external else slug
-        out += [f"{repo}#{n}" for n in re.findall(r"#(\d+)", chunk)]
+        repo = f"{slug.split('/')[0]}/{head[1]}" if slug and head and head[1] in external else slug
+        if "not blocking" not in chunk:
+            out += [f"{repo}#{n}" for n in re.findall(r"#(\d+)", chunk)]
     return out
 
 
 def _present(path: str, tree: list[str]) -> bool:
-    # ponytail: a scan of the tree per path; index by prefix if repos get big
+    # ponytail: a tree scan per path; index by prefix if repos get big
     return any(t == path or t.startswith(path.rstrip("/") + "/") or fnmatch(t, path) for t in tree)
 
 
@@ -162,14 +164,11 @@ async def _read(
     tree, shas, sizes = [], {}, {}
     for line in (await _ok(git, ["ls-tree", "-r", "-l", "origin/dev"])).splitlines():
         meta, _, p = line.partition("\t")
-        parts = meta.split()
-        if len(parts) == 4 and parts[1] == "blob":
+        if len(parts := meta.split()) == 4 and parts[1] == "blob":
             tree.append(p)
             shas[p], sizes[p] = parts[2], int(parts[3]) if parts[3].isdigit() else 0
-    code, grep, err = await git(
-        ["grep", "-E", "/// [A-Z]+-[JP][0-9]+", "origin/dev", "--", "UITests/"]
-    )
-    if code > 1:
+    code, grep, err = await git(_GREP)
+    if code > 1:  # 1 is "no match"
         raise ReadFailed(err.strip()[:200])
     existing = {j: ln.split(":")[1] for ln in grep.splitlines() for j in _JID.findall(ln)}
 
@@ -187,43 +186,21 @@ async def _read(
             apps.setdefault(m[1], {})[m[2] or ""] = p
 
     slug = prev["slug"] if "slug" in prev else await _github_slug(str(path), gh)
-    issues: dict[int, dict[str, Any]] = {}
+    issues: dict[Any, dict[str, Any]] = {}
     done_prs: dict[str, list[dict[str, Any]]] = {}
-    ci, heads, records = None, {}, {}
+    ci, heads, records = {}, {}, {}
     if slug:
-        r = ["-R", slug, "--limit", "500", "--json"]
         for row in await _rows(
-            gh, ["gh", "issue", "list", "--state", "all", *r, "number,state,labels"]
+            gh, ["gh", "issue", "list", "-R", slug, *_LIST, "number,state,labels"]
         ):
             issues[row.get("number")] = row
-        merged = ["gh", "pr", "list", "--label", "feature-done", "--state", "merged"]
-        for row in await _rows(gh, [*merged, *r, "number,body"]):
-            for f in re.findall(
-                r"^Feature:\s*(?:[\w-]+/)?([\w-]+)", str(row.get("body") or ""), re.M
-            ):
-                done_prs.setdefault(f, []).append(
-                    {"number": row.get("number"), "state": "MERGED", "done": True}
-                )
-        ci = next(
-            iter(
-                await _rows(
-                    gh,
-                    [
-                        "gh",
-                        "run",
-                        "list",
-                        "--branch",
-                        "dev",
-                        *r[:2],
-                        "--limit",
-                        "5",
-                        "--json",
-                        "headSha,conclusion,url",
-                    ],
-                )
-            ),
-            None,
-        )
+        merged = ["gh", "pr", "list", "-R", slug, "--label", "feature-done", "--state", "merged"]
+        for row in await _rows(gh, [*merged, "--limit", "200", "--json", "number,body"]):
+            pr = {"number": row.get("number"), "state": "MERGED", "done": True}
+            for f in _DONE_BY.findall(str(row.get("body") or "")):
+                done_prs.setdefault(f, []).append(pr)
+        dev = ["gh", "run", "list", "-R", slug, "--branch", "dev", "--limit", "5", "--json"]
+        ci = next(iter(await _rows(gh, [*dev, "headSha,conclusion,url"])), {})
         for row in await _rows(gh, ["gh", "api", f"repos/{slug}/git/matching-refs/heads/lead/"]):
             f = str(row.get("ref") or "").removeprefix("refs/heads/lead/")
             if _ID.fullmatch(f):
@@ -233,186 +210,97 @@ async def _read(
                 records[f] = prev.get("records", {}).get(f)
             else:
                 records[f] = await _record(gh, slug, f)
-    dev_ci = ci and {
-        "sha": ci.get("headSha"),
-        "state": {"success": "green", "failure": "red"}.get(ci.get("conclusion"), "pending"),
-        "url": ci.get("url"),
-    }
+    state = {"success": "green", "failure": "red"}.get(ci.get("conclusion"), "pending")
+    dev_ci = {"sha": ci.get("headSha"), "state": state, "url": ci.get("url")} if ci else None
 
-    lead_rows: dict[tuple[str, str], dict[str, Any]] = {}
-    in_flight, models = [], []
+    leads: dict[str | None, dict[str, Any]] = {}
+    in_flight = []
     for row in await runs(ws):
         if not row.get("repo") or Path(str(row["repo"])).expanduser().resolve() != path:
             continue
         lead = row.get("lead") or {}
-        if lead.get("feature"):
-            lead_rows.setdefault((str(lead.get("app")), str(lead["feature"])), row)
+        fid = f"{lead.get('app')}/{lead['feature']}" if lead.get("feature") else None
+        leads.setdefault(fid, row)
         if row.get("status") not in ab._SETTLED:
-            fid = f"{lead.get('app')}/{lead['feature']}" if lead.get("feature") else None
+            files = await touched(ws, str(row.get("action_id")))
+            kind = "lead" if fid else "task"
             in_flight.append(
-                {
-                    "action_id": row.get("action_id"),
-                    "kind": "lead" if fid else "task",
-                    "feature": fid,
-                    "files": await touched(ws, str(row.get("action_id"))),
-                }
+                {"action_id": row["action_id"], "kind": kind, "feature": fid, "files": files}
             )
 
-    features, components, journeys, gaps, app_rows = [], [], [], [], []
+    features, components, journeys, gaps, app_rows, models = [], [], [], [], [], []
     for app, files in sorted(apps.items()):
         model = load_model(await blob(files.get("")) or "")
         owned = _owned_system(model) if model else None
-        external = (
-            {str(s.get("id")) for s in _dicts(model["model"]["systems"])}
-            - {str((owned or {}).get("id"))}
-            if model
-            else set()
-        )
+        systems = _dicts(((model or {}).get("model") or {}).get("systems"))
+        external = {str(s.get("id")) for s in systems if s is not owned}
         models.append((path_index(model), ab.component_layers(model)))
         mine, named = [], {}
         for f, p in sorted(files.items()):
             text = await blob(p) if f else None
-            wave = ab.parse_wave(text) if text else None
-            if wave is None:
+            if not text or (wave := ab.parse_wave(text)) is None:
                 continue
-            raw = json.loads(text or "{}")
             row = issues.get(wave["issue"]) or {}
-            issue = row and {
-                "state": str(row.get("state")).lower(),
-                "labels": [str(x.get("name")) for x in _dicts(row.get("labels"))],
-            }
+            labels = [str(x.get("name")) for x in _dicts(row.get("labels"))]
+            issue = {"state": str(row.get("state")).lower(), "labels": labels} if row else None
+            run, rec, prs = leads.get(f"{app}/{f}"), records.get(f), done_prs.get(f, [])
             feat = ab.derive_feature(
-                app,
-                f,
-                text or "",
-                records.get(f),
-                model=model,
-                tree=tree,
-                issue=issue or None,
-                run=lead_rows.get((app, f)),
-                prs=done_prs.get(f, []),
+                app, f, text, rec, model=model, tree=tree, issue=issue, run=run, prs=prs
             )
+            raw = json.loads(text)
             feat["waits_on"] = _waits(raw.get("waits_on"), slug or "", external)
-            feat["journeys"] = [
-                f"{app}/{j}" for j in _JID.findall(json.dumps(raw.get("journeys") or []))
-            ]
+            feat["journeys"] = [f"{app}/{j}" for j in _JID.findall(json.dumps(raw.get("journeys")))]
             for j in feat["journeys"]:
-                named.setdefault(j, []).append(feat)
+                named.setdefault(j, []).append(feat["id"])
             mine.append(feat)
-        for c in _dicts(owned.get("containers")) if owned else []:
+        built = {x["id"] for x in mine if x["status"] in ("built", "done")}
+        finished = {x["id"] for x in mine if x["status"] == "done"}
+        for c in _dicts((owned or {}).get("containers")):
             for k in _dicts(c.get("components")):
                 paths = [x for x in k.get("paths") or [] if isinstance(x, str)]
                 present = sum(_present(x, tree) for x in paths)
-                status = (
-                    "built"
-                    if paths and present == len(paths)
-                    else "partial"
-                    if present
-                    else "planned"
-                )
+                status = "built" if paths and present == len(paths) else "partial"
+                status = status if present else "planned"
                 cid = f"{app}/{k.get('id')}"
-                owners = [x for x in mine if cid in x["components"]]
-                if status != "built" and any(x["status"] in ("built", "done") for x in owners):
+                owners = [x["id"] for x in mine if cid in x["components"]]
+                if status != "built" and built & set(owners):
                     gaps.append({"kind": "component_missing", "ref": f"component:{cid}"})
+                layer = ab.container_layer(str(c.get("id")))
+                row = {"id": cid, "container": c.get("id"), "layer": layer, "status": status}
                 components.append(
-                    {
-                        "id": cid,
-                        "container": c.get("id"),
-                        "layer": ab.container_layer(str(c.get("id"))),
-                        "status": status,
-                        "present": present,
-                        "total": len(paths),
-                        "features": [x["id"] for x in owners],
-                    }
+                    row | {"present": present, "total": len(paths), "features": owners}
                 )
-        green = bool(dev_ci) and dev_ci["state"] == "green"
         for j, owners in named.items():
-            built = any(x["status"] in ("built", "done") for x in owners)
-            state = (
-                "passing"
-                if j.split("/")[1] in existing and built and green
-                else "existing"
-                if j.split("/")[1] in existing
-                else "named"
+            passing = built & set(owners) and state == "green"
+            js = (
+                "named" if j.split("/")[1] not in existing else "passing" if passing else "existing"
             )
-            if state == "named" and any(x["status"] == "done" for x in owners):
+            if js == "named" and finished & set(owners):
                 gaps.append({"kind": "journey_no_test", "ref": f"journey:{j}"})
             journeys.append(
-                {
-                    "id": j,
-                    "file": existing.get(j.split("/")[1]),
-                    "state": state,
-                    "features": [x["id"] for x in owners],
-                }
+                {"id": j, "file": existing.get(j.split("/")[1]), "state": js, "features": owners}
             )
-        mine_j = [x for x in journeys if x["id"].startswith(app + "/")]
-        app_rows.append(
-            {
-                "id": app,
-                "counts": {
-                    "total": len(mine),
-                    **{s: sum(x["status"] == s for x in mine) for s in _STATUSES},
-                },
-                "journeys": {
-                    "named": len(mine_j),
-                    "existing": sum(x["state"] != "named" for x in mine_j),
-                    "passing": sum(x["state"] == "passing" for x in mine_j),
-                },
-            }
-        )
+        n = [x["state"] for x in journeys if x["id"].startswith(app + "/")]
+        jc = {"named": len(n), "existing": len(n) - n.count("named"), "passing": n.count("passing")}
+        counts = dict.fromkeys(_STATUSES, 0) | Counter(x["status"] for x in mine)
+        app_rows.append({"id": app, "counts": {"total": len(mine), **counts}, "journeys": jc})
         features += mine
 
-    states: dict[str, dict[int, str]] = {
-        slug or "": {n: str(r.get("state")).lower() for n, r in issues.items()}
-    }
+    states = {slug or "": {n: str(r.get("state")).lower() for n, r in issues.items()}}
     for dep in {ref.split("#")[0] for f in features for ref in f["waits_on"]} - states.keys():
-        rows = await _rows(
-            gh,
-            [
-                "gh",
-                "issue",
-                "list",
-                "-R",
-                dep,
-                "--state",
-                "all",
-                "--limit",
-                "500",
-                "--json",
-                "number,state",
-            ],
-        )
+        rows = await _rows(gh, ["gh", "issue", "list", "-R", dep, *_LIST, "number,state"])
         states[dep] = {r.get("number"): str(r.get("state")).lower() for r in rows}
     for f in features:
         gaps += [{"kind": g, "ref": f"feature:{f['id']}"} for g in f["gaps"]]
+        refs = [ref.split("#") for ref in f["waits_on"]]
         f["waits_on"] = [
-            {
-                "ref": ref,
-                "state": states.get(ref.split("#")[0], {}).get(int(ref.split("#")[1]), "unknown"),
-            }
-            for ref in f["waits_on"]
+            {"ref": f"{r}#{n}", "state": states.get(r, {}).get(int(n), "unknown")} for r, n in refs
         ]
-    for run in in_flight:
-        placed = {
-            ab.file_layer(p, i, lay)
-            for p in run.pop("files")
-            for i, lay in models
-            if p.startswith(("Tests/", "UITests/")) or component_for(p, i)
-        }
-        run["layers"] = [x for x in ab.LAYERS if x in placed]
-    graph = {
-        "repo": str(path),
-        "slug": slug,
-        "sha": sha,
-        "stale": False,
-        "read_at": datetime.now(UTC).isoformat(),
-        "dev_ci": dev_ci,
-        "layers": list(ab.LAYERS),
-        "apps": app_rows,
-        "features": features,
-        "components": components,
-        "journeys": journeys,
-        "in_flight": in_flight,
-        "gaps": gaps,
-    }
+    for run in in_flight:  # ponytail: a file on an "other" container is not shown
+        placed = {ab.file_layer(p, i, lay) for p in run.pop("files") for i, lay in models}
+        run["layers"] = [x for x in ab.LAYERS if x in placed - {"other"}]
+    graph = {"repo": str(path), "slug": slug, "sha": sha, "stale": False, "dev_ci": dev_ci}
+    graph |= {"read_at": datetime.now(UTC).isoformat(), "layers": list(ab.LAYERS)}
+    graph |= {"apps": app_rows, "features": features, "components": components}
+    graph |= {"journeys": journeys, "in_flight": in_flight, "gaps": gaps}
     return {"graph": graph, "slug": slug, "heads": heads, "records": records}

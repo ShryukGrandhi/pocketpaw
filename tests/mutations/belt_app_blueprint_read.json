@@ -1,0 +1,92 @@
+[
+  {
+    "label": "a read within the TTL goes back to git and gh",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "if hit and now() - hit[\"at\"] < TTL:",
+    "replace": "if hit and now() - hit[\"at\"] < 0:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "every lead RECORD is re-read, moved or not",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "if head == prev.get(\"heads\", {}).get(f):",
+    "replace": "if False:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "no lead RECORD is ever read",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "if head == prev.get(\"heads\", {}).get(f):",
+    "replace": "if True:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "a failed refresh serves the last graph as fresh",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "entry = {**hit, \"graph\": {**hit[\"graph\"], \"stale\": True}}",
+    "replace": "entry = {**hit, \"graph\": {**hit[\"graph\"], \"stale\": False}}",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "a failed first read is not a 503",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "if hit is None:",
+    "replace": "if False:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "the id guard admits dots and underscores",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "_ID = re.compile(r\"[a-z0-9][a-z0-9-]*\")",
+    "replace": "_ID = re.compile(r\"[A-Za-z0-9_.-]+\")",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "a lead ref is used without the id check",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "if _ID.fullmatch(f):",
+    "replace": "if f:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "an oversized blueprint file is read",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "if p not in shas or sizes[p] > MAX_MODEL_BYTES:",
+    "replace": "if p not in shas:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "an oversized RECORD is parsed",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "if int(body.get(\"size\") or 0) > MAX_MODEL_BYTES:",
+    "replace": "if False:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  },
+  {
+    "label": "waits_on refs never resolve to a sibling repo",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "external = {str(s.get(\"id\")) for s in systems if s is not owned}",
+    "replace": "external = set()",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py"
+    ]
+  }
+]
