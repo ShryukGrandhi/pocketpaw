@@ -4,12 +4,15 @@
 # Plan files come from git on the bound clone (``_READ_GIT`` through executor
 # ``_run``, inside ``_re_resolve_repo``'s allowlist): a fetch of dev, ``ls-tree -r
 # -l`` for paths and sizes, ``cat-file`` per blueprint file (cached by blob sha) and
-# a ``git grep`` of UITests for existing journeys. GitHub comes through the patrols
-# gh runner: issues, merged feature-done PRs, dev CI, every lead head in one call, a
-# RECORD.md only for a lead whose head moved, one issue list per dependency repo.
-# Lead runs come from ``service.list_runs``. Cached per (workspace, repo) for
-# ``TTL`` behind a single-flight lock; a failed read (git, any gh list, a rate
-# limit) serves the last graph with ``stale: True``, 503 with none yet. App and
+# a ``git grep -A`` of UITests for existing journeys and the test func after each
+# ``///`` id. An app's title and its named journeys come from ``<app>.md`` (first
+# ``# `` heading, the Journeys section) and every id anywhere in its wave files.
+# GitHub comes through the patrols gh runner: ``feature-lead`` issues, merged
+# feature-done PRs, dev CI, every lead head in one call, a RECORD.md only for a
+# lead whose head moved, one issue list per repo a ``waits_on`` ref names. Lead
+# runs come from ``service.list_runs``. Cached per (workspace, repo) for ``TTL``
+# behind a single-flight lock; any failed refresh (git, gh, a rate limit, a bug)
+# serves the last graph with ``stale: True``, 503 with none yet. App and
 # feature ids match ``_ID`` before any path or ref is built; a file over
 # ``MAX_MODEL_BYTES`` is refused unread. ``read_c4`` serves one app's planned
 # model off the same cache entry, with a status per component and per path.
@@ -19,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 import time
 from collections import Counter
@@ -39,12 +43,25 @@ _ID = re.compile(r"[a-z0-9][a-z0-9-]*")
 _FILE = re.compile(r"docs/blueprints/([^/]+)/(?:features/([^/]+)\.wave\.json|c4-planned\.json)")
 _JID = re.compile(r"[A-Z]+-[JP][0-9]+")
 _DONE_BY = re.compile(r"^Feature:\s*(?:[\w-]+/)?([\w-]+)", re.M)
-_GREP = ["grep", "-E", "/// [A-Z]+-[JP][0-9]+", "origin/dev", "--", "UITests/"]
+# ponytail: the test func must sit within 4 lines of its comment; read the blob if not
+_GREP = ["grep", "-A", "4", "-E", "/// [A-Z]+-[JP][0-9]+", "origin/dev", "--", "UITests/"]
+_MATCH = re.compile(r"[^:]*:([^:]+):\s*///(.*)")  # a grep hit, not a context line
+_TEST = re.compile(r"func (test\w+)")
+_JOURNEYS = re.compile(r"^(#+) [^\n]*journeys[^\n]*\n(.*?)(?=^\1 |\Z)", re.M | re.S | re.I)
 _LIST = "--state all --limit 500 --json".split()
 _STATUSES = ("done", "built", "building", "stuck", "filed", "planned", "gap")
 _UNREADY = "belt.blueprint_unavailable"
 # A component's C4 status by its owners' feature status, first match wins.
 _PAINT = {"stuck": "failed", "building": "changing"}
+_GAP_TEXT = {
+    "claimed_ahead": "wave.json says built or done, but no feature-done PR has merged",
+    "issue_closed_not_done": "The feature issue is closed, but the feature is not done",
+    "feature_no_owned": "wave.json lists no owned files, so nothing places the feature",
+    "component_missing": "A built feature owns it, but not all its paths are on dev",
+    "component_unowned": "It is not built yet, and no feature owns it",
+    "journey_no_test": "A done feature names it, but no UITest carries its id",
+}
+logger = logging.getLogger(__name__)
 _LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
 _CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 # ponytail: one entry per blueprint file version ever read; LRU if it matters
@@ -80,7 +97,9 @@ async def read_blueprint(
         io = (git or _git(path), gh or _default_gh, runs or _lead_runs, touched or _touched)
         try:
             entry = await _read(workspace_id, path, *io, hit or {})
-        except ReadFailed:
+        except Exception as exc:  # a ReadFailed, or a bug: stale or 503, never a bare 500
+            if not isinstance(exc, ReadFailed):
+                logger.exception("Blueprint read of %s failed", path)
             if hit is None:
                 raise BeltConsoleError(503, "Blueprint not readable yet.", _UNREADY) from None
             entry = {**hit, "graph": {**hit["graph"], "stale": True}}
@@ -198,7 +217,17 @@ async def _read(
     code, grep, err = await git(_GREP)
     if code > 1:  # 1 is "no match"
         raise ReadFailed(err.strip()[:200])
-    existing = {j: ln.split(":")[1] for ln in grep.splitlines() for j in _JID.findall(ln)}
+    existing, tests, pending = {}, {}, []
+    for ln in grep.splitlines():
+        m = _MATCH.match(ln)
+        if m and (ids := _JID.findall(m[2])):
+            existing |= dict.fromkeys(ids, m[1])
+            pending += ids
+        elif t := _TEST.search(ln):
+            tests |= dict.fromkeys(pending, t[1])
+            pending = []
+        elif ln == "--":
+            pending = []
 
     async def blob(p: str | None) -> str | None:
         if p not in shas or sizes[p] > MAX_MODEL_BYTES:
@@ -213,14 +242,13 @@ async def _read(
         if m and _ID.fullmatch(m[1]) and (m[2] is None or _ID.fullmatch(m[2])):
             apps.setdefault(m[1], {})[m[2] or ""] = p
 
-    slug = prev["slug"] if "slug" in prev else await _github_slug(str(path), gh)
+    slug = prev["slug"] if "slug" in prev else await _github_slug(str(path), gh) or ""
     issues: dict[Any, dict[str, Any]] = {}
     done_prs: dict[str, list[dict[str, Any]]] = {}
     ci, heads, records = {}, {}, {}
     if slug:
-        for row in await _rows(
-            gh, ["gh", "issue", "list", "-R", slug, *_LIST, "number,state,labels"]
-        ):
+        leads_argv = ["gh", "issue", "list", "-R", slug, "--label", "feature-lead", *_LIST]
+        for row in await _rows(gh, [*leads_argv, "number,state,labels"]):
             issues[row.get("number")] = row
         merged = ["gh", "pr", "list", "-R", slug, "--label", "feature-done", "--state", "merged"]
         for row in await _rows(gh, [*merged, "--limit", "200", "--json", "number,body"]):
@@ -265,7 +293,12 @@ async def _read(
         systems = _dicts(((model or {}).get("model") or {}).get("systems"))
         external = {str(s.get("id")) for s in systems if s is not owned}
         models.append((path_index(model), ab.component_layers(model)))
-        mine, named = [], {}
+        md = await blob(f"docs/blueprints/{app}.md") or ""
+        head = re.search(r"^# +(.+?)\s*$", md, re.M)
+        title = re.sub(r"(?i)\s+blueprint$", "", head[1]) if head else app
+        section = _JOURNEYS.search(md)
+        mine: list[dict[str, Any]] = []
+        named = {f"{app}/{j}": [] for j in _JID.findall(section[2] if section else "")}
         for f, p in sorted(files.items()):
             text = await blob(p) if f else None
             if not text or (wave := ab.parse_wave(text)) is None:
@@ -279,7 +312,7 @@ async def _read(
             )
             raw = json.loads(text)
             feat["waits_on"] = _waits(raw.get("waits_on"), slug or "", external)
-            feat["journeys"] = [f"{app}/{j}" for j in _JID.findall(json.dumps(raw.get("journeys")))]
+            feat["journeys"] = [f"{app}/{j}" for j in dict.fromkeys(_JID.findall(text))]
             for j in feat["journeys"]:
                 named.setdefault(j, []).append(feat["id"])
             mine.append(feat)
@@ -295,6 +328,8 @@ async def _read(
                 status = status if present else "planned"
                 cid = f"{app}/{k.get('id')}"
                 owners = [x["id"] for x in mine if cid in x["components"]]
+                if not owners and status != "built":
+                    gaps.append({"kind": "component_unowned", "ref": f"component:{cid}"})
                 if status != "built" and built & set(owners):
                     gaps.append({"kind": "component_missing", "ref": f"component:{cid}"})
                 layer = ab.container_layer(str(c.get("id")))
@@ -309,16 +344,18 @@ async def _read(
             )
             if js == "named" and finished & set(owners):
                 gaps.append({"kind": "journey_no_test", "ref": f"journey:{j}"})
-            journeys.append(
-                {"id": j, "file": existing.get(j.split("/")[1]), "state": js, "features": owners}
-            )
+            jid = j.split("/")[1]
+            row = {"id": j, "test": tests.get(jid), "file": existing.get(jid), "state": js}
+            journeys.append(row | {"features": owners})
         n = [x["state"] for x in journeys if x["id"].startswith(app + "/")]
         jc = {"named": len(n), "existing": len(n) - n.count("named"), "passing": n.count("passing")}
         counts = dict.fromkeys(_STATUSES, 0) | Counter(x["status"] for x in mine)
-        app_rows.append({"id": app, "counts": {"total": len(mine), **counts}, "journeys": jc})
+        app_rows.append(
+            {"id": app, "title": title, "counts": {"total": len(mine), **counts}, "journeys": jc}
+        )
         features += mine
 
-    states = {slug or "": {n: str(r.get("state")).lower() for n, r in issues.items()}}
+    states: dict[str, dict[Any, str]] = {"": {}}  # waits_on reads every issue, not only leads
     for dep in {ref.split("#")[0] for f in features for ref in f["waits_on"]} - states.keys():
         rows = await _rows(gh, ["gh", "issue", "list", "-R", dep, *_LIST, "number,state"])
         states[dep] = {r.get("number"): str(r.get("state")).lower() for r in rows}
@@ -328,6 +365,7 @@ async def _read(
         f["waits_on"] = [
             {"ref": f"{r}#{n}", "state": states.get(r, {}).get(int(n), "unknown")} for r, n in refs
         ]
+    gaps = [g | {"text": _GAP_TEXT[g["kind"]]} for g in gaps]
     for run in in_flight:  # ponytail: a file on an "other" container is not shown
         placed = {ab.file_layer(p, i, lay) for p in run.pop("files") for i, lay in models}
         run["layers"] = [x for x in ab.LAYERS if x in placed - {"other"}]

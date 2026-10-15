@@ -63,13 +63,17 @@ class Fake:
         self.calls.append(argv)
         if argv[0] == "cat-file":
             return 0, next(t for p, t in FILES.items() if sha(p) == argv[2]), ""
-        drag, parent = "origin/dev:UITests/HaloJourneyTests+Drag.swift", "origin/dev:UITests/P.swift"
+        drag, parent = (
+            "origin/dev:UITests/HaloJourneyTests+Drag.swift",
+            "origin/dev:UITests/P.swift",
+        )
         grep = (
             f"{drag}:    /// H-J5: a viewer drag keys a position.\n"
             f"{drag}-    @MainActor func testDragLayerToKeyPosition() {{\n--\n"
             f"{drag}:/// H-J5's and H-J6's steps over one launched Halo.\n"
             f"{drag}-@MainActor private struct ViewerDragSteps {{\n--\n"
-            f"{parent}:    /// H-J23: parent a layer.\n{parent}-    func testParentLayer() throws {{\n"
+            f"{parent}:    /// H-J23: parent a layer.\n"
+            f"{parent}-    func testParentLayer() throws {{\n"
         )
         return 0, {"rev-parse": "62a8577\n", "ls-tree": self.ls, "grep": grep}.get(argv[0], ""), ""
 
@@ -128,7 +132,7 @@ async def test_first_read_derives_the_graph(fake):
     assert lk["status"] == "building" and lk["run"]["stage"].startswith("5 finish")
     assert {"ref": "qbtrix/creative-apps#777", "state": "unknown"} in lk["waits_on"]
     assert live["waits_on"][0] == {"ref": "qbtrix/creative-core#171", "state": "closed"}
-    assert {"kind": "claimed_ahead", "ref": "feature:halo/live-keys"} in g["gaps"]
+    assert ("claimed_ahead", "feature:halo/live-keys") in [(x["kind"], x["ref"]) for x in g["gaps"]]
     lead = {"action_id": "act-1", "kind": "lead", "feature": "halo/layer-keys"}
     assert g["in_flight"] == [lead | {"layers": ["tests"]}]
     assert g["components"] and {c["status"] for c in g["components"]} <= {
@@ -272,7 +276,11 @@ async def test_every_gap_has_text_and_unowned_planned_components_are_gaps(fake):
     ahead = next(x for x in g["gaps"] if x["kind"] == "claimed_ahead")
     assert "feature-done" in ahead["text"]
     comps = {c["id"]: c for c in g["components"]}
-    unowned = [x["ref"].removeprefix("component:") for x in g["gaps"] if x["kind"] == "component_unowned"]
+    unowned = [
+        x["ref"].removeprefix("component:") for x in g["gaps"] if x["kind"] == "component_unowned"
+    ]
     assert unowned and all(comps[c]["features"] == [] for c in unowned)
     assert all(comps[c]["status"] != "built" for c in unowned)
-    assert {c for c, row in comps.items() if not row["features"] and row["status"] != "built"} == set(unowned)
+    assert {
+        c for c, row in comps.items() if not row["features"] and row["status"] != "built"
+    } == set(unowned)

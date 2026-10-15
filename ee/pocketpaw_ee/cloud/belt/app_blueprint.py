@@ -146,7 +146,7 @@ def feature_status(
     prs: list[dict[str, Any]],
 ) -> tuple[str, list[str]]:
     """``(status, gap kinds)``. ``issue`` is ``{state, labels}``; ``run`` the newest
-    lead run row (console ``status``, ``lead`` with ``prs`` and ``stalls``);
+    lead run row (console ``status``, ``lead`` with ``prs`` and the int ``stalls``);
     ``prs`` the merged feature-done PRs that name the feature, as ``{number,
     state, done}`` rows like ``lead.prs``."""
     issue, run = issue or {}, run or {}
@@ -155,7 +155,8 @@ def feature_status(
     prs = [*prs, *(lead.get("prs") or [])]
     done_pr = any(p.get("done") and p.get("state") == "MERGED" for p in prs)
     ahead = claimed in ("built", "done") and not done_pr
-    stuck = "needs-human" in (issue.get("labels") or []) or len(lead.get("stalls") or []) >= 2
+    stalls = lead.get("stalls") if isinstance(lead.get("stalls"), int) else 0
+    stuck = "needs-human" in (issue.get("labels") or []) or stalls >= 2
     rules = (
         ("done", run.get("status") == "landed" or (closed and done_pr)),
         ("built", done_pr),
@@ -183,7 +184,9 @@ def derive_feature(
 ) -> dict[str, Any] | None:
     """One feature row of the blueprint graph (``None``: unreadable wave.json).
     ``model`` is the app's loaded c4-planned.json, ``tree`` dev's file paths.
-    Each task carries its resolved ``files`` and its ``layer``."""
+    Each task carries its resolved ``files`` and its ``layer``. ``issue`` always
+    has ``state`` (``unknown`` when gh did not list it) and ``labels``; ``run``'s
+    ``record_at`` is ``None`` until something read carries the RECORD's time."""
     wave = parse_wave(wave_text)
     if wave is None:
         return None
@@ -203,8 +206,11 @@ def derive_feature(
         "app": app,
         **{k: wave[k] for k in ("title", "wave", "order", "claimed", "depends", "waits_on")},
         "status": status,
-        "issue": {**(issue or {}), "number": wave["issue"]} if wave["issue"] else None,
+        "issue": {"state": "unknown", "labels": [], **(issue or {}), "number": wave["issue"]}
+        if wave["issue"]
+        else None,
         "run": {"action_id": run.get("action_id"), "stage": rec["stage"], "next": rec["next"]}
+        | {"record_at": None}
         if run
         else None,
         "tasks": tasks,
