@@ -143,6 +143,8 @@ class LeadRunner:
         self.launches_left = launches
         self.wall = time.time
         self.ci_by_sha = ci_by_sha or {}  # dev CI runs per merge commit, over ``ci``
+        self.dev_runs: list[dict] = []  # newest dev CI runs, any head (no --commit)
+        self.contains: dict[str, str] = {}  # head sha -> compare status vs the merge
         self.nudge_codes = nudge_codes or [0]  # exit code per ``claude -p --cloud``
         # gh reads to fail transiently, by "pr list" / "issue view": calls left.
         self.fail = dict(fail or {})
@@ -186,6 +188,11 @@ class LeadRunner:
             if at is None:
                 return 1, "", "gh: Not Found (HTTP 404)"
             return 0, json.dumps({"commit": {"committer": {"date": _iso(at)}}}), ""
+        if argv[:2] == ["gh", "api"] and "/compare/" in argv[2]:
+            head = argv[2].split("...")[-1]
+            return 0, json.dumps({"status": self.contains.get(head, "diverged")}), ""
+        if argv[:3] == ["gh", "run", "list"] and "--commit" not in argv:
+            return 0, json.dumps(self.dev_runs), ""
         if argv[:3] == ["gh", "run", "list"]:
             sha = argv[argv.index("--commit") + 1]
             if sha in self.ci_by_sha:
@@ -356,6 +363,9 @@ async def test_done_lead_lands_with_every_pr_and_the_contact_sheet(store, dirs, 
     # The dev CI it read is the done PR's merge commit, on dev.
     ci = next(a for a, _ in runner.calls if a[:3] == ["gh", "run", "list"])
     assert MERGE_SHA in ci and "dev" in ci
+    # Any event counts: the lane dispatches dev CI (workflow_dispatch) with a
+    # token that fires no push runs, so a push-only filter never sees green.
+    assert "--event" not in ci
 
 
 async def test_lead_is_not_done_until_dev_ci_on_the_merge_is_green(store, dirs, playbook):
@@ -368,8 +378,55 @@ async def test_lead_is_not_done_until_dev_ci_on_the_merge_is_green(store, dirs, 
 
     await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
 
-    assert sum(a[:3] == ["gh", "run", "list"] for a, _ in runner.calls) == 4
+    assert sum(a[:3] == ["gh", "run", "list"] and "--commit" in a for a, _ in runner.calls) == 4
     assert (await store.get_action(run_ref)).status == ActionStatus.EXECUTED
+
+
+async def test_a_later_green_dev_run_that_contains_the_merge_lands_the_lead(store, dirs, playbook):
+    # The lane often merges more PRs before it dispatches dev CI, and a red run
+    # on the merge commit is superseded by a later green one that includes it.
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = _done_runner(run_ref, ci_by_sha={MERGE_SHA: [{**RED_RUN, "name": "CI"}]})
+    later = "d" * 40
+    runner.dev_runs = [
+        {**GREEN_RUN, "name": "CI", "headSha": later},
+        {**RED_RUN, "name": "CI", "headSha": MERGE_SHA},
+    ]
+    runner.contains = {later: "ahead"}
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert (await store.get_action(run_ref)).status == ActionStatus.EXECUTED
+
+
+async def test_a_green_dev_run_without_the_merge_does_not_land_the_lead(store, dirs, playbook):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = _done_runner(run_ref, ci_by_sha={MERGE_SHA: [RED_RUN]})
+    other = "e" * 40
+    runner.dev_runs = [{**GREEN_RUN, "headSha": other}]
+    runner.contains = {other: "diverged"}  # a green head that lacks the merge commit
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert (await store.get_action(run_ref)).status != ActionStatus.EXECUTED
+
+
+async def test_a_later_green_run_of_another_workflow_does_not_land_the_lead(store, dirs, playbook):
+    # Only the workflow that judged the merge commit counts on a later head: a
+    # green lane or audit run on dev says nothing about CI.
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    red_ci = {**RED_RUN, "name": "CI"}
+    runner = _done_runner(run_ref, ci_by_sha={MERGE_SHA: [red_ci]})
+    later = "f" * 40
+    runner.dev_runs = [{**GREEN_RUN, "name": "Fast Lane", "headSha": later}]
+    runner.contains = {later: "ahead"}
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert (await store.get_action(run_ref)).status != ActionStatus.EXECUTED
 
 
 async def test_lead_is_not_done_without_a_new_contact_sheet(store, dirs, playbook):
@@ -483,7 +540,11 @@ async def test_lead_has_8h_and_no_no_pr_rule(store, dirs, playbook):
 
     assert len(_launch_briefs(runner)) == 1 and not _nudges(runner)  # no 1 h relaunch
     polls = sum(a[:3] == ["gh", "pr", "list"] for a, _ in runner.calls)
-    assert 8 * 60 <= polls <= 8 * 60 + 2
+    # Past 8 h a lead still committing keeps going; it is released once it has
+    # been past the timeout AND silent for a whole stall window (commits stop at
+    # 9 h, so 9 h 30 m). A paused plan or a long Anatomy round must not release
+    # a live lead (factory lesson 100).
+    assert 9 * 60 + 30 <= polls <= 9 * 60 + 32
     # Out of time it settles like the ladder's last rung, never as a develop
     # failure: a failed run stops counting in flight while its session may still
     # commit, and the next shift would launch a second lead on the feature.
@@ -499,6 +560,61 @@ async def test_lead_has_8h_and_no_no_pr_rule(store, dirs, playbook):
     # A lead with no PR change for hours still writes its row once per stall
     # window, so the line's headroom (it drops rows unwritten for 3 h) counts it.
     assert runner.wall() - cc["lead"]["heartbeat_at"] <= 1800
+
+
+async def test_a_lead_still_working_is_released_only_at_twice_the_timeout(store, dirs, playbook):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = LeadRunner()
+    disp = _lead_dispatcher(runner, launch)
+    runner.commits = [runner.wall() + 60 * i for i in range(20 * 60)]  # busy for 20 h
+
+    await disp.run(run_ref, workspace_id=WS)
+
+    polls = sum(a[:3] == ["gh", "pr", "list"] for a, _ in runner.calls)
+    assert 16 * 60 <= polls <= 16 * 60 + 2  # the hard cap: twice the 8 h timeout
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.REJECTED
+    assert action.rejected_reason == (
+        "feature lead not done after 16h (session https://claude.ai/code/session_L1)"
+    )
+
+
+async def test_a_lead_quiet_before_the_timeout_gets_the_ladder_not_the_timeout(
+    store, dirs, playbook
+):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = LeadRunner()
+    disp = _lead_dispatcher(runner, launch)
+    runner.commits = [runner.wall() + 60 * i for i in range(5 * 60)]  # busy 5 h, then quiet
+
+    await disp.run(run_ref, workspace_id=WS)
+
+    # Quiet at 5 h is a stall, not a timeout: the 8 h clock has not run out, so
+    # the ladder (nudge, relaunch, then needs-human) settles it.
+    assert _nudges(runner)
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.REJECTED
+    assert "not done after" not in (action.rejected_reason or "")
+
+
+async def test_a_lead_that_posted_its_contact_sheet_waits_for_ci_without_the_ladder(
+    store, dirs, playbook
+):
+    # A lead whose sheet is up is finished: it waits on dev CI (red here, for
+    # other lines' failures), so a quiet branch is not a stall. No nudge, no
+    # relaunch of a session with nothing left to do; the timeout settles it.
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = _done_runner(run_ref, ci_by_sha={MERGE_SHA: [RED_RUN]})
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert not _nudges(runner) and len(_launch_briefs(runner)) == 1
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.REJECTED
+    assert (action.rejected_reason or "").startswith("feature lead not done after 8h")
 
 
 async def test_lead_timeouts_read_the_env(monkeypatch, tmp_path):

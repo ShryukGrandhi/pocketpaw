@@ -60,7 +60,9 @@
 #           ``lead/<feature>`` commit, PR update or issue comment for LEAD_STALL:
 #           a ``claude -p --cloud`` nudge, then a resume relaunch, then
 #           ``needs-human`` and the run released. LEAD_TIMEOUT (8 h) settles the same
-#           way (labelled and released, never a develop failure); no no-PR rule.
+#           way (labelled and released, never a develop failure) once the lead is
+#           also silent for a stall window; a lead still working runs to twice the
+#           timeout. No no-PR rule.
 # Only git, gh and the launcher run locally; an approved escalated diff lands on the line.
 
 from __future__ import annotations
@@ -126,6 +128,13 @@ _SAFE_FEATURE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _FEATURE_DONE = "feature-done"
 _CONTACT_SHEET = "Belt-Contact-Sheet:"
 _CI_DONE_OK = {"success", "neutral", "skipped"}
+
+
+def _run_green(run: dict[str, Any]) -> bool:
+    """One CI run finished and passed (a skip counts, like a check's)."""
+    return run.get("status") == "completed" and run.get("conclusion") in _CI_DONE_OK
+
+
 # gh failures worth a retry (lesson 42): network, timeouts, GitHub 5xx and
 # rate limits. Anything else (a 404, a bad argument) fails at once.
 _TRANSIENT = re.compile(
@@ -617,13 +626,17 @@ class CloudTaskDispatcher:
             if done and sheet and await self._dev_green(slug, base, done["merge_sha"], cwd):
                 await self._land_lead(store, run_ref, blob, slug, done, sheet)
                 return
-            if expired:
-                await self._lead_expired(store, run_ref, blob, slug, cwd)
-                return
             said = max((_epoch(c.get("createdAt")) for c in comments), default=0.0)
             branch = await self._branch_at(slug, str(lead.get("branch") or ""), cwd)
             # The lead's own signs of work; a stall rung or a relaunch is Belt's.
             active = max(launched, pr_at, said, branch)
+            # Past the timeout a lead still showing work inside one stall window
+            # keeps going, up to twice the timeout: a paused plan or a long
+            # Anatomy round must not release a live lead (factory lesson 100).
+            hard = now - launched >= 2 * self.lead_timeout_seconds
+            if hard or (expired and now - active >= self.lead_stall_seconds):
+                await self._lead_expired(store, run_ref, blob, slug, cwd, hard=hard)
+                return
             heard = max(
                 [
                     active,
@@ -631,13 +644,22 @@ class CloudTaskDispatcher:
                     *(float(s.get("at") or 0) for s in lead.get("stalls") or []),
                 ]
             )
-            if now - heard >= self.lead_stall_seconds:
+            # A lead whose contact sheet is up has finished and waits on dev CI:
+            # a quiet branch then is not a stall, and the timeout settles it.
+            if not sheet and now - heard >= self.lead_stall_seconds:
                 if not await self._lead_stall(store, run_ref, blob, slug, worker, cwd, active):
                     return
             await self.sleep(self.poll_seconds)
 
     async def _lead_expired(
-        self, store: Any, run_ref: str, blob: dict[str, Any], slug: str, cwd: Path
+        self,
+        store: Any,
+        run_ref: str,
+        blob: dict[str, Any],
+        slug: str,
+        cwd: Path,
+        *,
+        hard: bool = False,
     ) -> None:
         """Out of time: settle like the stall ladder's last rung (label the issue
         ``needs-human``, release the run). Never as a develop failure: a failed
@@ -648,7 +670,7 @@ class CloudTaskDispatcher:
         await _patch(store, run_ref, lead=lead)
         await self._flag_issue(slug, str(lead.get("issue") or ""), cwd)
         session = (lead.get("sessions") or [{}])[-1].get("session_url")
-        hours = self.lead_timeout_seconds / 3600
+        hours = self.lead_timeout_seconds * (2 if hard else 1) / 3600
         await self._release(
             store, run_ref, blob, f"feature lead not done after {hours:g}h (session {session})"
         )
@@ -696,20 +718,44 @@ class CloudTaskDispatcher:
             return 0.0
 
     async def _dev_green(self, slug: str, base: str, sha: str, cwd: Path) -> bool:
-        """The push CI ``sha`` (a merge commit) triggered on ``base``: at least
-        one run, every one finished green. Unreadable reads as not yet."""
+        """Dev CI says the merge commit ``sha`` is green: every run on ``sha``
+        itself finished green, or else the newest finished dev CI head that
+        contains ``sha`` is green. Any event. Unreadable reads as not yet.
+
+        Any event, because the fast lane merges with a token that fires no push
+        runs and dispatches dev CI itself (``workflow_dispatch``). The later-head
+        fallback, because the lane often merges more PRs before it dispatches,
+        and a later green run supersedes a red one on the merge commit."""
         if not _HEX_SHA.match(sha):
             return False
         argv = ["gh", "run", "list", "-R", slug, "--commit", sha, "--branch", base]
-        argv += ["--event", "push", "--limit", "50", "--json", "status,conclusion,name"]
+        argv += ["--limit", "50", "--json", "status,conclusion,name"]
         try:
             runs = json.loads(await self._gh(argv, cwd, "DONE: gh run list") or "[]")
+            if runs and all(_run_green(r) for r in runs):
+                return True
+            argv = ["gh", "run", "list", "-R", slug, "--branch", base, "--limit", "30"]
+            argv += ["--json", "headSha,status,conclusion,name"]
+            recent = json.loads(await self._gh(argv, cwd, "DONE: gh run list") or "[]")
+            # Only the workflows that judged the merge commit count on a later
+            # head: a green lane or audit run says nothing about CI.
+            names = {r.get("name") for r in runs}
+            recent = [r for r in recent if not names or r.get("name") in names]
+            heads = list(dict.fromkeys(str(r.get("headSha") or "") for r in recent))
+            for head in heads:  # newest first
+                group = [r for r in recent if r.get("headSha") == head]
+                if head == sha or not _HEX_SHA.match(head):
+                    continue
+                if any(r.get("status") != "completed" for r in group):
+                    continue  # still running: judge an older finished head
+                compare = f"repos/{slug}/compare/{sha}...{head}"
+                out = await self._gh(["gh", "api", compare, "--jq", "."], cwd, "DONE: compare")
+                if (json.loads(out or "{}").get("status") or "") not in {"ahead", "identical"}:
+                    continue  # this head lacks the merge commit
+                return all(_run_green(r) for r in group)
         except Exception:  # noqa: BLE001 — the next poll reads it again
             logger.info("belt cloud: dev CI of %s on %s unreadable", sha, slug, exc_info=True)
-            return False
-        return bool(runs) and all(
-            r.get("status") == "completed" and r.get("conclusion") in _CI_DONE_OK for r in runs
-        )
+        return False
 
     async def _lead_stall(
         self,
