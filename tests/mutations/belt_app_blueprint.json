@@ -110,8 +110,8 @@
   {
     "label": "needs-human does not stick",
     "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
-    "find": "stuck = \"needs-human\" in (issue.get(\"labels\") or []) or len(lead.get(\"stalls\") or []) >= 2",
-    "replace": "stuck = len(lead.get(\"stalls\") or []) >= 2",
+    "find": "stuck = \"needs-human\" in (issue.get(\"labels\") or []) or stalls >= 2",
+    "replace": "stuck = stalls >= 2",
     "tests": [
       "tests/cloud/test_belt_app_blueprint.py"
     ]
@@ -119,8 +119,8 @@
   {
     "label": "one stall rung sticks",
     "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
-    "find": "len(lead.get(\"stalls\") or []) >= 2",
-    "replace": "len(lead.get(\"stalls\") or []) >= 1",
+    "find": "or stalls >= 2",
+    "replace": "or stalls >= 1",
     "tests": [
       "tests/cloud/test_belt_app_blueprint.py"
     ]
@@ -128,8 +128,8 @@
   {
     "label": "stall rungs never stick",
     "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
-    "find": "len(lead.get(\"stalls\") or []) >= 2",
-    "replace": "len(lead.get(\"stalls\") or []) >= 99",
+    "find": "or stalls >= 2",
+    "replace": "or stalls >= 99",
     "tests": [
       "tests/cloud/test_belt_app_blueprint.py"
     ]
@@ -436,6 +436,24 @@
     "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
     "find": "for p in owned or [f for t in tasks for f in t[\"files\"]])",
     "replace": "for p in owned)",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py"
+    ]
+  },
+  {
+    "label": "an unlisted issue has no state or labels",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "{\"state\": \"unknown\", \"labels\": [], **(issue or {}), \"number\": wave[\"issue\"]}",
+    "replace": "{**(issue or {}), \"number\": wave[\"issue\"]}",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py"
+    ]
+  },
+  {
+    "label": "a run row has no record_at",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "| {\"record_at\": None}",
+    "replace": "",
     "tests": [
       "tests/cloud/test_belt_app_blueprint.py"
     ]

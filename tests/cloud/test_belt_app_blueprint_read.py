@@ -74,7 +74,10 @@ class Fake:
             f"{drag}-@MainActor private struct ViewerDragSteps {{\n--\n"
             f"{parent}:    /// H-J23: parent a layer.\n"
             f"{parent}-    func testParentLayer() throws {{\n"
+            f'{parent}-        XCTAssert(true, "H-J40 is not a journey comment")\n'
         )
+        if argv[0] == "grep" and argv[argv.index("-A") + 1 if "-A" in argv else 0] in ("0", "grep"):
+            grep = "".join(x for x in grep.splitlines(True) if ".swift:" in x)  # no context
         return 0, {"rev-parse": "62a8577\n", "ls-tree": self.ls, "grep": grep}.get(argv[0], ""), ""
 
     async def gh(self, argv):

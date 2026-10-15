@@ -1683,16 +1683,16 @@ lead runs. Design: workspace `docs/design/drafts/2026-10-15-belt-blueprint-line-
 
 | Field | Shape |
 |---|---|
-| `repo`, `slug`, `sha` | the resolved clone, its GitHub `owner/repo`, the `origin/dev` sha read |
+| `repo`, `slug`, `sha` | the resolved clone, its GitHub `owner/repo` (`""` off GitHub), the `origin/dev` sha read |
 | `stale`, `read_at` | `stale: true` when the last refresh failed and this is the previous graph |
 | `dev_ci` | `{sha, state: green\|red\|pending, url}` of dev's latest run, or `null` |
 | `layers` | the band order: `tests, app, shell, model, engine, other` |
-| `apps` | `[{id, counts: {total, done, built, building, stuck, filed, planned, gap}, journeys: {named, existing, passing}}]` |
-| `features` | `[{id: "<app>/<feature>", app, title, wave, order, status, claimed, issue, waits_on: [{ref, state}], depends, run, tasks, layers, components, journeys, gaps}]` |
+| `apps` | `[{id, title, counts: {total, done, built, building, stuck, filed, planned, gap}, journeys: {named, existing, passing}}]`; `title` is the first `# ` heading of `docs/blueprints/<app>.md` less a trailing "blueprint", else the id |
+| `features` | `[{id: "<app>/<feature>", app, title, wave, order, status, claimed, issue: {number, state, labels} \| null, waits_on: [{ref, state}], depends, run: {action_id, stage, next, record_at} \| null, tasks, layers, components, journeys, gaps}]`; an issue gh did not list has `state: "unknown"`, `labels: []`; `record_at` is `null` for now |
 | `components` | `[{id: "<app>/<component>", container, layer, status: built\|partial\|planned, present, total, features}]` |
-| `journeys` | `[{id, file, state: named\|existing\|passing, features}]` |
+| `journeys` | `[{id, test, file, state: named\|existing\|passing, features}]`; `test` is the `func test...` after the `///` id, else `null` |
 | `in_flight` | this workspace's unsettled runs on the repo: `[{action_id, kind: lead\|task, feature, layers}]` |
-| `gaps` | `[{kind, ref}]`, kinds `claimed_ahead`, `issue_closed_not_done`, `component_missing`, `journey_no_test`, ... |
+| `gaps` | `[{kind, ref, text}]`, kinds `claimed_ahead`, `issue_closed_not_done`, `feature_no_owned`, `component_missing`, `component_unowned` (not built, no feature owns it), `journey_no_test`; `text` is one plain sentence per kind |
 
 `GET /api/v1/belt/blueprints/c4?repo=<path>&app=<app>` (`belt.read`) returns
 `{app, model: {scope, model}, status}`. `model` has the shape of the run
@@ -1705,7 +1705,12 @@ sits under it), else `planned`, so a partial component can mark each file.
 
 Both reads are cached for 60 s per (workspace, repo) behind one lock; a read
 inside the window makes no git or gh call. A failed refresh (git ref lock, gh
-rate limit) serves the last graph with `stale: true`. Errors carry the cloud
+rate limit, or an unexpected error, which is logged) serves the last graph with
+`stale: true`. Feature issues come from `gh issue list --label feature-lead
+--state all`; `waits_on` states come from one unlabelled list per repo a ref
+names. A journey is named when its id appears anywhere in a feature's wave.json
+(real files keep them in `note`) or in the Journeys section of
+`docs/blueprints/<app>.md`. Errors carry the cloud
 envelope plus `detail`: 404 `belt.repo_not_found` for a repo outside the
 allowlist, 404 `belt.app_not_found` for an app with no `c4-planned.json`, 422
 for an `app` that is not `^[a-z0-9][a-z0-9-]*$` (checked before anything is
