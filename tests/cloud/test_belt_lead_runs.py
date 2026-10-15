@@ -14,7 +14,8 @@
 # (open and merged), never reviewed (no ``belt/review``) and never fixed.
 # DONE: a merged ``feature-done`` PR, every dev CI run of its merge commit
 # green, and a ``Belt-Contact-Sheet:`` comment on the issue since the launch;
-# any one missing keeps the run tracking.
+# any one missing keeps the run tracking. A closed feature issue finishes the
+# run as done at the next poll and frees its slot, never nudged or relaunched.
 # STALL: 30 min with no lead-branch commit, PR update or issue comment: a
 # ``claude -p --cloud <session>`` nudge, then a relaunch with the resume brief,
 # then ``needs-human`` on the issue and the run released, the reason naming the
@@ -27,6 +28,8 @@
 # LESSON 45: on startup a run whose tracker died on a TRACK error (inside its
 # timeout) is tracked again with the error cleared; an errored run is never
 # counted in flight.
+# ROW: a lead run's console row carries ``lead`` (feature, app, PRs, session and
+# stall counts, contact sheet) off the tracker's blob; a task run's is null.
 
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +45,7 @@ pytest.importorskip("pocketpaw_ee")
 
 from pocketpaw_ee.cloud.belt import cloud_station  # noqa: E402
 from pocketpaw_ee.cloud.belt.cloud_station import CloudTaskDispatcher  # noqa: E402
+from pocketpaw_ee.cloud.belt.service import _run_summary  # noqa: E402
 from pocketpaw_ee.cloud.mandates import service as mandate_service  # noqa: E402
 from pocketpaw_ee.cloud.mandates.domain import Budget  # noqa: E402
 
@@ -1028,3 +1033,169 @@ async def test_an_outage_past_the_lead_timeout_still_ends_it(store, dirs, playbo
     assert action.rejected_reason.startswith("feature lead not done after 8h")
     assert any(a[:3] == ["gh", "issue", "edit"] and "needs-human" in a for a, _ in runner.calls)
     assert "headless_error" not in action.parameters["_code_change"]
+
+
+# -- the console row ------------------------------------------------------------
+
+_ROW_PR = {
+    "number": 1122,
+    "url": f"https://github.com/{SLUG}/pull/1122",
+    "state": "MERGED",
+    "branch": f"lead/{FEATURE}-1122",
+    "done": False,
+    "merge_sha": MERGE_SHA,
+    "merged_at": "2026-10-15T10:00:00Z",
+}
+_ROW_SHEET = "Belt-Contact-Sheet: https://example.com/sheet.png"
+
+
+def _row_action() -> SimpleNamespace:
+    return SimpleNamespace(id="act-1", status=SimpleNamespace(value="pending"))
+
+
+def test_lead_run_row_carries_lead() -> None:
+    blob = {
+        "recipe": "feature-lead",
+        "task": "Lead #93",
+        "lead": {
+            "feature": FEATURE,
+            "packet": PACKET,
+            "issue": 93,
+            "branch": f"lead/{FEATURE}",
+            "prs": [_ROW_PR],
+            "sessions": [{"session_url": f"https://claude.ai/code/{SID}", "at": 1.0}],
+            "stalls": [],
+            "heartbeat_at": 2.0,
+            "contact_sheet": _ROW_SHEET,
+        },
+    }
+    lead = _run_summary(_row_action(), blob)["lead"]
+    assert lead["feature"] == FEATURE
+    assert lead["app"] == "flare"
+    assert lead["issue"] == 93
+    assert lead["branch"] == f"lead/{FEATURE}"
+    assert lead["prs"] == [_ROW_PR]
+    assert lead["sessions"] == 1
+    assert lead["stalls"] == 0
+    assert lead["contact_sheet"] == _ROW_SHEET
+
+
+def test_queued_lead_row_is_a_lead_before_launch() -> None:
+    # Planned with the recipe, not launched yet: no ``lead`` dict on the blob.
+    lead = _run_summary(_row_action(), {"recipe": "feature-lead", "task": "Lead #7"})["lead"]
+    assert lead is not None
+    assert lead["feature"] is None
+    assert lead["prs"] == []
+    assert lead["contact_sheet"] is None
+
+
+def test_task_run_row_has_null_lead() -> None:
+    assert _run_summary(_row_action(), {"task": "fix the bug"})["lead"] is None
+
+
+# -- a closed feature issue ends the run ---------------------------------------
+# Live 2026-10-15: creative-apps #798 closed by hand and #1037 closed by its own
+# PR both stayed "running" for hours, holding a slot while dev CI was red. A
+# closed issue finishes the run as done at the next poll: no nudge, no relaunch.
+
+
+class IssueStateRunner(LeadRunner):
+    """``LeadRunner`` whose ``gh issue view`` answers ``state`` (one per poll
+    from ``states``, holding the last) only when the call asks for it."""
+
+    def __init__(self, *, states: list[str], **kw):
+        super().__init__(**kw)
+        self.states = states
+
+    async def __call__(self, argv, *, cwd, timeout, stdin=None, on_line=None):
+        code, out, err = await super().__call__(
+            argv, cwd=cwd, timeout=timeout, stdin=stdin, on_line=on_line
+        )
+        if argv[:3] == ["gh", "issue", "view"] and code == 0 and "--json" in argv:
+            fields = argv[argv.index("--json") + 1].split(",")
+            if "comments" in fields:
+                data = json.loads(out)
+                state = self._next(self.states)
+                if "state" in fields:
+                    data["state"] = state
+                out = json.dumps(data)
+        return code, out, err
+
+
+def _in_flight(action) -> int:
+    row = _run_summary(action, action.parameters["_code_change"])
+    budget = Budget(max_tasks_per_shift=3, max_in_flight=3)
+    return mandate_service._headroom(budget, [row], datetime.now(UTC))["in_flight"]
+
+
+async def test_a_closed_feature_issue_finishes_the_run_and_frees_the_slot(store, dirs, playbook):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    # A merged slice, no feature-done PR, no contact sheet: the done rule waits.
+    runner = IssueStateRunner(states=["CLOSED"], prs=[[_lead_pr(31, run_ref, state="MERGED")]])
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    assert "feature issue #93 was closed" in str(action.outcome)
+    cc = action.parameters["_code_change"]
+    assert cc["station_pending"] is False and "headless_state" not in cc
+    assert _in_flight(action) == 0
+    assert not _nudges(runner) and len(_launch_briefs(runner)) == 1
+    assert not any(a[:3] == ["gh", "issue", "edit"] for a, _ in runner.calls)
+
+
+async def test_an_open_feature_issue_keeps_the_stall_ladder(store, dirs, playbook):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = IssueStateRunner(states=["OPEN"])  # silent, issue open: today's ladder
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.REJECTED
+    lead = action.parameters["_code_change"]["lead"]
+    assert [s["kind"] for s in lead["stalls"]] == ["nudge", "relaunch", "needs-human"]
+
+
+async def test_an_open_feature_issue_with_the_done_rule_met_still_lands(store, dirs, playbook):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    done = _done_runner(run_ref)
+    runner = IssueStateRunner(states=["OPEN"], prs=done.prs, comments=done.comments)
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    assert "was closed" not in str(action.outcome)
+
+
+async def test_a_closed_feature_issue_is_never_nudged_or_relaunched(store, dirs, playbook):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    # Silent from launch; the issue closes at the poll the first stall rung
+    # would fire on (30 min in), so the rung must never run.
+    runner = IssueStateRunner(states=["OPEN"] * 30 + ["CLOSED"])
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    assert not _nudges(runner) and len(_launch_briefs(runner)) == 1
+    assert action.parameters["_code_change"]["lead"]["stalls"] == []
+    assert not any(a[:3] == ["gh", "issue", "edit"] for a, _ in runner.calls)
+
+
+async def test_a_lead_closed_after_a_nudge_is_not_relaunched(store, dirs, playbook):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    # Nudged at 30 min, then the issue closes before the relaunch rung at 60.
+    runner = IssueStateRunner(states=["OPEN"] * 45 + ["CLOSED"])
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    assert len(_nudges(runner)) == 1 and len(_launch_briefs(runner)) == 1
