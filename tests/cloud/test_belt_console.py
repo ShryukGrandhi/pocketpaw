@@ -25,8 +25,8 @@
 #     audience resolver fans belt_run_updated out to workspace members.
 #   * GET /belt/blueprints and /belt/blueprints/c4 — a member reads the app
 #     blueprint graph and one app's C4 view over B3's fake git and gh; 404
-#     outside the allowlist, 422 on a bad app id, stale passed through, 503
-#     with no graph yet.
+#     outside the allowlist, 422 on a bad app id, a status per component and
+#     per component path, stale passed through, 503 with no graph yet.
 #
 # `pocketpaw_ee` is import-skipped on an OSS-only install. The Mongo-backed
 # add-repo persistence rides the conftest ``mongo_db`` fixture (mongomock-motor
@@ -1039,6 +1039,13 @@ def test_blueprint_c4_returns_the_model_and_a_status_per_component(bp):
     assert set(status.values()) <= {"planned", "landed", "changing", "failed"}
     missing = _bp_get("blueprints/c4", bp, app="nope")
     assert missing.status_code == 404 and missing.json()["error"]["code"] == "belt.app_not_found"
+
+
+def test_blueprint_c4_marks_each_path_of_a_partial_component(bp):
+    status = _bp_get("blueprints/c4", bp, app="halo").json()["status"]
+    assert status["halo-frames"] == "planned"  # partial: one of two files on dev
+    assert status["Sources/HaloModel/FrameRenderer.swift"] == "landed"
+    assert status["Sources/HaloModel/HaloRenderFrame.swift"] == "planned"
 
 
 def test_blueprint_c4_paints_a_stuck_owner_failed(bp, monkeypatch):

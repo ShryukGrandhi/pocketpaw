@@ -12,7 +12,7 @@
 # limit) serves the last graph with ``stale: True``, 503 with none yet. App and
 # feature ids match ``_ID`` before any path or ref is built; a file over
 # ``MAX_MODEL_BYTES`` is refused unread. ``read_c4`` serves one app's planned
-# model off the same cache entry, with a status per component.
+# model off the same cache entry, with a status per component and per path.
 
 from __future__ import annotations
 
@@ -91,13 +91,16 @@ async def read_blueprint(
 async def read_c4(workspace_id: str, repo: str, app: str, **io: Any) -> dict[str, Any]:
     """One app's ``c4-planned.json`` as ``{scope, model}`` and a status per
     component id: ``failed`` when a stuck feature owns it, ``changing`` when a
-    building one does, ``landed`` when every path is on dev, else ``planned``."""
+    building one does, ``landed`` when every path is on dev, else ``planned``.
+    Each component path is a key too: ``landed`` when it is on dev, else
+    ``planned``, so a partial component can mark its files one by one."""
     graph = await read_blueprint(workspace_id, repo, **io)
-    model = _CACHE[(workspace_id, graph["repo"])]["models"].get(app)
+    entry = _CACHE[(workspace_id, graph["repo"])]
+    model = entry["models"].get(app)
     if model is None:
         raise BeltConsoleError(404, "No C4 model for this app.", "belt.app_not_found")
     feats = {f["id"]: f["status"] for f in graph["features"]}
-    status = {}
+    status = {p: "landed" if hit else "planned" for p, hit in entry["paths"].get(app, {}).items()}
     for c in graph["components"]:
         if c["id"].startswith(f"{app}/"):
             owners = {feats.get(f) for f in c["features"]}
@@ -255,6 +258,7 @@ async def _read(
 
     features, components, journeys, gaps, app_rows, models = [], [], [], [], [], []
     c4: dict[str, dict[str, Any] | None] = {}
+    on_dev: dict[str, dict[str, bool]] = {}
     for app, files in sorted(apps.items()):
         model = c4[app] = load_model(await blob(files.get("")) or "")
         owned = _owned_system(model) if model else None
@@ -284,7 +288,9 @@ async def _read(
         for c in _dicts((owned or {}).get("containers")):
             for k in _dicts(c.get("components")):
                 paths = [x for x in k.get("paths") or [] if isinstance(x, str)]
-                present = sum(_present(x, tree) for x in paths)
+                hits = [_present(x, tree) for x in paths]
+                on_dev.setdefault(app, {}).update(zip(paths, hits, strict=True))
+                present = sum(hits)
                 status = "built" if paths and present == len(paths) else "partial"
                 status = status if present else "planned"
                 cid = f"{app}/{k.get('id')}"
@@ -329,4 +335,11 @@ async def _read(
     graph |= {"read_at": datetime.now(UTC).isoformat(), "layers": list(ab.LAYERS)}
     graph |= {"apps": app_rows, "features": features, "components": components}
     graph |= {"journeys": journeys, "in_flight": in_flight, "gaps": gaps}
-    return {"graph": graph, "slug": slug, "heads": heads, "records": records, "models": c4}
+    return {
+        "graph": graph,
+        "slug": slug,
+        "heads": heads,
+        "records": records,
+        "models": c4,
+        "paths": on_dev,
+    }
