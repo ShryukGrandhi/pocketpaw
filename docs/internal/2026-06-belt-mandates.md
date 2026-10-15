@@ -1699,7 +1699,9 @@ lead runs. Design: workspace `docs/design/drafts/2026-10-15-belt-blueprint-line-
 blueprint's `model` above, so the same adapters draw it. `status` maps each
 component id (bare, as in the model) to `failed` when a stuck feature owns it,
 `changing` when a building one does, `landed` when every path is on dev, else
-`planned`.
+`planned`. Every `paths` entry of the app's own components is a key too:
+`landed` when it is in `origin/dev`'s tree (a path ending in `/` once any file
+sits under it), else `planned`, so a partial component can mark each file.
 
 Both reads are cached for 60 s per (workspace, repo) behind one lock; a read
 inside the window makes no git or gh call. A failed refresh (git ref lock, gh
