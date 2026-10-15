@@ -27,7 +27,7 @@ OPEN = {"state": "open", "labels": ["feature-lead", "line:halo"]}
 RUNNING = {
     "action_id": "act-1a13eb691a3-wg4n",
     "status": "running",
-    "lead": {"prs": [{"number": 1122, "state": "MERGED", "done": False}], "stalls": []},
+    "lead": {"prs": [{"number": 1122, "state": "MERGED", "done": False}], "stalls": 0},
 }
 DONE_PR = {"number": 1129, "state": "MERGED", "done": True}
 
@@ -125,8 +125,8 @@ def test_a_feature_with_no_owned_list_is_placed_by_its_record_tasks_else_unknown
         ("gap", {**OPEN, "labels": ["needs-human"]}, None, [], "built", 1),
         ("gap", {"state": "CLOSED"}, None, [], "planned", 1),
         ("stuck", {**OPEN, "labels": ["needs-human"]}, RUNNING, [], "building", 1),
-        ("stuck", OPEN, {"status": "running", "lead": {"stalls": [{}, {}]}}, [], "building", 1),
-        ("building", OPEN, {"status": "running", "lead": {"stalls": [{}]}}, [], "building", 1),
+        ("stuck", OPEN, {"status": "running", "lead": {"stalls": 2}}, [], "building", 1),
+        ("building", OPEN, {"status": "running", "lead": {"stalls": 1}}, [], "building", 1),
         ("stuck", OPEN, {"status": "rejected"}, [], "building", 1),
         ("stuck", OPEN, {"status": "failed"}, [], "building", 1),
         ("building", OPEN, {"status": "queued"}, [], "planned", 1),
@@ -182,3 +182,11 @@ def test_task_layer_is_the_majority_of_its_non_test_files():
     assert place(snap, journey) == "tests"  # no component owns them: the prefix rule places them
     assert place("Package.swift") == "other"
     assert place() == "unknown"
+
+
+def test_issue_and_run_carry_every_contract_field():
+    # #799 is not in the gh list: the row still has a state and labels.
+    assert derive(issue=None)["issue"] == {"number": 1036, "state": "unknown", "labels": []}
+    assert derive()["issue"] == {"number": 1036, **OPEN}
+    # nothing read carries the RECORD's commit time yet
+    assert derive()["run"]["record_at"] is None

@@ -4,7 +4,10 @@
 # creative-apps clone (Halo's c4-planned.json, two wave files, the layer-keys
 # RECORD on its lead branch). Pins the cache (no calls within the TTL; a moved lead
 # head re-reads only its RECORD), the stale fallback on a rate limit, and the
-# guards (a bad id or an oversized file is refused before it is read).
+# guards (a bad id or an oversized file is refused before it is read). The
+# run rows, the grep output and the blueprint .md are shaped like the real ones:
+# ``stalls`` is an int, journey ids sit in a wave's ``note`` and the .md's
+# Journeys section, a test function follows its ``///`` comment.
 
 from __future__ import annotations
 
@@ -28,6 +31,11 @@ FILES = {
     f"{BP}/features/live-keys.wave.json": (FX / "flare-live-keys.wave.json").read_text(),
     f"{BP}/features/Bad_Id.wave.json": "{}",
     f"{BP}/features/huge.wave.json": "{}",
+    "docs/blueprints/halo.md": (
+        "# Halo blueprint\n\nIntro, H-J99 is not named here.\n\n## 4. Journeys\n\n"
+        "### Tier-1 journeys\n\n- H-J5 drag a layer\n- H-J40 owned by no feature\n\n"
+        "## 5. Contracts\n\nH-J77 is past the section.\n"
+    ),
 }
 HUGE = f"{BP}/features/huge.wave.json"
 RECORD = (FX / "layer-keys-RECORD.md").read_text()
@@ -43,7 +51,8 @@ def contents(text: str, size: int | None = None) -> dict:
 
 class Fake:
     def __init__(self, repo: Path):
-        self.repo, self.calls, self.limited = repo, [], False
+        self.repo, self.calls, self.limited, self.stalls = repo, [], False, 1
+        self.origin = "https://github.com/qbtrix/creative-apps.git"
         self.heads = {"layer-keys": "a1", "easing": "b1", "Bad.Ref": "c1"}
         self.records = {"layer-keys": contents(RECORD), "easing": contents("Stage: 1 plan\n")}
         tree = [*FILES, *(FX / "dev-tree.txt").read_text().split()]
@@ -54,18 +63,27 @@ class Fake:
         self.calls.append(argv)
         if argv[0] == "cat-file":
             return 0, next(t for p, t in FILES.items() if sha(p) == argv[2]), ""
-        grep = "origin/dev:UITests/HaloJourneyTests+Drag.swift:  /// H-J5 drag\n"
+        drag, parent = "origin/dev:UITests/HaloJourneyTests+Drag.swift", "origin/dev:UITests/P.swift"
+        grep = (
+            f"{drag}:    /// H-J5: a viewer drag keys a position.\n"
+            f"{drag}-    @MainActor func testDragLayerToKeyPosition() {{\n--\n"
+            f"{drag}:/// H-J5's and H-J6's steps over one launched Halo.\n"
+            f"{drag}-@MainActor private struct ViewerDragSteps {{\n--\n"
+            f"{parent}:    /// H-J23: parent a layer.\n{parent}-    func testParentLayer() throws {{\n"
+        )
         return 0, {"rev-parse": "62a8577\n", "ls-tree": self.ls, "grep": grep}.get(argv[0], ""), ""
 
     async def gh(self, argv):
         self.calls.append(argv)
         if argv[0] == "git":
-            return 0, "https://github.com/qbtrix/creative-apps.git\n", ""
+            return 0, self.origin + "\n", ""
         if self.limited:
             return 1, "", "HTTP 403: API rate limit exceeded"
         rows: object = []
         if argv[1:3] == ["issue", "list"] and "qbtrix/creative-apps" in argv:
             rows = [{"number": 1036, "state": "OPEN", "labels": [{"name": "feature-lead"}]}]
+            if "feature-lead" not in argv:  # the waits_on read sees every issue
+                rows.append({"number": 333, "state": "OPEN"})
         elif argv[1:3] == ["issue", "list"]:
             rows = [{"number": 171, "state": "CLOSED"}]
         elif argv[1:3] == ["run", "list"]:
@@ -79,7 +97,7 @@ class Fake:
         return 0, json.dumps(rows), ""
 
     async def runs(self, ws):
-        lead = {"feature": "layer-keys", "app": "halo", "prs": [], "stalls": []}
+        lead = {"feature": "layer-keys", "app": "halo", "prs": [], "stalls": self.stalls}
         return [{"action_id": "act-1", "status": "running", "repo": str(self.repo), "lead": lead}]
 
     async def touched(self, ws, action_id):
@@ -170,3 +188,91 @@ async def test_repo_outside_the_allowlist_is_404(fake, monkeypatch):
     with pytest.raises(BeltConsoleError) as err:
         await read(fake)
     assert err.value.status_code == 404 and fake.calls == []
+
+
+async def test_two_stalls_on_the_real_int_shape_is_stuck(fake):
+    assert feature(await read(fake), "halo/layer-keys")["status"] == "building"  # stalls=1
+    fake.stalls = 2
+    assert feature(await read(fake, t=61.0), "halo/layer-keys")["status"] == "stuck"
+
+
+async def test_an_unexpected_error_serves_stale_or_503_never_a_bare_500(fake):
+    good = fake.runs
+
+    async def broken(ws):
+        raise TypeError("a row of an unexpected shape")
+
+    fake.runs = broken
+    with pytest.raises(BeltConsoleError) as err:
+        await read(fake)
+    assert err.value.status_code == 503
+    fake.runs = good
+    first = await read(fake, t=100.0)
+    fake.runs = broken
+    g = await read(fake, t=161.0)
+    assert g["stale"] is True and g["features"] == first["features"]
+
+
+async def test_issues_come_from_the_feature_lead_label_and_always_carry_state(fake):
+    g = await read(fake)
+    lists = [c for c in fake.calls if c[1:3] == ["issue", "list"]]
+    mine = [c for c in lists if "qbtrix/creative-apps" in c and "number,state,labels" in c]
+    assert mine and all(c[c.index("--label") + 1] == "feature-lead" for c in mine)
+    assert not any("feature-lead" in c for c in lists if "qbtrix/creative-core" in c)
+    lk, live = feature(g, "halo/layer-keys"), feature(g, "halo/live-keys")
+    assert lk["issue"] == {"number": 1036, "state": "open", "labels": ["feature-lead"]}
+    assert live["issue"] == {"number": 799, "state": "unknown", "labels": []}
+    # a same-repo waits_on ref that is not a feature lead still resolves
+    assert {"ref": "qbtrix/creative-apps#333", "state": "open"} in lk["waits_on"]
+    assert lk["run"]["record_at"] is None
+
+
+async def test_a_repo_not_on_github_has_an_empty_slug(fake):
+    fake.origin = "git@example.com:acme/creative-apps.git"
+    g = await read(fake)
+    assert g["slug"] == "" and g["features"]
+
+
+async def test_app_title_is_the_blueprint_heading_else_the_id(fake):
+    assert (await read(fake))["apps"][0]["title"] == "Halo"
+    fake.ls = "".join(x for x in fake.ls.splitlines(True) if "halo.md" not in x)
+    assert (await read(fake, t=61.0))["apps"][0]["title"] == "halo"
+
+
+async def test_journeys_are_named_from_the_note_and_the_journeys_section(fake):
+    g = await read(fake)
+    assert feature(g, "halo/layer-keys")["journeys"] == ["halo/H-J5", "halo/H-J6", "halo/H-J23"]
+    rows = {j["id"]: j for j in g["journeys"]}
+    assert set(rows) == {"halo/H-J5", "halo/H-J40", "halo/H-J6", "halo/H-J23"}
+    assert rows["halo/H-J5"] | {"features": None} == {
+        "id": "halo/H-J5",
+        "test": "testDragLayerToKeyPosition",
+        "file": "UITests/HaloJourneyTests+Drag.swift",
+        "state": "existing",
+        "features": None,
+    }
+    assert rows["halo/H-J6"]["test"] is None and rows["halo/H-J6"]["state"] == "existing"
+    assert (rows["halo/H-J23"]["test"], rows["halo/H-J23"]["file"]) == (
+        "testParentLayer",
+        "UITests/P.swift",
+    )
+    assert rows["halo/H-J40"] == {
+        "id": "halo/H-J40",
+        "test": None,
+        "file": None,
+        "state": "named",
+        "features": [],
+    }
+    assert g["apps"][0]["journeys"] == {"named": 4, "existing": 3, "passing": 0}
+
+
+async def test_every_gap_has_text_and_unowned_planned_components_are_gaps(fake):
+    g = await read(fake)
+    assert g["gaps"] and all(isinstance(x["text"], str) and x["text"] for x in g["gaps"])
+    ahead = next(x for x in g["gaps"] if x["kind"] == "claimed_ahead")
+    assert "feature-done" in ahead["text"]
+    comps = {c["id"]: c for c in g["components"]}
+    unowned = [x["ref"].removeprefix("component:") for x in g["gaps"] if x["kind"] == "component_unowned"]
+    assert unowned and all(comps[c]["features"] == [] for c in unowned)
+    assert all(comps[c]["status"] != "built" for c in unowned)
+    assert {c for c, row in comps.items() if not row["features"] and row["status"] != "built"} == set(unowned)
