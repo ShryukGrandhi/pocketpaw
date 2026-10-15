@@ -39,27 +39,25 @@ def derive(wave=LAYER_KEYS, record=RECORD, app="halo", fid="layer-keys", **kw):
 
 def test_layer_keys_is_building_with_each_task_on_its_layer():
     f = derive()
-    assert (f["id"], f["status"], f["claimed"], f["wave"]) == (
-        "halo/layer-keys",
+    assert (f["id"], f["status"], f["claimed"], f["wave"]) == ("halo/layer-keys",) + (
         "building",
-        "building",
-        "1",
-    )
-    assert (
-        f["issue"]["number"] == 1036
-        and f["depends"] == ["foundation"]
-        and f["waits_on"] == [777, 333]
-    )
-    assert f["run"] == {
-        "action_id": "act-1a13eb691a3-wg4n",
-        "stage": "5 finish (blocked: dev red on #1185, not ours)",
-        "next": f["run"]["next"],
-    } and f["run"]["next"].startswith("when #1185 merges")
+    ) * 2 + ("1",)
+    assert (f["issue"]["number"], f["depends"], f["waits_on"]) == (1036, ["foundation"], [777, 333])
+    assert f["run"]["action_id"] == "act-1a13eb691a3-wg4n"
+    assert f["run"]["stage"] == "5 finish (blocked: dev red on #1185, not ours)"
+    assert f["run"]["next"].startswith("when #1185 merges")
     layer = {t["id"]: t["layer"] for t in f["tasks"]}
     assert (layer["LK-12"], layer["LK-9"], layer["LK-1"]) == ("tests", "app", "model")
     assert layer["LK-3"] == "model"  # "same as LK-2a" takes LK-2a's files
     lk12 = next(t for t in f["tasks"] if t["id"] == "LK-12")
-    assert lk12 == {"id": "LK-12", "wave": "7", "layer": "tests", "pr": 1122, "state": "merged"}
+    assert lk12 == {
+        "id": "LK-12",
+        "wave": "7",
+        "layer": "tests",
+        "pr": 1122,
+        "state": "merged",
+        "files": ["UITests/HaloJourneyTests+Drag.swift"],
+    }
     assert f["layers"] == ["tests", "app", "model"]
     assert {"halo/halo-window", "halo/halo-services", "halo/halo-model-tests"} <= set(
         f["components"]
@@ -134,42 +132,28 @@ def test_status_first_rule_that_holds_wins(status, issue, run, prs, claimed, num
 
 
 def test_issue_closed_without_done_is_a_gap_kind():
-    assert ab.feature_status("planned", 1, {"state": "closed"}, None, [])[1] == [
-        "issue_closed_not_done"
-    ]
-    assert ab.feature_status("done", 1, {"state": "closed"}, None, [DONE_PR])[1] == []
+    closed = {"state": "closed"}
+    assert ab.feature_status("planned", 1, closed, None, [])[1] == ["issue_closed_not_done"]
+    assert ab.feature_status("done", 1, closed, None, [DONE_PR])[1] == []
 
 
 def test_feature_issue_must_be_a_number_to_count_as_filed():
-    for raw, num in (
-        ("#1036", 1036),
-        ("file when ready", None),
-        ("later", None),
-        ("#12 soon", None),
-    ):
+    for raw, num in {
+        "#1036": 1036,
+        "file when ready": None,
+        "later": None,
+        "#12 soon": None,
+    }.items():
         assert ab.parse_wave(f'{{"feature_issue": "{raw}"}}')["issue"] == num
     assert ab.parse_wave("[1]") is None and ab.parse_wave("{") is None
 
 
-@pytest.mark.parametrize(
-    "container,layer",
-    [
-        ("halo-tests", "tests"),
-        ("photo-journeys", "tests"),
-        ("halo-snapshots", "tests"),
-        ("app-audit", "tests"),
-        ("suiteui-tests", "tests"),
-        ("suiteui", "shell"),
-        ("suiteui-kit", "shell"),
-        ("suite-shell", "shell"),
-        ("afterglow-dock", "shell"),
-        ("halo-model", "model"),
-        ("suite-logic", "model"),
-        ("halo-app", "app"),
-        ("apps", "app"),
-        ("docs", "other"),
-    ],
-)
+LAYER_TABLE = """halo-tests:tests photo-journeys:tests halo-snapshots:tests app-audit:tests
+suiteui-tests:tests suiteui:shell suiteui-kit:shell suite-shell:shell afterglow-dock:shell
+halo-model:model suite-logic:model halo-app:app apps:app docs:other"""
+
+
+@pytest.mark.parametrize("container,layer", [p.split(":") for p in LAYER_TABLE.split()])
 def test_container_layer_first_match_wins(container, layer):
     assert ab.container_layer(container) == layer
     assert ab.container_layer(container, external=True) == "engine"
@@ -185,8 +169,7 @@ def test_task_layer_is_the_majority_of_its_non_test_files():
     app, model = "Sources/HaloApp/HaloWindow+Keys.swift", "Sources/HaloModel/HaloKeying.swift"
     assert place(app, "Tests/HaloModelTests/A.swift", "Tests/HaloModelTests/B.swift") == "app"
     assert place(model, app, "Sources/HaloApp/HaloLayerInspector.swift") == "app"
-    assert (
-        place("Tests/AppSnapshotTests/HaloX.swift", "UITests/HaloJourneyTests+X.swift") == "tests"
-    )
+    snap, journey = "Tests/AppSnapshotTests/HaloX.swift", "UITests/HaloJourneyTests+X.swift"
+    assert place(snap, journey) == "tests"  # no component owns them: the prefix rule places them
     assert place("Package.swift") == "other"
     assert place() == "unknown"

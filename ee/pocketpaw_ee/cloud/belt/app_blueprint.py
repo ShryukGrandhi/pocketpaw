@@ -1,25 +1,19 @@
 # ee/pocketpaw_ee/cloud/belt/app_blueprint.py — the Belt blueprint's pure derivation.
 #
-# Turns one app's planning files plus the GitHub and Belt evidence the caller
-# already read into the feature rows of ``GET /belt/blueprints``. No I/O, no
-# clock, no network: the readers (git, gh, the run store) live elsewhere and pass
-# text and rows in. Size caps and id validation belong to those readers.
+# Turns one app's planning files, plus the GitHub and Belt evidence the caller
+# already read, into the feature rows of ``GET /belt/blueprints``. No I/O, no
+# clock, no network; size caps and id validation belong to the readers.
 #
-#   parsers  ``parse_wave`` (a feature's ``.wave.json``), ``parse_record`` (a
-#            lead's RECORD.md: ``Stage:``/``Next:`` and the task table read by
-#            header name). The app's ``c4-planned.json`` goes through
-#            ``orient.load_model``. Unreadable input gives ``None`` fields, never a
-#            guessed value.
-#   layers   a container maps to tests, shell, model, app or other by id, first
-#            match wins; an external system's container is engine. A file under
-#            ``Tests/`` or ``UITests/`` is tests before any container lookup. A
-#            task sits on the layer most of its non-test files map to, else tests.
-#            A feature is placed by its ``owned`` paths, else its RECORD tasks,
-#            else "unknown".
-#   status   the first rule that holds wins (design doc, section 1): done, built,
-#            gap, stuck, building, filed, planned. The wave.json ``status`` is
-#            only the lead's claim; a built or done claim with no merged
-#            feature-done PR is the ``claimed_ahead`` gap.
+# Parsers: ``parse_wave`` (a feature's .wave.json) and ``parse_record`` (a lead's
+# RECORD.md, ``Stage:``/``Next:`` and the task table read by header name); the
+# app's c4-planned.json goes through ``orient.load_model``. Unreadable input gives
+# ``None`` fields, never a guess. Layers (design doc, section 3): a container maps
+# by id, first match wins, and an external system's is engine; a file under
+# ``Tests/`` or ``UITests/`` is tests first. A task sits where most of its non-test
+# files sit, a feature on its ``owned`` paths' layers, else its tasks', else
+# "unknown". Status (section 1): the first rule that holds wins; the wave.json
+# ``status`` is only a claim, and a built or done claim with no merged
+# feature-done PR is the ``claimed_ahead`` gap.
 
 from __future__ import annotations
 
@@ -29,13 +23,7 @@ import re
 from collections import Counter
 from typing import Any
 
-from pocketpaw_ee.cloud.belt.orient import (
-    PathIndex,
-    _dicts,
-    _owned_system,
-    component_for,
-    path_index,
-)
+from .orient import PathIndex, _dicts, _owned_system, component_for, path_index
 
 LAYERS = ("tests", "app", "shell", "model", "engine", "other")
 _LAYER_RULES = (
@@ -92,30 +80,20 @@ def parse_record(text: str | None) -> dict[str, Any]:
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if header is None:
-            header = (
-                [c.lower() for c in cells] if {"id", "files"} <= {c.lower() for c in cells} else []
-            )
+            names = [c.lower() for c in cells]
+            header = names if {"id", "files"} <= set(names) else []
             continue
         if not header or set(cells[0]) <= set("-: "):
             continue
         row = dict(zip(header, cells, strict=False))
-        same = re.match(r"same as (\S+)", row.get("files", ""))
-        files = (
-            files_of.get(same.group(1), [])
-            if same
-            else [f.strip() for f in row.get("files", "").split(",") if f.strip()]
-        )
-        pr = re.fullmatch(r"#(\d+)", row.get("pr", ""))
+        cell = row.get("files", "")
+        files = [f for f in map(str.strip, cell.split(",")) if f]
+        if same := re.match(r"same as (\S+)", cell):
+            files = files_of.get(same.group(1), [])
         files_of[row.get("id", "")] = files
-        tasks.append(
-            {
-                "id": row.get("id"),
-                "wave": row.get("wave") or None,
-                "files": files,
-                "pr": int(pr.group(1)) if pr else None,
-                "state": row.get("state") or None,
-            }
-        )
+        pr = re.fullmatch(r"#(\d+)", row.get("pr", ""))
+        task = {k: row.get(k) or None for k in ("id", "wave", "state")}
+        tasks.append(task | {"files": files, "pr": int(pr.group(1)) if pr else None})
     return {"stage": fields.get("Stage"), "next": fields.get("Next"), "tasks": tasks}
 
 
@@ -184,22 +162,16 @@ def feature_status(
         p.get("done") and p.get("state") == "MERGED" for p in [*prs, *(lead.get("prs") or [])]
     )
     ahead = claimed in ("built", "done") and not done_pr
-    if run.get("status") == "landed" or (closed and done_pr):
-        status = "done"
-    elif done_pr:
-        status = "built"
-    elif ahead or closed:
-        status = "gap"
-    elif (
-        "needs-human" in (issue.get("labels") or [])
-        or len(lead.get("stalls") or []) >= 2
-        or run.get("status") in _SETTLED
-    ):
-        status = "stuck"
-    elif run:
-        status = "building"
-    else:
-        status = "filed" if issue_number else "planned"
+    stuck = "needs-human" in (issue.get("labels") or []) or len(lead.get("stalls") or []) >= 2
+    rules = (
+        ("done", run.get("status") == "landed" or (closed and done_pr)),
+        ("built", done_pr),
+        ("gap", ahead or closed),
+        ("stuck", stuck or run.get("status") in _SETTLED),
+        ("building", bool(run)),
+        ("filed", issue_number is not None),
+    )
+    status = next((name for name, holds in rules if holds), "planned")
     gaps = ["claimed_ahead"] if ahead else []
     return status, gaps + (["issue_closed_not_done"] if closed and status != "done" else [])
 
@@ -217,31 +189,21 @@ def derive_feature(
     prs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """One feature row of the blueprint graph (``None``: unreadable wave.json).
-    ``model`` is the app's loaded c4-planned.json, ``tree`` dev's file paths."""
+    ``model`` is the app's loaded c4-planned.json, ``tree`` dev's file paths.
+    Each task carries its resolved ``files`` and its ``layer``."""
     wave = parse_wave(wave_text)
     if wave is None:
         return None
     rec = parse_record(record_text)
     index, layers = path_index(model), component_layers(model)
     owned = wave["owned"]
-    tasks, task_files = [], []
-    for t in rec["tasks"]:
-        files = resolve_files(t["files"], [*tree, *owned])
-        task_files += files
-        tasks.append(
-            {
-                "id": t["id"],
-                "wave": t["wave"],
-                "layer": task_layer(files, index, layers),
-                "pr": t["pr"],
-                "state": t["state"],
-            }
-        )
-    if owned:
-        placed = {file_layer(p, index, layers) for p in owned}
-    else:
-        placed = {t["layer"] for t in tasks} or {"unknown"}
-    comps = (component_for(p, index) for p in owned or task_files)
+    tasks = rec["tasks"]
+    for t in tasks:  # owned paths resolve tokens for files not on dev yet
+        t["files"] = resolve_files(t["files"], [*tree, *owned])
+        t["layer"] = task_layer(t["files"], index, layers)
+    placed = {file_layer(p, index, layers) for p in owned}
+    placed = placed or {t["layer"] for t in tasks} or {"unknown"}
+    comps = (component_for(p, index) for p in owned or [f for t in tasks for f in t["files"]])
     status, gaps = feature_status(wave["claimed"], wave["issue"], issue, run, prs or [])
     return {
         "id": f"{app}/{feature}",
