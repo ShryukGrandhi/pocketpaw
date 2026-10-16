@@ -11,11 +11,13 @@
 # auto gate's approve path, with the gate flag off or on. A task mandate (the
 # default) still goes to the foreman and the manual plan gate.
 # NEVER TWICE, UNTIL RE-ARMED: an issue labelled ``needs-human`` (live, off the
-# open issue list: the stall ladder and the lead timeout label it, then reject
-# the run) is not planned, nor is one whose lead run is still in flight or whose
-# lead failed outside that release path (never labelled). A released lead's
-# issue is planned again once a human takes the label off, and held again when
-# that lead is released too. A title naming another issue (``#12``)
+# open issue list: the station's releases label it, then reject the run) is not
+# planned, nor is one whose lead run is still in flight. A released lead's issue
+# is planned again once a human takes the label off, and held again when that
+# lead is released too. BREAKER: a failed lead is tried again until 3 failures
+# across all the issue's sightings (a re-filed issue keeps its count); then the
+# issue is labelled needs-human with a one-line reason, and a human removing the
+# label re-arms it for 3 more. A title naming another issue (``#12``)
 # is prefixed with its own number, so the lead is briefed on the right issue.
 # CLOUD ONLY: a lead mandate is refused (422) at create and at trigger unless
 # the cloud develop station is the wired dispatcher; the local station has no
@@ -166,16 +168,51 @@ def test_an_issue_labelled_needs_human_is_not_planned_again():
     assert _numbers(lead_planner.plan(1, [held, cleared, stale], 5)) == ["s2"]
 
 
-@pytest.mark.parametrize("status", ["develop failed", "failed"])
-def test_a_failed_lead_that_never_got_needs_human_is_held(status):
-    """A lead that died without the station's release path was never labelled
-    and nobody looked: no label to remove, so it stays held."""
-    failed = _s(1, "p1", age_h=5)
-    failed["tasks"] = [{"shift_no": 1, "title": "Feature 1", "status": status}]
-    failed["labels"] = ["feature-lead", "p1"]
-    landed_earlier = _s(2, "p2", age_h=4)
-    landed_earlier["tasks"] = [{"shift_no": 1, "title": "Feature 2", "status": "dispatched"}]
-    assert _numbers(lead_planner.plan(2, [failed, landed_earlier], 5)) == ["s2"]
+def _failed(n: int, runs: int, *, breaker_at: int = 0, live: tuple[str, ...] = ()) -> dict:
+    """Issue ``n`` whose leads failed ``runs`` times (``failed`` or ``develop
+    failed``, across all its sightings), its breaker last tripped at ``breaker_at``."""
+    s = _s(n, "p1", age_h=5)
+    s["failed"] = [f"run-{n}-{i}" for i in range(runs)]
+    s["breaker_at"] = breaker_at
+    s["labels"] = ["feature-lead", "p1", *live]
+    return s
+
+
+def test_a_failed_lead_is_tried_again_until_its_third_failure():
+    """Mutation: ``>= BREAKER`` as ``> BREAKER`` plans a third try; as ``>= 2``
+    holds after two."""
+    assert _numbers(lead_planner.plan(2, [_failed(1, 1), _failed(2, 2)], 5)) == ["s1", "s2"]
+    assert lead_planner.plan(4, [_failed(1, 3)], 5).no_action
+    assert lead_planner.plan(4, [_failed(1, 3, live=("needs-human",))], 5).no_action
+
+
+def test_a_tripped_breaker_names_the_issue_with_a_one_line_reason():
+    (trip,) = lead_planner.trips([_failed(1, 3), _failed(2, 2), _s(3, "p1")])
+    sighting, reason = trip
+    assert sighting["id"] == "s1"
+    assert reason.startswith("Belt: 3 feature lead attempts failed")
+    assert "run-1-0" in reason and "\n" not in reason
+    # Already labelled: nothing to trip, the label holds it.
+    assert lead_planner.trips([_failed(1, 3, live=("needs-human",))]) == []
+    # A sighting with no issue has nobody to label.
+    foreign = _failed(4, 3)
+    foreign["evidence"]["source"] = "support"
+    assert lead_planner.trips([foreign]) == []
+
+
+def test_a_human_re_arms_a_tripped_breaker_for_three_more_tries():
+    """The trip records how many failures it saw; taking ``needs-human`` off
+    re-arms the issue, and three more failures trip it again."""
+    assert _numbers(lead_planner.plan(5, [_failed(1, 3, breaker_at=3)], 5)) == ["s1"]
+    assert _numbers(lead_planner.plan(5, [_failed(1, 5, breaker_at=3)], 5)) == ["s1"]
+    assert lead_planner.plan(5, [_failed(1, 6, breaker_at=3)], 5).no_action
+    assert lead_planner.trips([_failed(1, 6, breaker_at=3)])
+
+
+def test_the_same_failed_run_counts_once():
+    s = _failed(1, 0)
+    s["failed"] = ["run-a", "run-a", "run-a"]
+    assert _numbers(lead_planner.plan(2, [s], 5)) == ["s1"]
 
 
 def _released(n: int, *statuses: str, live: tuple[str, ...]) -> dict:
@@ -201,13 +238,11 @@ def test_a_released_lead_a_human_re_armed_is_planned_again():
 
 def test_a_re_armed_lead_released_again_is_held_again():
     """No loop: the second release labels the issue again; only a second
-    removal frees it, and a re-armed lead that then failed stays held."""
+    removal frees it. Released runs never count toward the breaker."""
     again = _released(1, "rejected", "rejected", live=("needs-human",))
     assert lead_planner.plan(3, [again], 5).no_action
-    cleared = _released(2, "rejected", "rejected", live=())
+    cleared = _released(2, "rejected", "rejected", "rejected", live=())
     assert _numbers(lead_planner.plan(3, [cleared], 5)) == ["s2"]
-    died = _released(3, "rejected", "develop failed", live=())
-    assert lead_planner.plan(3, [died], 5).no_action
 
 
 def test_a_title_naming_another_issue_leads_with_its_own_number():
@@ -481,8 +516,9 @@ async def test_a_released_lead_is_held_until_a_human_re_arms_it(
     store,  # noqa: F811
 ):
     """#16's lead was released (labelled needs-human, run rejected), #11's
-    failed. Held while the label is on; a human takes it off and the next shift
-    plans #16 again, never #11. A second release holds #16 again."""
+    failed once. Held while the label is on; a human takes it off and the next
+    shift plans #16 again, beside #11's second try. A second release holds #16
+    again."""
     gh = _lead_gh()
     mid, ids = await _lead_mandate(
         tmp_path,
@@ -499,13 +535,13 @@ async def test_a_released_lead_is_held_until_a_human_re_arms_it(
     await _run_for(store, mid, plan_id, 2, headless_error="TRACK: gh pr list failed")
 
     second = await mandate_service.trigger_shift(WS, USER, mid)
-    assert await _plan_refs(store, second) == [[ids[10]], [ids[15]]]
-    for i in (1, 2):  # #10 and #15 go in flight
+    assert await _plan_refs(store, second) == [[ids[11]], [ids[10]]]
+    for i in (1, 2):  # #11 (its second try) and #10 go in flight
         await _run_for(store, mid, second["shift"]["plan_action_id"], i, headless_state="cloud")
 
     _label(monkeypatch, gh, 16, on=False)
     third = await mandate_service.trigger_shift(WS, USER, mid)
-    assert await _plan_refs(store, third) == [[ids[16]], [ids[17]]]
+    assert await _plan_refs(store, third) == [[ids[16]], [ids[15]]]
 
     again = await _run_for(store, mid, third["shift"]["plan_action_id"], 1, headless_state=None)
     _label(monkeypatch, gh, 16, on=True)
@@ -513,7 +549,111 @@ async def test_a_released_lead_is_held_until_a_human_re_arms_it(
     await _run_for(store, mid, third["shift"]["plan_action_id"], 2, headless_state="cloud")
 
     fourth = await mandate_service.trigger_shift(WS, USER, mid)
+    assert await _plan_refs(store, fourth) == [[ids[17]]]
+    await _run_for(store, mid, fourth["shift"]["plan_action_id"], 1, headless_state="cloud")
+
+    # A third release, re-armed again: releases never trip the breaker.
+    _label(monkeypatch, gh, 16, on=False)
+    fifth = await mandate_service.trigger_shift(WS, USER, mid)
+    third_try = await _run_for(store, mid, fifth["shift"]["plan_action_id"], 1)
+    await store.reject(third_try.id, reason="feature lead silent 30m after two nudges")
+    sixth = await mandate_service.trigger_shift(WS, USER, mid)
+    assert await _plan_refs(store, sixth) == [[ids[16]]]
+
+
+class FlagGh(FakeGh):
+    """``FakeGh`` that also takes the breaker's label and comment writes."""
+
+    async def __call__(self, argv: list[str]) -> tuple[int, str, str]:
+        if argv[:3] in (["gh", "issue", "comment"], ["gh", "issue", "edit"]) or argv[:2] == [
+            "gh",
+            "label",
+        ]:
+            self.calls.append(list(argv))
+            return 0, "", ""
+        return await super().__call__(argv)
+
+
+def _comments(gh: FakeGh, n: int) -> list[str]:
+    return [a[-1] for a in gh.calls if a[:4] == ["gh", "issue", "comment", str(n)]]
+
+
+@pytest.mark.usefixtures("graph", "journal", "cloud_station_wired")
+async def test_a_re_filed_issue_keeps_its_failures_and_trips_the_breaker(
+    tmp_path,
+    mongo_db,
+    monkeypatch,
+    store,  # noqa: F811
+):
+    """#11 failed twice under a sighting the patrol then resolved (once kept on
+    the sighting, once a run citing it), and the issue was re-filed as a new
+    sighting. Its next failure trips the breaker: #11 is labelled needs-human
+    with a one-line reason and held. Held again while the label is on (no
+    second comment); a human taking it off re-arms it. Mutation: counting only
+    the free sighting's own runs plans a fourth try."""
+    gh = FlagGh(_lead_gh().issues, states={13: "CLOSED", 412: "OPEN"}, views={11: {"labels": []}})
+    gh.prs = [{"number": 160, "body": "Fixes #14"}]
+    mid, ids = await _lead_mandate(
+        tmp_path,
+        monkeypatch,
+        gh,
+        run_kind="feature-lead",
+        budget={"max_tasks_per_shift": 2, "max_in_flight": 10},
+    )
+    old = await SightingDoc.get(ids[11])
+    old.evidence = {**old.evidence, "lead_failed": ["old-a"]}
+    await old.save()
+    first = await mandate_service.trigger_shift(WS, USER, mid)
+    assert await _plan_refs(store, first) == [[ids[16]], [ids[11]]]
+    await _run_for(store, mid, first["shift"]["plan_action_id"], 1, headless_state="cloud")
+    await _run_for(store, mid, first["shift"]["plan_action_id"], 2, headless_error="LAUNCH: x")
+    refiled = SightingDoc(
+        workspace=WS,
+        mandate_id=mid,
+        patrol=old.patrol,
+        severity=old.severity,
+        summary=old.summary,
+        evidence={k: v for k, v in old.evidence.items() if k != "lead_failed"},
+        ts=old.ts,
+    )
+    old.resolved_by_run = "patrol:issue-left-line"
+    await old.save()
+    await refiled.insert()
+
+    second = await mandate_service.trigger_shift(WS, USER, mid)
+    assert await _plan_refs(store, second) == [[str(refiled.id)], [ids[10]]]  # 2 < 3: tried
+    await _run_for(store, mid, second["shift"]["plan_action_id"], 1, headless_error="LAUNCH: y")
+    await _run_for(store, mid, second["shift"]["plan_action_id"], 2, headless_state="cloud")
+
+    third = await mandate_service.trigger_shift(WS, USER, mid)
+    assert await _plan_refs(store, third) == [[ids[15]], [ids[17]]]
+    (reason,) = _comments(gh, 11)
+    assert reason.startswith("Belt: 3 feature lead attempts failed (") and "old-a" in reason
+    assert ["gh", "issue", "edit", "11", "-R", SLUG, "--add-label", "needs-human"] in gh.calls
+    kept = (await SightingDoc.get(refiled.id)).evidence
+    assert len(kept["lead_failed"]) == 3 and kept["lead_breaker_at"] == 3
+    for i in (1, 2):
+        await _run_for(store, mid, third["shift"]["plan_action_id"], i, headless_state="cloud")
+
+    _label(monkeypatch, gh, 11, on=True)
+    fourth = await mandate_service.trigger_shift(WS, USER, mid)
     assert fourth["shift"]["state"] == "stood_down"
+    assert len(_comments(gh, 11)) == 1
+
+    _label(monkeypatch, gh, 11, on=False)  # a human re-arms it
+    fifth = await mandate_service.trigger_shift(WS, USER, mid)
+    assert await _plan_refs(store, fifth) == [[str(refiled.id)]]
+
+
+async def test_the_breaker_flag_counts_a_label_already_on():
+    """The cached open list said no label, the issue has it: no second
+    comment, and the trip is kept (True)."""
+    gh = FlagGh([], views={11: {"labels": [{"name": "needs-human"}]}})
+    assert await patrols.flag_needs_human(f"github:{SLUG}#11", "why", gh=gh) is True
+    assert not _comments(gh, 11)
+    gh.views = {11: {"labels": []}}
+    assert await patrols.flag_needs_human(f"github:{SLUG}#11", "why", gh=gh) is True
+    assert _comments(gh, 11) == ["why"]
 
 
 @pytest.mark.usefixtures("store", "graph", "journal", "cloud_station_wired")

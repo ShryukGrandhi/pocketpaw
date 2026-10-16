@@ -646,5 +646,104 @@
     "tests": [
       "tests/cloud/test_belt_lead_runs.py::test_a_feature_without_slices_keeps_the_v2_rule"
     ]
+  },
+  {
+    "label": "the rebase hint fires at the threshold",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "                behind=behind if behind > self.lead_rebase_behind else 0,",
+    "replace": "                behind=behind if behind >= self.lead_rebase_behind else 0,",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "the brief never asks for a rebase",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "                behind=behind if behind > self.lead_rebase_behind else 0,",
+    "replace": "                behind=0,",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "the hard limit refuses at the limit",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "            if behind > self.lead_refuse_behind:",
+    "replace": "            if behind >= self.lead_refuse_behind:",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "a stale lead branch launches anyway",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "            if behind > self.lead_refuse_behind:",
+    "replace": "            if False:",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "a refused launch is a develop failure",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "            except StaleBaseError as exc:\n                await self._refuse(store, run_ref, blob, exc)\n                return\n",
+    "replace": "            except StaleBaseError:\n                raise\n",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "a refused relaunch is a failed rung",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "            except StaleBaseError as exc:\n                await self._refuse(store, run_ref, blob, exc)\n                return False\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "a refusal is not labelled",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "        await self._flag_issue(exc.slug, issue, cwd)\n        await self._release(store, run_ref, blob, str(exc))",
+    "replace": "        await self._release(store, run_ref, blob, str(exc))",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "a refusal leaves no note",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "        argv = [\"gh\", \"issue\", \"comment\", issue, \"-R\", exc.slug, \"--body\", str(exc)]",
+    "replace": "        argv = [\"true\"]",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "the lead branch is measured from the wrong end",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "        argv = [*_GIT, \"rev-list\", \"--count\", f\"{ref}..origin/{base}\"]",
+    "replace": "        argv = [*_GIT, \"rev-list\", \"--count\", f\"origin/{base}..{ref}\"]",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "a missing lead branch is still measured",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "        if (await self.runner(argv, cwd=launch, timeout=120.0))[0] != 0:\n            return 0\n",
+    "replace": "        await self.runner(argv, cwd=launch, timeout=120.0)\n",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
+  },
+  {
+    "label": "the stale-base settings ignore the env",
+    "file": "ee/pocketpaw_ee/cloud/belt/cloud_station.py",
+    "find": "        lead_refuse_behind=int(_env_float(\"POCKETPAW_FACTORY_CLOUD_LEAD_REFUSE_BEHIND\", 150)),\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_lead_runs.py"
+    ]
   }
 ]

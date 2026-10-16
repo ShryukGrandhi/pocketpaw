@@ -32,6 +32,10 @@
 # TIMEOUT: 8 h from the launch (from the last progress while waiting), and no 1 h
 # no-PR rule; a timed-out lead is labelled ``needs-human`` and released like the
 # ladder's last rung.
+# STALE BASE: a ``lead/<feature>`` on origin more than 40 commits behind the base
+# gets a rebase-first rule in the brief; more than 150 and the launch or relaunch
+# is refused: a note and ``needs-human`` on the issue, the run released (never a
+# develop failure). No lead branch yet is nothing to measure.
 # RESUME: a launched lead is tracked again as a lead, never relaunched.
 # LESSON 42: a transient gh failure is retried with backoff; a permanent one
 # fails at once; a transient one past the retries ends the tracker.
@@ -174,6 +178,10 @@ class LeadRunner:
         self.record = ""  # RECORD.md on the lead branch, read with its last commit
         # Base-branch runs the stall check reads: a list, or a function of the wall.
         self.base_runs = base_runs or []
+        # ``git rev-list --count lead/<f>..origin/<base>``, one per launch; and
+        # whether ``lead/<f>`` is on origin at all (a first launch: not yet).
+        self.behind = [0]
+        self.lead_branch = True
 
     @staticmethod
     def _next(seq: list):
@@ -185,6 +193,10 @@ class LeadRunner:
             return 0, f"https://github.com/{SLUG}.git\n", ""
         if "rev-parse" in argv and "HEAD" in argv and "--abbrev-ref" not in argv:
             return 0, f"{HEAD_SHA}\n", ""
+        if "rev-list" in argv:
+            return 0, f"{self._next(self.behind)}\n", ""
+        if "fetch" in argv and any(a.startswith("+refs/heads/lead/") for a in argv):
+            return (0, "", "") if self.lead_branch else (128, "", "couldn't find remote ref")
         if "-p" in argv and "--cloud" in argv:
             self.locked_at_nudge.append(cloud_station._LAUNCH_LOCK.locked())
             code = self._next(self.nudge_codes)
@@ -310,6 +322,68 @@ async def test_lead_brief_is_the_playbook_plus_the_run_and_the_rules(store, dirs
     # Launched like every cloud run: under the pty, from the clone at origin/dev.
     launch_argv = next(a for a, _ in runner.calls if "--cloud" in a)
     assert launch_argv[1] == cloud_station.PTY_RUN
+
+
+def _rev_lists(runner: LeadRunner) -> list[list[str]]:
+    return [a for a, _ in runner.calls if "rev-list" in a]
+
+
+@pytest.mark.parametrize("behind", [40, 41])
+async def test_a_lead_branch_behind_its_base_is_told_to_rebase_first(store, dirs, playbook, behind):
+    """Past ``lead_rebase_behind`` (40) the brief's first rule is a rebase.
+    Mutation: ``>`` as ``>=`` hints at 40."""
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = _done_runner(run_ref)
+    runner.behind = [behind]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    (brief,) = _launch_briefs(runner)
+    (count,) = _rev_lists(runner)
+    assert count[-1] == f"refs/remotes/origin/lead/{FEATURE}..origin/dev"
+    hint = f"rebase lead/{FEATURE} onto origin/dev: it is {behind} commits behind"
+    assert (hint in brief) == (behind > 40)
+
+
+@pytest.mark.parametrize(("behind", "refused"), [(150, False), (151, True)])
+async def test_a_lead_branch_past_the_hard_limit_is_refused_not_failed(
+    store, dirs, playbook, behind, refused
+):
+    """Past ``lead_refuse_behind`` (150) no session starts: the issue gets the
+    note and ``needs-human``, and the run is released (rejected), never a
+    develop failure, so the breaker does not count it."""
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = _done_runner(run_ref)
+    runner.behind = [behind]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    notes = [a[-1] for a, _ in runner.calls if a[:3] == ["gh", "issue", "comment"]]
+    if not refused:
+        assert _launch_briefs(runner) and not notes
+        assert action.status == ActionStatus.EXECUTED
+        return
+    assert not _launch_briefs(runner)
+    note = f"Belt: lead/{FEATURE} is 151 commits behind dev (over 150)"
+    assert [n.startswith(note) for n in notes] == [True]
+    assert any(a[:3] == ["gh", "issue", "edit"] and "needs-human" in a for a, _ in runner.calls)
+    assert action.status == ActionStatus.REJECTED
+    assert action.rejected_reason.startswith(note)
+    assert "headless_error" not in action.parameters["_code_change"]
+
+
+async def test_a_first_launch_has_no_lead_branch_to_measure(store, dirs, playbook):
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = _done_runner(run_ref)
+    runner.lead_branch, runner.behind = False, [999]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert not _rev_lists(runner) and len(_launch_briefs(runner)) == 1
 
 
 async def test_lead_git_identity_comes_from_the_dispatcher(store, dirs, playbook):
@@ -541,6 +615,23 @@ async def test_silent_lead_is_nudged_then_relaunched_then_flagged(store, dirs, p
     ]
     gaps = [b["at"] - a["at"] for a, b in zip(lead["stalls"], lead["stalls"][1:], strict=False)]
     assert all(g >= 1800 for g in gaps)  # each step waits a full stall window
+
+
+async def test_a_relaunch_on_a_stale_lead_branch_is_refused(store, dirs, playbook):
+    """The base moved on while the lead was silent: the relaunch is refused like
+    a launch, released with the note, and no second session starts."""
+    repo, launch = dirs
+    run_ref = await _queue_lead(store, repo)
+    runner = LeadRunner()
+    runner.behind = [3, 151]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert len(_launch_briefs(runner)) == 1 and len(_rev_lists(runner)) == 2
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.REJECTED
+    assert action.rejected_reason.startswith(f"Belt: lead/{FEATURE} is 151 commits behind dev")
+    assert "headless_error" not in action.parameters["_code_change"]
 
 
 async def test_lead_activity_holds_off_the_stall(store, dirs, playbook):
@@ -818,6 +909,8 @@ async def test_lead_timeouts_read_the_env(monkeypatch, tmp_path):
     monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_LEAD_TIMEOUT", "100")
     monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_LEAD_STALL", "50")
     monkeypatch.setenv("POCKETPAW_FACTORY_LEAD_GIT_NAME", "Pat Lead")
+    monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_LEAD_REBASE_BEHIND", "7")
+    monkeypatch.setenv("POCKETPAW_FACTORY_CLOUD_LEAD_REFUSE_BEHIND", "9")
     seen: list[CloudTaskDispatcher] = []
     monkeypatch.setattr("pocketpaw_ee.cloud.belt.headless.set_production_dispatcher", seen.append)
 
@@ -826,7 +919,12 @@ async def test_lead_timeouts_read_the_env(monkeypatch, tmp_path):
     (disp,) = seen
     assert disp.lead_timeout_seconds == 100 and disp.lead_stall_seconds == 50
     assert disp.lead_git_name == "Pat Lead"
+    assert (disp.lead_rebase_behind, disp.lead_refuse_behind) == (7, 9)
     assert CloudTaskDispatcher().lead_timeout_seconds == 8 * 3600
+    assert (CloudTaskDispatcher().lead_rebase_behind, CloudTaskDispatcher().lead_refuse_behind) == (
+        40,
+        150,
+    )
     assert CloudTaskDispatcher().lead_stall_seconds == 1800
 
 

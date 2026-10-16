@@ -1366,7 +1366,13 @@ async def trigger_shift(workspace_id: str, user_id: str, mandate_id: str) -> dic
         # A lead line plans without the foreman: one feature-lead run per free
         # feature issue, p1 first, then oldest, up to the shift's budget.
         plan = await _lead_plan(
-            workspace_id, mandate_id, shift_no, free, capacity["budget"], doc.surface.repo_id
+            workspace_id,
+            mandate_id,
+            shift_no,
+            free,
+            capacity["budget"],
+            doc.surface.repo_id,
+            backlog["tasks"],
         )
         # The cloud station owns the lead recipe; the charter declares no command.
         charter_wire = {
@@ -1884,11 +1890,17 @@ async def _lead_plan(
     free: list[dict[str, Any]],
     budget: int,
     repo_id: str,
+    tasks: list[dict[str, Any]],
 ) -> Any:
     """The lead planner's plan (``lead_planner.plan``) over the ``free`` backlog
     entries, read back as their sightings for the issue's title, labels and age,
-    each with its citing tasks and its issue's LIVE labels off the bound repo's
-    cached open issue list (``needs-human`` lands after the sighting is filed)."""
+    each with its issue's LIVE labels off the bound repo's cached open issue list
+    (``needs-human`` lands after the sighting is filed) and its breaker count:
+    the failed lead runs citing ANY sighting of the same issue (``tasks``, the
+    backlog's) plus the ones kept on those sightings (``lead_failed``), so a
+    re-filed issue keeps its count. The union is written back on the sighting.
+    An issue whose breaker trips is labelled ``needs-human`` with the reason,
+    and the count at the trip is kept as ``lead_breaker_at``."""
     from pocketpaw_ee.cloud.mandates import lead_planner
     from pocketpaw_ee.cloud.mandates import patrols as mandate_patrols
 
@@ -1901,21 +1913,46 @@ async def _lead_plan(
         for r in await mandate_patrols.open_issues(repo_id)
         if isinstance(r.get("number"), int) and isinstance(r.get("labels"), list)
     }
-    sightings = []
+    by_source: dict[str, list[SightingDoc]] = {}
     for d in docs:
-        entry = entries.get(str(d.id))
-        if entry is None:
+        by_source.setdefault(str(d.evidence.get("source") or d.id), []).append(d)
+    sightings, by_id = [], {}
+    for d in docs:
+        if str(d.id) not in entries:
             continue
-        number = str(d.evidence.get("source") or "").rpartition("#")[2]
+        source = str(d.evidence.get("source") or "")
+        same = by_source.get(source or str(d.id), [d])
+        ids = {str(x.id) for x in same}
+        failed = {str(r) for x in same for r in x.evidence.get("lead_failed") or []}
+        failed |= {
+            str(t["run_id"])
+            for t in tasks
+            if t.get("run_id")
+            and t["status"] in lead_planner.FAILED
+            and ids & set(t["evidence_refs"])
+        }
+        if sorted(failed) != d.evidence.get("lead_failed", []):
+            # no-event: the breaker's bookkeeping on the sighting row.
+            d.evidence = {**d.evidence, "lead_failed": sorted(failed)}
+            await d.save()
+        number = source.rpartition("#")[2]
         sightings.append(
             {
                 "id": str(d.id),
                 "evidence": dict(d.evidence or {}),
                 "ts": d.ts,
                 "labels": live.get(int(number)) if number.isdigit() else None,
-                "tasks": list(entry.get("tasks") or []),
+                "failed": sorted(failed),
+                "breaker_at": max(int(x.evidence.get("lead_breaker_at") or 0) for x in same),
             }
         )
+        by_id[str(d.id)] = d
+    for s, reason in lead_planner.trips(sightings):
+        if await mandate_patrols.flag_needs_human(s["evidence"]["source"], reason):
+            d = by_id[s["id"]]
+            # no-event: the trip's count, so a human removing the label re-arms it.
+            d.evidence = {**d.evidence, "lead_breaker_at": len(s["failed"])}
+            await d.save()
     return lead_planner.plan(shift_no, sightings, budget)
 
 
