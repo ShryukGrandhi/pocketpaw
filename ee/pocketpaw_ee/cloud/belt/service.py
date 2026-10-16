@@ -26,8 +26,8 @@
 #     ``headless_error`` / ``headless_state`` / ``redevelop``) are read
 #     STRUCTURALLY off the blob; ``error`` is the failure reason (``Action.error``, else
 #     ``headless_error``); ``lead`` is a feature lead's feature, PRs, session and
-#     stall counts and contact sheet, off the cloud station's ``lead`` blob (null on
-#     a task run). The mandates digest reads this same list.
+#     stall counts, contact sheet and per-slice state, off the cloud station's ``lead``
+#     blob (null on a task run). The mandates digest reads this same list.
 #   * ``save_run_feed`` / ``get_run_feed`` — a run stage's step feed (what one
 #     station step did), one ``BeltRunFeed`` row per (workspace, run, stage),
 #     kept out of the Action blob that ``list_runs`` reads in bulk. The read
@@ -791,14 +791,15 @@ _PACKET_APP = re.compile(r"docs/blueprints/([\w.-]+)/features/")
 def _lead_row(blob: dict[str, Any]) -> dict[str, Any] | None:
     """A feature lead's progress, read off the ``lead`` dict the cloud station's
     tracker writes (``feature`` / ``packet`` / ``issue`` / ``branch`` / ``prs`` /
-    ``sessions`` / ``stalls`` / ``contact_sheet``); ``None`` on a task run. A lead
+    ``sessions`` / ``stalls`` / ``contact_sheet`` / ``slices``, a v3 lead's
+    ``{id, done, run, gaps, pr}`` per slice); ``None`` on a task run. A lead
     still queued (no launch, so no ``lead`` dict yet) reads with empty fields."""
     if blob.get("recipe") != _LEAD_RECIPE:
         return None
     lead = blob.get("lead")
     lead = lead if isinstance(lead, dict) else {}
     app = _PACKET_APP.match(str(lead.get("packet") or ""))
-    prs = lead.get("prs")
+    prs, slices = lead.get("prs"), lead.get("slices")
     return {
         "feature": lead.get("feature") or None,
         "app": app.group(1) if app else None,
@@ -808,6 +809,7 @@ def _lead_row(blob: dict[str, Any]) -> dict[str, Any] | None:
         "sessions": len(lead.get("sessions") or []),
         "stalls": len(lead.get("stalls") or []),
         "contact_sheet": lead.get("contact_sheet") or None,
+        "slices": [s for s in slices if isinstance(s, dict)] if isinstance(slices, list) else [],
     }
 
 

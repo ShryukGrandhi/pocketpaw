@@ -29,6 +29,8 @@ _LAYER_RULES = (
     ("app", re.compile(r".*-app|apps")),
 )
 _FIELD = re.compile(r"^(Stage|Next):[ \t]*(\S.*?)[ \t]*$", re.M)
+# A packet slice id (``contract``, ``S1``): what Belt builds lines and argv from.
+SLICE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 _SETTLED = {"landed", "rejected", "failed"}
 
 
@@ -89,6 +91,44 @@ def parse_record(text: str | None) -> dict[str, Any]:
         task = {k: row.get(k) or None for k in ("id", "wave", "state")}
         tasks.append(task | {"files": files, "pr": int(pr.group(1)) if pr else None})
     return {"stage": fields.get("Stage"), "next": fields.get("Next"), "tasks": tasks}
+
+
+def parse_slices(text: str | None) -> list[dict[str, Any]]:
+    """A packet's Slices table (the first table whose header has ``slice`` and
+    ``tasks``), one row per slice: ``id`` and ``behavior``, and ``tasks``,
+    ``journeys`` and ``waits`` as lists (``–`` is none). Backticks and bold are
+    stripped; ids are NOT validated (``SLICE_ID`` is the caller's). [] with none."""
+    rows: list[dict[str, Any]] = []
+    header: list[str] | None = None
+    for line in (text or "").splitlines():
+        if not line.startswith("|"):
+            if rows:
+                break  # the table ended
+            header = None
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if header is None:
+            names = [c.lower() for c in cells]
+            header = names if {"slice", "tasks"} <= set(names) else []
+            continue
+        if not header or set(cells[0]) <= set("-: "):
+            continue
+        row = dict(zip(header, cells, strict=False))
+
+        def items(key: str, row: dict[str, str] = row) -> list[str]:
+            parts = (p.strip(" `*") for p in re.split(r"[,;]", row.get(key, "")))
+            return [p for p in parts if p not in {"", "–", "-"}]
+
+        rows.append(
+            {
+                "id": row["slice"].strip(" `*"),
+                "behavior": row.get("behavior") or None,
+                "tasks": items("tasks"),
+                "journeys": items("journeys"),
+                "waits": items("waits on"),
+            }
+        )
+    return rows
 
 
 def resolve_files(tokens: list[str], tree: list[str]) -> list[str]:
