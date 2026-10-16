@@ -78,12 +78,27 @@ def test_reels_hold_to_fifteen_to_twenty_seconds(duration, kept):
 
 
 def test_the_brief_names_every_figure_in_both_prompts():
-    from pocketpaw_ee.agent.mcp_servers.ripple_beats import RIPPLE_BEATS_BRIEF
+    from pocketpaw_ee.agent.mcp_servers.ripple_beats import REEL_DIAGRAM_BRIEF
     from pocketpaw_ee.cloud.growth.social.ideas import _MEDIA_BRIEFS
 
-    reel = _MEDIA_BRIEFS["reel"].format(size="1080x1920", ripple=RIPPLE_BEATS_BRIEF)
-    for prompt in (reel, ADD_MOTION_GRAPHIC_DESCRIPTION):
-        assert 'data-ripple="figure"' in prompt and 'data-ripple="iso-scene"' in prompt
-        assert 'data-ripple="anatomy"' in prompt
-        assert all(fid in prompt for fid in FIGURE_ANCHORS)
+    prompt = ADD_MOTION_GRAPHIC_DESCRIPTION
+    assert 'data-ripple="figure"' in prompt and 'data-ripple="iso-scene"' in prompt
+    assert 'data-ripple="anatomy"' in prompt
+    assert all(fid in prompt for fid in FIGURE_ANCHORS)
+
+    reel = _MEDIA_BRIEFS["reel"].format(size="1080x1920", ripple=REEL_DIAGRAM_BRIEF)
+    assert 'data-ripple="anatomy"' in reel
+    assert 'data-ripple="figure"' not in reel and 'data-ripple="iso-scene"' not in reel
     assert "15 to 20 second" in reel
+
+
+def test_growth_reels_draw_an_anatomy_reveal_and_nothing_else():
+    from pocketpaw_ee.cloud.growth.social.domain import SocialIdea, SocialProfile
+    from pocketpaw_ee.cloud.growth.social.ideas import build_media_prompt
+
+    profile = SocialProfile(id="p", workspace_id="w", company_name="Acme")
+    idea = SocialIdea(id="i", workspace_id="w", format="reel", hook="Why old sash windows rattle")
+    prompt = build_media_prompt(profile, idea, "reel")
+    assert 'data-ripple="anatomy"' in prompt
+    assert 'data-ripple="iso-scene"' not in prompt
+    assert 'data-ripple="figure"' not in prompt

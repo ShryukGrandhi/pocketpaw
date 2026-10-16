@@ -13,8 +13,9 @@
 # unknown formats are normalised (``hook-demo`` → ``hook_demo``) or dropped,
 # hashtags get a leading ``#``, and an unreadable answer is zero ideas, which
 # the service turns into a 502. The same agent draws an idea's media: a poster
-# (sanitised SVG) or a 15-20 s reel (a HyperFrames composition, optionally with
-# a Ripple explainer figure as one beat; ``clean_reel`` enforces the length).
+# (sanitised SVG) or a 15-20 s reel (a HyperFrames composition built around one
+# Ripple anatomy reveal of the post's physical object; ``clean_reel`` enforces
+# the length).
 
 from __future__ import annotations
 
@@ -293,9 +294,10 @@ _MEDIA_BRIEFS = {
         'window.__timelines = window.__timelines || {{}}; window.__timelines["main"] = tl; '
         "brand-toned colours, no <audio>, every asset inline or absolute https. Tell it with "
         "a diagram, not text: a hook of at most six words for the first two seconds, then one "
-        "explainer diagram (below; it is required) filling most of the frame from about two "
-        "seconds until the last two, building itself and then revealing its pins every two "
-        "to three seconds so they carry the story, then a closing line of at most six words. "
+        "anatomy reveal (below; it is required) filling most of the frame from about two "
+        "seconds until the last two: it tumbles in, comes apart, reveals its pins one at a "
+        "time while apart so they carry the story, and snaps back together near the end; "
+        "then a closing line of at most six words. "
         "No other on-screen text, no paragraphs, no bullet lists. Answer with only the "
         "HTML.\n\n{ripple}"
     ),
@@ -319,10 +321,10 @@ MAX_EDITED_POSTER_CHARS = 2_000_000
 
 
 def build_media_prompt(profile: SocialProfile, idea: SocialIdea, kind: str) -> str:
-    from pocketpaw_ee.agent.mcp_servers.ripple_beats import RIPPLE_BEATS_BRIEF
+    from pocketpaw_ee.agent.mcp_servers.ripple_beats import REEL_DIAGRAM_BRIEF
 
     size = _POSTER_SIZES.get(idea.platform, "1080x1080")
-    lines = [_MEDIA_BRIEFS[kind].format(size=size, ripple=RIPPLE_BEATS_BRIEF), "", "<post>"]
+    lines = [_MEDIA_BRIEFS[kind].format(size=size, ripple=REEL_DIAGRAM_BRIEF), "", "<post>"]
     lines.append(f"Company: {fence(profile.company_name) or '(not given)'}")
     if profile.analysis is not None and profile.analysis.tone:
         lines.append(f"Tone: {fence(profile.analysis.tone)}")
