@@ -52,9 +52,7 @@ the root and the timeline; fix whatever it names.
 
 When the user wants to show how something works, one beat can be a live
 Ripple drawing: an `iso-scene` you describe as parts and motions (any
-product, machine, building part or process), an `anatomy` product reveal
-(one physical product built from its real parts, which tumbles in, explodes,
-pins its labels and snaps back), or one of the curated figures
+product, machine, building part or process), or one of the curated figures
 (heart, bike gears, rocket engine, ion thruster, tokamak, fission reactor,
 particle collider). Write only the host element from the add_motion_graphic
 description; the render draws it frame by frame, so the source stays small.

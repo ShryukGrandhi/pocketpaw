@@ -1,6 +1,7 @@
 # tests/ee/agent/test_ripple_beats.py — Ripple explainer diagrams in HyperFrames
 # compositions: the pre-dispatch check, the 15-20 s reel window, and the brief
-# reaching both the Studio tool and the Growth reel prompt.
+# reaching the Studio tool. Reels carry an anatomy film, not Ripple
+# (test_anatomy_film.py), so the reel paths here include one.
 from __future__ import annotations
 
 import json
@@ -30,25 +31,19 @@ ISO = {"parts": [{"id": "ring", "kind": "gear", "at": [0, 0, 30], "r": 22}], "mo
 SCENE = (
     f'<div data-ripple="iso-scene"><script type="application/json">{json.dumps(ISO)}</script></div>'
 )
-PRODUCT = {
-    "parts": [
-        {"id": "shell", "kind": "box", "at": [0, 0, 0], "w": 70, "d": 8, "h": 150},
-        {"id": "battery", "kind": "box", "at": [0, 0, 20], "w": 50, "d": 4, "h": 80, "group": "in"},
-    ],
-    "assemblies": [{"id": "in", "dir": "front", "travel": 40}],
-    "labels": [{"part": "battery", "label": "Battery"}],
-}
-ANATOMY = (
-    '<div data-ripple="anatomy" data-ripple-for="10"><script type="application/json">'
-    f"{json.dumps(PRODUCT)}</script></div>"
+FILM = (
+    '<div data-anatomy-film data-start="2" data-duration="12"><script type="application/json">'
+    + json.dumps({"parts": [{"id": "body", "kind": "box", "at": [0, 0, 0], "w": 60}]})
+    + "</script></div>"
 )
 
 
 def test_known_hosts_pass_and_reach_the_render():
-    html = comp(FIGURE + SCENE + ANATOMY)
+    html = comp(FIGURE + SCENE)
     shape, error = validate_motion_graphic(html, 30)
     assert error is None and shape["durationS"] == 18
-    assert clean_reel(html) == html
+    reel = comp(FIGURE + SCENE + FILM)
+    assert clean_reel(reel) == reel
 
 
 @pytest.mark.parametrize(
@@ -58,12 +53,6 @@ def test_known_hosts_pass_and_reach_the_render():
         ('<div data-ripple="figure"></div>', "not a Ripple figure"),
         ('<div data-ripple="iso-scene"><script type="application/json">{x</script></div>', "JSON"),
         ('<div data-ripple="iso-scene"></div>', "JSON"),
-        ('<div data-ripple="anatomy"></div>', "JSON"),
-        (
-            '<div data-ripple="anatomy"><script type="application/json">'
-            '{"parts":[{"kind":"torus"}]}</script></div>',
-            "box, cylinder, ball",
-        ),
         ('<div data-ripple="chart"></div>', "unknown"),
     ],
 )
@@ -74,31 +63,10 @@ def test_bad_hosts_are_refused_with_a_fix(body, needle):
 
 @pytest.mark.parametrize(("duration", "kept"), [(10, False), (15, True), (20, True), (21, False)])
 def test_reels_hold_to_fifteen_to_twenty_seconds(duration, kept):
-    assert bool(clean_reel(comp(duration=duration))) is kept
+    assert bool(clean_reel(comp(FILM, duration=duration))) is kept
 
 
-def test_the_brief_names_every_figure_in_both_prompts():
-    from pocketpaw_ee.agent.mcp_servers.ripple_beats import REEL_DIAGRAM_BRIEF
-    from pocketpaw_ee.cloud.growth.social.ideas import _MEDIA_BRIEFS
-
+def test_the_brief_names_every_figure_in_the_studio_tool():
     prompt = ADD_MOTION_GRAPHIC_DESCRIPTION
     assert 'data-ripple="figure"' in prompt and 'data-ripple="iso-scene"' in prompt
-    assert 'data-ripple="anatomy"' in prompt
     assert all(fid in prompt for fid in FIGURE_ANCHORS)
-
-    reel = _MEDIA_BRIEFS["reel"].format(size="1080x1920", ripple=REEL_DIAGRAM_BRIEF)
-    assert 'data-ripple="anatomy"' in reel
-    assert 'data-ripple="figure"' not in reel and 'data-ripple="iso-scene"' not in reel
-    assert "15 to 20 second" in reel
-
-
-def test_growth_reels_draw_an_anatomy_reveal_and_nothing_else():
-    from pocketpaw_ee.cloud.growth.social.domain import SocialIdea, SocialProfile
-    from pocketpaw_ee.cloud.growth.social.ideas import build_media_prompt
-
-    profile = SocialProfile(id="p", workspace_id="w", company_name="Acme")
-    idea = SocialIdea(id="i", workspace_id="w", format="reel", hook="Why old sash windows rattle")
-    prompt = build_media_prompt(profile, idea, "reel")
-    assert 'data-ripple="anatomy"' in prompt
-    assert 'data-ripple="iso-scene"' not in prompt
-    assert 'data-ripple="figure"' not in prompt

@@ -1,20 +1,15 @@
 # ee/agent/mcp_servers/ripple_beats.py — Ripple explainer diagrams inside a
-# HyperFrames composition: the briefs the agent writes them from, and the check
-# that runs before a composition is dispatched. RIPPLE_BEATS_BRIEF offers all
-# three host kinds to the Studio motion-graphic tool; REEL_DIAGRAM_BRIEF offers
-# only the anatomy reveal (ANATOMY_BEAT_BRIEF) to Growth reels.
+# HyperFrames composition: the brief the agent writes them from, and the check
+# that runs before a composition is dispatched.
 #
-# The agent only writes host elements (`data-ripple="iso-scene"` or
-# `data-ripple="anatomy"` with a JSON parts spec, or `data-ripple="figure"`); it
-# never writes Ripple itself. An anatomy host is a product reveal drawn with the
-# Anatomy kit (as used by github.com/annnguyentt/anatomy-reveal-skill): convex
-# parts on a paper card that tumble in, explode, pin their labels and snap back. The
+# The agent only writes host elements (`data-ripple="iso-scene"` with a JSON
+# parts spec, or `data-ripple="figure"`); it never writes Ripple itself. The
 # browser draws each host frame by frame from Ripple's shipped code when it
 # renders (paw-enterprise core/studio/editor/hyperframes/ripple.ts), so stored
 # compositions stay small enough to round-trip through the MOTION GRAPHICS
 # prompt block. FIGURE_ANCHORS mirrors ripple's manifest entry
 # for `figure` (lib/manifest/entries/figure.ts); a figure added there needs its
-# row here. ANATOMY_KINDS mirrors the part kinds anatomy.ts can build.
+# row here.
 
 from __future__ import annotations
 
@@ -130,26 +125,6 @@ FIGURE_ANCHORS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-ANATOMY_KINDS = ("box", "cylinder", "ball")
-
-ANATOMY_BEAT_BRIEF = (
-    '<div data-ripple="anatomy" data-ripple-at="<second>" data-ripple-for="<seconds on '
-    'screen, 8 to 14>"><script type="application/json">{"parts":[...],"assemblies":[...],'
-    '"labels":[...]}</script></div>. It is drawn as a crafted exploded-view figure on its own '
-    "paper card: it tumbles in, comes apart into its assemblies, reveals its pins while "
-    "apart, then snaps back together for a hero shot at the end. parts: 8 to 40 solids "
-    "in real millimetres (x right, y back, z up, standing on z=0), each {id, kind "
-    "box|cylinder|ball, at [x,y,z] (bottom centre of a box, start of a cylinder's axis, "
-    "centre of a ball), w/d/h and round (corner radius) for box, r/h/axis x|y|z for "
-    "cylinder (r2 for the far end makes a cone), r for ball, material (optional) "
-    "steel|chrome|gunmetal|rubber|brass|copper|gold|glass|pcb|porcelain, group: the "
-    "assembly it comes apart with}. Build the real thing from its real parts: a shell of "
-    "panels, then what sits inside (board, battery, motor, lens). assemblies: 2 to 6 of "
-    "{id, dir up|down|left|right|front|back or [x,y,z], travel in mm, delay 0 to 1 (outer "
-    "parts lead), parent (optional assembly id)}; parts with no group stay put. labels: 3 "
-    "to 6 of {part, label}."
-)
-
 RIPPLE_BEATS_BRIEF = (
     "Explainer diagram (include one whenever the post involves a physical thing, product, "
     "building part, machine or process, which most do): a live, moving Ripple drawing can "
@@ -173,8 +148,6 @@ RIPPLE_BEATS_BRIEF = (
     "ghost: true for a see-through housing, on: parent id}. motions: {part, kind "
     "spin|slide|swing|pulse|flow, axis, speed (turns or cycles per second)}; give at least "
     "one so it moves. labels: 3 to 6 of {part, label}, in the order the story is told.\n"
-    "- A product reveal, when the post is about one physical product (a device, gadget, "
-    "tool, appliance, piece of hardware): " + ANATOMY_BEAT_BRIEF + "\n"
     "- A curated figure, when the post is about one of these exactly: "
     '<div data-ripple="figure" data-figure="<id>" data-params=\'{"bpm":72}\' '
     'data-labels=\'[{"anchor":"<anchor>","label":"<1-4 words>"}]\' data-ripple-at="<second>">'
@@ -182,26 +155,8 @@ RIPPLE_BEATS_BRIEF = (
     "their anchors: "
     + "; ".join(f"{fid}: {', '.join(anchors)}" for fid, anchors in FIGURE_ANCHORS.items())
     + ".\n"
-    '- Optional on any: data-theme="light" or "dark" (figure and iso-scene default dark, '
-    "anatomy defaults to light paper), data-reveal='[0.5,2,3.5]' "
+    "- Optional on either: data-theme=\"light\" (default dark), data-reveal='[0.5,2,3.5]' "
     "(seconds after data-ripple-at when pin 1, 2, 3 show; default 0.5, 1.3, 2.1, ...)."
-)
-
-REEL_DIAGRAM_BRIEF = (
-    "Explainer diagram (required): an anatomy reveal of the physical object the post is "
-    "about. When the post is not about one product, pick the single physical object that "
-    "best stands for its subject (a building, a tool, a device, a machine) and build it from "
-    "that object's real parts. Write only the host element below; the render draws it frame "
-    "by frame as a live, moving Ripple drawing, so never write Ripple markup or scripts "
-    "yourself. Its pins reveal one at a time while it is apart, each drawn with its own "
-    "label next to it, so the labels carry the story: keep them to one to four words and "
-    "never repeat them as separate text. Size and place the host with CSS (width about "
-    "1000px, centred; height follows) and fade it in and out with the timeline like any "
-    "element. Set data-ripple-for between 8 and 14 seconds and give it most of the reel.\n"
-    + ANATOMY_BEAT_BRIEF
-    + '\nOptional: data-theme="light" or "dark" (default light paper), '
-    "data-reveal='[0.5,2,3.5]' (seconds after data-ripple-at when pin 1, 2, 3 show; "
-    "default 0.5, 1.3, 2.1, ...)."
 )
 
 _HOST_RE = re.compile(r"<[a-zA-Z][^>]*\bdata-ripple\s*=\s*([\"'])([^\"']*)\1[^>]*>", re.IGNORECASE)
@@ -234,31 +189,9 @@ def validate_ripple_beats(html: str) -> str | None:
                     'A data-ripple="iso-scene" host needs a <script type="application/json"> '
                     'child holding {"parts": [...]} as valid JSON.'
                 )
-        elif kind == "anatomy":
-            spec = _SPEC_RE.search(html, host.end())
-            try:
-                parsed = json.loads(spec.group(1)) if spec else None
-            except ValueError:
-                parsed = None
-            parts = parsed.get("parts") if isinstance(parsed, dict) else None
-            if not isinstance(parts, list) or not any(
-                isinstance(p, dict) and p.get("kind") in ANATOMY_KINDS for p in parts
-            ):
-                return (
-                    'A data-ripple="anatomy" host needs a <script type="application/json"> '
-                    'child holding {"parts": [...]} as valid JSON, with parts of kind '
-                    f"{', '.join(ANATOMY_KINDS)}."
-                )
         else:
-            return f'data-ripple={kind!r} is unknown. Use "figure", "iso-scene" or "anatomy".'
+            return f'data-ripple={kind!r} is unknown. Use "figure" or "iso-scene".'
     return None
 
 
-__all__ = [
-    "ANATOMY_BEAT_BRIEF",
-    "ANATOMY_KINDS",
-    "FIGURE_ANCHORS",
-    "REEL_DIAGRAM_BRIEF",
-    "RIPPLE_BEATS_BRIEF",
-    "validate_ripple_beats",
-]
+__all__ = ["FIGURE_ANCHORS", "RIPPLE_BEATS_BRIEF", "validate_ripple_beats"]
