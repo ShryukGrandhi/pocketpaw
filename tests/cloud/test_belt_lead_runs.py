@@ -12,10 +12,16 @@
 # feature name fails the launch before any session starts.
 # TRACK: every PR whose body has ``Belt-Lead: <run id>`` is kept on the run
 # (open and merged), never reviewed (no ``belt/review``) and never fixed.
-# DONE: a merged ``feature-done`` PR, every dev CI run of its merge commit
-# green, and a ``Belt-Contact-Sheet:`` comment on the issue since the launch;
-# any one missing keeps the run tracking. A closed feature issue finishes the
-# run as done at the next poll and frees its slot, never nudged or relaunched.
+# DONE (v2, a wave.json with no ``slices``): a merged ``feature-done`` PR, every
+# dev CI run of its merge commit green, and a ``Belt-Contact-Sheet:`` comment on
+# the issue since the launch; any one missing keeps the run tracking.
+# DONE (v3, ``slices`` in the wave.json at launch): a ``Belt-Slice-Done:`` line
+# since the launch for every slice, each naming a successful ci.yml run on the
+# base that holds the slice's last PR (``Slice:`` lines), then the sheet; dev
+# CI is not read, gaps are kept per slice, and an unsafe slice id, an oversized
+# wave.json or one outside the clone never launches. A closed feature issue
+# finishes the run as done at the next poll and frees its slot, never nudged or
+# relaunched.
 # STALL: 30 min with no lead-branch commit, PR update or issue comment: a
 # ``claude -p --cloud <session>`` nudge, then a relaunch with the resume brief,
 # then ``needs-human`` on the issue and the run released, the reason naming the
@@ -33,7 +39,7 @@
 # timeout) is tracked again with the error cleared; an errored run is never
 # counted in flight.
 # ROW: a lead run's console row carries ``lead`` (feature, app, PRs, session and
-# stall counts, contact sheet) off the tracker's blob; a task run's is null.
+# stall counts, contact sheet, slices) off the tracker's blob; a task run's is null.
 
 from __future__ import annotations
 
@@ -108,13 +114,15 @@ def _lead_pr(
     at: float = 0.0,
     sha: str = MERGE_SHA,
     merged: str = "2026-01-01T00:00:00Z",
+    slices: str = "",
 ) -> dict:
     labels = [{"name": "fast-lane"}] + ([{"name": "feature-done"}] if done else [])
+    slice_line = f"Slice: {slices}\n" if slices else ""
     return {
         "number": number,
         "url": f"https://github.com/{SLUG}/pull/{number}",
         "state": state,
-        "body": f"Swarm slice.\n\nBelt-Lead: {run_ref}\nFeature: {FEATURE}\n",
+        "body": f"Swarm slice.\n\nBelt-Lead: {run_ref}\nFeature: {FEATURE}\n{slice_line}",
         "labels": labels,
         "headRefName": f"lead/{FEATURE}-{number}",
         "updatedAt": _iso(at) if at else "2020-01-01T00:00:00Z",
@@ -155,7 +163,9 @@ class LeadRunner:
         self.wall = time.time
         self.ci_by_sha = ci_by_sha or {}  # dev CI runs per merge commit, over ``ci``
         self.dev_runs: list[dict] = []  # newest dev CI runs, any head (no --commit)
-        self.contains: dict[str, str] = {}  # head sha -> compare status vs the merge
+        # compare status: "<sha>...<head>" first, else by head alone
+        self.contains: dict[str, str] = {}
+        self.runs: dict[str, dict] = {}  # Actions run id -> its API row (a slice's run)
         self.nudge_codes = nudge_codes or [0]  # exit code per ``claude -p --cloud``
         # gh reads to fail transiently, by "pr list" / "issue view": calls left.
         self.fail = dict(fail or {})
@@ -206,8 +216,12 @@ class LeadRunner:
             runs = self.base_runs
             return 0, json.dumps(runs(self.wall()) if callable(runs) else runs), ""
         if argv[:2] == ["gh", "api"] and "/compare/" in argv[2]:
-            head = argv[2].split("...")[-1]
-            return 0, json.dumps({"status": self.contains.get(head, "diverged")}), ""
+            pair = argv[2].split("/compare/")[-1]
+            status = self.contains.get(pair, self.contains.get(pair.split("...")[-1]))
+            return 0, json.dumps({"status": status or "diverged"}), ""
+        if argv[:2] == ["gh", "api"] and "/actions/runs/" in argv[2]:
+            run = self.runs.get(argv[2].rsplit("/", 1)[-1])
+            return (0, json.dumps(run), "") if run else (1, "", "gh: Not Found (HTTP 404)")
         if argv[:3] == ["gh", "run", "list"] and "--commit" not in argv:
             return 0, json.dumps(self.dev_runs), ""
         if argv[:3] == ["gh", "run", "list"]:
@@ -1376,3 +1390,412 @@ async def test_a_lead_closed_after_a_nudge_is_not_relaunched(store, dirs, playbo
     action = await store.get_action(run_ref)
     assert action.status == ActionStatus.EXECUTED
     assert len(_nudges(runner)) == 1 and len(_launch_briefs(runner)) == 1
+
+
+# -- v3: a feature is done slice by slice -----------------------------------
+# A feature whose wave.json lists ``slices`` (creative-apps #1302, #1305) is done when
+# every slice has a ``Belt-Slice-Done: <slice> <run url>`` line since the launch
+# whose run is a completed, successful ci.yml run on the base whose head contains
+# the slice's last merged PR (PRs map to slices by their ``Slice:`` line), and
+# the contact sheet is up. Dev CI on the merge is no longer read. A feature with
+# no slices keeps the v2 rule above, byte for byte.
+
+WAVE = PACKET.removesuffix(".md") + ".wave.json"
+# The feature's wave.json as creative-apps #1305 writes it: v3 lists ``slices``.
+PLAIN = {"title": "Text shapes", "wave": 1, "status": "planned", "owned": ["Sources/A.swift"]}
+SLICED = {
+    **PLAIN,
+    "slices": [
+        {"id": "contract", "behavior": "protocols and fakes", "tasks": ["T-1"], "journeys": []},
+        {"id": "S1", "tasks": ["T-2", "T-3"], "journeys": ["F-J4"], "waits": {"contract": ["T-2"]}},
+    ],
+}
+CONTRACT_SHA, S1_SHA, RUN_HEAD = "1" * 40, "2" * 40, "9" * 40
+
+
+def _wave(launch: Path, wave: dict | str = SLICED) -> None:
+    path = launch / WAVE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(wave if isinstance(wave, str) else json.dumps(wave))
+
+
+def _run_url(run_id: int) -> str:
+    return f"https://github.com/{SLUG}/actions/runs/{run_id}"
+
+
+def _ci_run(run_id: int, head: str = RUN_HEAD, **over) -> dict:
+    row = {
+        "id": run_id,
+        "path": ".github/workflows/ci.yml",
+        "head_branch": "dev",
+        "head_sha": head,
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": _run_url(run_id),
+    }
+    return row | over
+
+
+def _slice_done(slice_id: str, run_id: int, at: float, tail: str = "") -> dict:
+    body = f"Slice {slice_id} is done.\nBelt-Slice-Done: {slice_id} {_run_url(run_id)}{tail}"
+    return {"createdAt": _iso(at), "body": body}
+
+
+def _sliced_runner(run_ref: str, *, sheet: bool = True) -> LeadRunner:
+    """A v3 lead done at the first poll: contract (#41) and S1 (#42, the
+    ``feature-done`` one) merged, a slice-done line for each naming a green
+    ci.yml run on dev that contains its PR, and the contact sheet. Dev CI on the
+    merges is red, which no longer matters."""
+    future = time.time() + 3600
+    prs = [
+        _lead_pr(
+            41,
+            run_ref,
+            state="MERGED",
+            sha=CONTRACT_SHA,
+            slices="contract",
+            merged="2026-10-16T10:00:00Z",
+        ),
+        _lead_pr(
+            42,
+            run_ref,
+            state="MERGED",
+            sha=S1_SHA,
+            slices="S1",
+            done=True,
+            merged="2026-10-16T11:00:00Z",
+        ),
+    ]
+    said = [_slice_done("contract", 901, future), _slice_done("S1", 902, future)]
+    runner = LeadRunner(prs=[prs], comments=[said + ([_sheet(future)] if sheet else [])])
+    runner.ci = [[RED_RUN]]
+    runner.runs = {"901": _ci_run(901, CONTRACT_SHA), "902": _ci_run(902)}
+    runner.contains = {f"{S1_SHA}...{RUN_HEAD}": "ahead"}
+    return runner
+
+
+def _issue_views(runner: LeadRunner) -> int:
+    return sum(a[:3] == ["gh", "issue", "view"] for a, _ in runner.calls)
+
+
+async def test_a_v3_lead_is_done_when_every_slice_is_done_and_the_sheet_is_up(
+    store, dirs, playbook
+):
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    cc = action.parameters["_code_change"]
+    lead = cc["lead"]
+    assert lead["slice_ids"] == ["contract", "S1"]
+    assert [(s["id"], s["done"], s["run"], s["gaps"], s["pr"]) for s in lead["slices"]] == [
+        ("contract", True, _run_url(901), [], 41),
+        ("S1", True, _run_url(902), [], 42),
+    ]
+    assert [p["slices"] for p in lead["prs"]] == [["contract"], ["S1"]]
+    assert cc["pr_url"].endswith("/pull/42") and cc["commit_sha"] == S1_SHA
+    assert "2 slice(s) done (0 with gaps)" in str(action.outcome)
+    # Red dev CI on the merges no longer holds a v3 feature: it is never read.
+    assert not any(a[:3] == ["gh", "run", "list"] and "--commit" in a for a, _ in runner.calls)
+
+
+async def test_a_v3_lead_waits_for_every_slice_and_the_sheet(store, dirs, playbook):
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+    future = time.time() + 3600
+    contract, s1 = _slice_done("contract", 901, future), _slice_done("S1", 902, future)
+    runner.comments = [[contract, _sheet(future)], [contract, s1], [contract, s1, _sheet(future)]]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert _issue_views(runner) == 3  # no S1 line, then no sheet, then done
+    assert (await store.get_action(run_ref)).status == ActionStatus.EXECUTED
+
+
+async def test_a_slice_done_line_from_before_the_launch_does_not_count(store, dirs, playbook):
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+    future = time.time() + 3600
+    old = _slice_done("S1", 902, time.time() - 86400)  # another run's line
+    first = [_slice_done("contract", 901, future), old, _sheet(future)]
+    runner.comments = [first, [*first, _slice_done("S1", 902, future)]]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert _issue_views(runner) == 2
+    assert (await store.get_action(run_ref)).status == ActionStatus.EXECUTED
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"conclusion": "failure"},
+        {"conclusion": "skipped"},  # a skipped run ran no journeys
+        {"status": "in_progress", "conclusion": None},
+        {"path": ".github/workflows/fast-lane.yml"},  # not ci.yml
+        {"head_branch": "lead/text-shapes"},  # not a run of the base
+        {"head_sha": "8" * 40},  # its head lacks the slice's last PR
+    ],
+    ids=["red", "skipped", "running", "other-workflow", "other-branch", "lacks-the-pr"],
+)
+async def test_a_slice_done_whose_run_does_not_hold_up_does_not_count(store, dirs, playbook, bad):
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+    future = time.time() + 3600
+    runner.runs["903"] = _ci_run(903) | bad
+    first = [_slice_done("contract", 901, future), _slice_done("S1", 903, future), _sheet(future)]
+    # The lead posts a fresh line naming a good run: the newest line per slice wins.
+    runner.comments = [first, [*first, _slice_done("S1", 902, future + 1)]]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert _issue_views(runner) == 2
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    s1 = action.parameters["_code_change"]["lead"]["slices"][1]
+    assert s1["run"] == _run_url(902)
+
+
+async def test_a_later_pr_with_no_slice_line_is_no_slice_s_last_pr(store, dirs, playbook):
+    # #43 merged last but names no slice: S1's last PR is still #42, which the
+    # run holds, so the lead lands at the first poll.
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+    other = _lead_pr(43, run_ref, state="MERGED", sha="3" * 40, merged="2026-10-16T13:00:00Z")
+    runner.prs = [[*runner.prs[0], other]]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert _issue_views(runner) == 1
+    assert (await store.get_action(run_ref)).status == ActionStatus.EXECUTED
+
+
+async def test_a_later_slice_pr_needs_a_newer_slice_done(store, dirs, playbook):
+    # Both slices verified at poll 1 (no sheet yet); #44 then merges for both,
+    # so the kept verdicts no longer hold until lines naming a run with #44.
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref, sheet=False)
+    prs = runner.prs[0]
+    fix = _lead_pr(
+        44,
+        run_ref,
+        state="MERGED",
+        sha="4" * 40,
+        slices="S1, contract",
+        merged="2026-10-16T12:00:00Z",
+    )
+    runner.prs = [prs, [*prs, fix]]
+    later = "7" * 40
+    runner.runs["904"] = _ci_run(904, later)
+    runner.contains[f"{'4' * 40}...{later}"] = "ahead"
+    said = [*runner.comments[0], _sheet(time.time() + 3600)]
+    future = time.time() + 7200
+    newer = [_slice_done("contract", 904, future), _slice_done("S1", 904, future)]
+    runner.comments = [runner.comments[0], said, [*said, *newer]]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert _issue_views(runner) == 3
+    lead = (await store.get_action(run_ref)).parameters["_code_change"]["lead"]
+    assert [(s["pr"], s["run"]) for s in lead["slices"]] == [(44, _run_url(904))] * 2
+
+
+async def test_a_newer_slice_done_naming_a_red_run_undoes_the_slice(store, dirs, playbook):
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref, sheet=False)
+    runner.runs["903"] = _ci_run(903, conclusion="failure")
+    said, at = runner.comments[0], time.time() + 7200
+    red = [*said, _slice_done("S1", 903, at), _sheet(at)]
+    runner.comments = [said, red, [*red, _slice_done("S1", 902, at + 1)]]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert _issue_views(runner) == 3
+
+
+async def test_a_slice_done_with_gaps_is_done_and_counted(store, dirs, playbook):
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+    future = time.time() + 3600
+    runner.comments = [
+        [
+            _slice_done("contract", 901, future),
+            _slice_done("S1", 902, future, " gaps: #77 #78"),
+            _sheet(future),
+        ]
+    ]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    slices = action.parameters["_code_change"]["lead"]["slices"]
+    assert [s["gaps"] for s in slices] == [[], [77, 78]]
+    assert sum(bool(s["done"] and s["gaps"]) for s in slices) == 1
+    assert "1 with gaps" in str(action.outcome)
+
+
+async def test_a_done_slice_run_is_not_read_again(store, dirs, playbook):
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref, sheet=False)
+    said = runner.comments[0]
+    runner.comments = [said] * 5 + [[*said, _sheet(time.time() + 3600)]]
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    assert _issue_views(runner) == 6
+    reads = [a for a, _ in runner.calls if a[:2] == ["gh", "api"] and "/actions/runs/" in a[2]]
+    assert len(reads) == 2  # one per slice, then the verdict is kept
+
+
+@pytest.mark.parametrize("wave", [None, PLAIN, "{not json"], ids=["none", "no-slices", "bad"])
+async def test_a_feature_without_slices_keeps_the_v2_rule(store, dirs, playbook, wave):
+    # The live v2 leads: slice-done lines and Slice: lines change nothing; the
+    # feature-done PR's merge on green dev CI and the sheet still decide.
+    repo, launch = dirs
+    if wave is not None:
+        _wave(launch, wave)
+    run_ref = await _queue_lead(store, repo)
+    runner = _done_runner(run_ref)
+    future = time.time() + 3600
+    runner.comments = [[_slice_done("S1", 902, future), _sheet(future)]]
+    runner.runs = {"902": _ci_run(902, MERGE_SHA)}
+    runner.prs = [[{**p, "body": f"{p['body']}Slice: S1\n"} for p in runner.prs[0]]]
+    runner.ci = [[RED_RUN], [GREEN_RUN]]  # dev CI on the feature-done merge still decides
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    lead = action.parameters["_code_change"]["lead"]
+    assert lead["slice_ids"] == [] and "slices" not in lead
+    assert sum(a[:3] == ["gh", "run", "list"] and "--commit" in a for a, _ in runner.calls) == 2
+    assert not any("/actions/runs/" in " ".join(a) for a, _ in runner.calls)
+    assert "slice" not in str(action.outcome)
+    (brief,) = _launch_briefs(runner)
+    assert V2_DONE in brief and V2_LOOP in brief and "Belt-Slice-Done" not in brief
+
+
+V2_DONE = (
+    "- Done: the last PR also carries the label `feature-done`. Once it has merged and the CI "
+    "run it triggered on dev is green, comment on #93 with a line starting "
+    "`Belt-Contact-Sheet:` and this run's session link.\n\n## Brief rules\n"
+)
+V2_LOOP = (
+    "\n5. The Anatomy loop stops after 2 clean rounds or 4 rounds total; once a round is clean, "
+    "add no new critics.\n6. One critic lens is first-use clarity"
+)
+
+
+async def test_a_lead_launched_before_slices_keeps_the_v2_rule(store, dirs, playbook):
+    # A blob from before this change has no ``slice_ids``: a re-tracked running
+    # lead keeps the rule it was briefed with, whatever its wave.json says now.
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    lead = {"feature": FEATURE, "packet": PACKET, "issue": 93, "branch": f"lead/{FEATURE}"}
+    await cloud_station._patch(
+        store,
+        run_ref,
+        headless_state="cloud",
+        cloud={"session_url": CLOUD_URL, "launched_at": time.time()},
+        lead=lead,
+    )
+    runner = _done_runner(run_ref)
+
+    dispatcher = _lead_dispatcher(runner, launch, workspaces_for=_ws)
+    assert await dispatcher.resume_all() == 1
+
+    action = await store.get_action(run_ref)
+    assert action.status == ActionStatus.EXECUTED
+    assert any(a[:3] == ["gh", "run", "list"] and "--commit" in a for a, _ in runner.calls)
+
+
+async def test_a_v3_brief_describes_slices_and_never_waiting(store, dirs, playbook):
+    repo, launch = dirs
+    _wave(launch)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    (brief,) = _launch_briefs(runner)
+    assert brief.startswith(PLAYBOOK.strip())
+    assert "Slices: contract, S1" in brief
+    assert "`Slice: <slice>`" in brief
+    assert "Belt-Slice-Done: <slice> <run url>" in brief and "gaps: #<n>" in brief
+    assert "Belt-Contact-Sheet:" in brief
+    assert "never wait" in brief.lower() and "`finding`" in brief
+    assert "2 fix rounds" in brief
+    assert "2 clean rounds or 4 rounds total" not in brief  # the v2 loop
+    assert "the CI run it triggered" not in brief  # the v2 done rule
+
+
+@pytest.mark.parametrize("where", ["over-the-cap", "outside-the-clone"])
+async def test_a_wave_json_over_the_cap_or_outside_the_clone_never_launches(
+    store, dirs, playbook, tmp_path, where
+):
+    repo, launch = dirs
+    if where == "over-the-cap":
+        _wave(launch, json.dumps(SLICED) + " " * cloud_station._WAVE_BYTES)
+    else:
+        outside = tmp_path / "outside.wave.json"
+        outside.write_text(json.dumps(SLICED))
+        (launch / WAVE).parent.mkdir(parents=True, exist_ok=True)
+        (launch / WAVE).symlink_to(outside)
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    cc = (await store.get_action(run_ref)).parameters["_code_change"]
+    assert cc["headless_error"].startswith(f"LAUNCH: {WAVE}")
+    assert not _launch_briefs(runner)
+
+
+async def test_a_wave_json_with_an_unsafe_slice_id_never_launches(store, dirs, playbook):
+    repo, launch = dirs
+    _wave(launch, {**SLICED, "slices": [*SLICED["slices"], {"id": "S2; rm"}]})
+    run_ref = await _queue_lead(store, repo)
+    runner = _sliced_runner(run_ref)
+
+    await _lead_dispatcher(runner, launch).run(run_ref, workspace_id=WS)
+
+    cc = (await store.get_action(run_ref)).parameters["_code_change"]
+    assert cc["headless_error"].startswith("LAUNCH:") and "slice" in cc["headless_error"]
+    assert not _launch_briefs(runner)
+
+
+def test_lead_run_row_carries_its_slices() -> None:
+    slices = [
+        {"id": "contract", "done": True, "run": _run_url(901), "gaps": [], "pr": 41},
+        {"id": "S1", "done": False, "run": None, "gaps": [], "pr": None},
+    ]
+    blob = {"recipe": "feature-lead", "task": "Lead #93", "lead": {"packet": PACKET}}
+    blob["lead"]["slices"] = slices
+    lead = _run_summary(_row_action(), blob)["lead"]
+    assert lead["slices"] == slices
+    assert lead["app"] == "flare" and lead["prs"] == []  # the old fields stay
+    queued = _run_summary(_row_action(), {"recipe": "feature-lead", "task": "Lead #7"})["lead"]
+    assert queued["slices"] == []

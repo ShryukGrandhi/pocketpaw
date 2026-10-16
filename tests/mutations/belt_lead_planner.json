@@ -331,5 +331,14 @@
     "tests": [
       "tests/cloud/test_belt_lead_runs.py"
     ]
+  },
+  {
+    "label": "the planned outcome keeps only the v2 done rule",
+    "file": "ee/pocketpaw_ee/cloud/mandates/lead_planner.py",
+    "find": "\"slices: every slice done on a green ci.yml run that holds its last PR \"",
+    "replace": "\"slices: \"",
+    "tests": [
+      "tests/cloud/test_belt_lead_planner.py::test_the_expected_outcome_names_slices_and_keeps_the_v2_rule"
+    ]
   }
 ]
