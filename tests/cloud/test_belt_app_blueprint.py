@@ -5,10 +5,12 @@
 # c4-planned.json, three wave.json files, the layer-keys RECORD (Decisions and
 # Open cut) and dev's Halo file tree. The GitHub side (issue, run, PRs) is built
 # in each test as it stood when the design doc was written: #1036 open, the lead
-# run pending, no feature-done PR merged.
+# run pending, no feature-done PR merged. A v3 wave.json's ``slices`` take their
+# status off the lead run (done, done-with-gaps, building, planned).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -190,3 +192,61 @@ def test_issue_and_run_carry_every_contract_field():
     assert derive()["issue"] == {"number": 1036, **OPEN}
     # nothing read carries the RECORD's commit time yet
     assert derive()["run"]["record_at"] is None
+
+
+# -- slices (factory v3): the wave.json ``slices`` and each one's status ------
+
+SLICES = [
+    {"id": "CT-a", "behavior": "protocols and fakes", "tasks": ["LK-1"], "journeys": []},
+    {"id": "CT-b", "tasks": "LK-2a", "journeys": ["J5"], "waits": {"CT-a": ["LK-2a"]}},
+    {"id": "CT-c", "tasks": ["LK-9"], "waits": {"design-window:DW-a": ["LK-9"], "seams": []}},
+    {"id": "CT d", "tasks": ["LK-12"]},  # not a safe id
+    {"behavior": "no id"},
+    "not a slice",
+]
+
+
+def test_wave_slices_keep_entries_with_an_id_and_their_waits_keys():
+    wave = ab.parse_wave(json.dumps({"slices": SLICES}))
+    assert [s["id"] for s in wave["slices"]] == ["CT-a", "CT-b", "CT-c", "CT d"]
+    assert wave["slices"][0] == {
+        "id": "CT-a",
+        "behavior": "protocols and fakes",
+        "tasks": ["LK-1"],
+        "journeys": [],
+        "waits": [],
+    }
+    assert wave["slices"][1]["tasks"] == []  # a string is not a task list
+    assert wave["slices"][2]["waits"] == ["design-window:DW-a", "seams"]
+    assert ab.parse_wave("{}")["slices"] == ab.parse_wave('{"slices": {}}')["slices"] == []
+
+
+def _sliced(**over) -> str:
+    return json.dumps(json.loads(LAYER_KEYS) | {"slices": SLICES} | over)
+
+
+def test_each_slice_takes_its_status_from_the_lead_run():
+    lead = {
+        "stalls": 0,
+        "prs": [{"number": 1140, "state": "OPEN", "done": False, "slices": ["CT-c"]}],
+        "slices": [
+            {"id": "CT-a", "done": True, "run": "r1", "gaps": []},
+            {"id": "CT-b", "done": True, "run": "r2", "gaps": [77]},
+            {"id": "CT-c", "done": False, "run": None, "gaps": []},
+        ],
+    }
+    f = derive(wave=_sliced(), run={**RUNNING, "lead": lead})
+    got = [(s["id"], s["status"], s["run"], s["gaps"]) for s in f["slices"]]
+    assert got == [
+        ("CT-a", "done", "r1", []),
+        ("CT-b", "done-with-gaps", "r2", [77]),
+        ("CT-c", "building", None, []),  # an open PR names it; "CT d" is dropped
+    ]
+
+
+def test_slices_are_planned_without_a_live_lead_and_absent_without_any():
+    assert {s["status"] for s in derive(wave=_sliced(), run=None)["slices"]} == {"planned"}
+    prs = [{"number": 1140, "state": "MERGED", "done": False, "slices": ["CT-a"]}]
+    released = {**RUNNING, "status": "rejected", "lead": {"stalls": 0, "prs": prs}}
+    assert {s["status"] for s in derive(wave=_sliced(), run=released)["slices"]} == {"planned"}
+    assert derive()["slices"] == []

@@ -10,7 +10,8 @@
 # GitHub comes through the patrols gh runner: ``feature-lead`` issues, merged
 # feature-done PRs, dev CI, every lead head in one call, a RECORD.md only for a
 # lead whose head moved, one issue list per repo a ``waits_on`` ref names. Lead
-# runs come from ``service.list_runs``. Cached per (workspace, repo) for ``TTL``
+# runs come from ``service.list_runs``; an app row counts its features' slices by
+# status (done-with-gaps apart from done). Cached per (workspace, repo) for ``TTL``
 # behind a single-flight lock; any failed refresh (git, gh, a rate limit, a bug)
 # serves the last graph with ``stale: True``, 503 with none yet. App and
 # feature ids match ``_ID`` before any path or ref is built; a file over
@@ -50,6 +51,7 @@ _TEST = re.compile(r"func (test\w+)")
 _JOURNEYS = re.compile(r"^(#+) [^\n]*journeys[^\n]*\n(.*?)(?=^\1 |\Z)", re.M | re.S | re.I)
 _LIST = "--state all --limit 500 --json".split()
 _STATUSES = ("done", "built", "building", "stuck", "filed", "planned", "gap")
+_SLICE_STATUSES = ("done", "done-with-gaps", "building", "planned")
 _UNREADY = "belt.blueprint_unavailable"
 # A component's C4 status by its owners' feature status, first match wins.
 _PAINT = {"stuck": "failed", "building": "changing"}
@@ -350,8 +352,10 @@ async def _read(
         n = [x["state"] for x in journeys if x["id"].startswith(app + "/")]
         jc = {"named": len(n), "existing": len(n) - n.count("named"), "passing": n.count("passing")}
         counts = dict.fromkeys(_STATUSES, 0) | Counter(x["status"] for x in mine)
+        sc = Counter(s["status"] for x in mine for s in x["slices"])
         app_rows.append(
             {"id": app, "title": title, "counts": {"total": len(mine), **counts}, "journeys": jc}
+            | {"slices": dict.fromkeys(_SLICE_STATUSES, 0) | sc}
         )
         features += mine
 

@@ -7,7 +7,8 @@
 # guards (a bad id or an oversized file is refused before it is read). The
 # run rows, the grep output and the blueprint .md are shaped like the real ones:
 # ``stalls`` is an int, journey ids sit in a wave's ``note`` and the .md's
-# Journeys section, a test function follows its ``///`` comment.
+# Journeys section, a test function follows its ``///`` comment. A feature's
+# slices and the app's slice counts come through the same read.
 
 from __future__ import annotations
 
@@ -52,6 +53,7 @@ def contents(text: str, size: int | None = None) -> dict:
 class Fake:
     def __init__(self, repo: Path):
         self.repo, self.calls, self.limited, self.stalls = repo, [], False, 1
+        self.lead_extra: dict = {}  # more lead-row fields (a v3 lead's ``slices``)
         self.origin = "https://github.com/qbtrix/creative-apps.git"
         self.heads = {"layer-keys": "a1", "easing": "b1", "Bad.Ref": "c1"}
         self.records = {"layer-keys": contents(RECORD), "easing": contents("Stage: 1 plan\n")}
@@ -105,6 +107,7 @@ class Fake:
 
     async def runs(self, ws):
         lead = {"feature": "layer-keys", "app": "halo", "prs": [], "stalls": self.stalls}
+        lead |= self.lead_extra
         return [{"action_id": "act-1", "status": "running", "repo": str(self.repo), "lead": lead}]
 
     async def touched(self, ws, action_id):
@@ -287,3 +290,20 @@ async def test_every_gap_has_text_and_unowned_planned_components_are_gaps(fake):
     assert {
         c for c, row in comps.items() if not row["features"] and row["status"] != "built"
     } == set(unowned)
+
+
+async def test_features_carry_their_slices_and_apps_count_them(fake, monkeypatch):
+    path = f"{BP}/features/layer-keys.wave.json"
+    wave = json.loads(FILES[path]) | {"slices": [{"id": "LK-a"}, {"id": "LK-b"}, {"id": "LK-c"}]}
+    monkeypatch.setitem(FILES, path, json.dumps(wave))
+    fake.lead_extra = {
+        "slices": [
+            {"id": "LK-a", "done": True, "run": "r1", "gaps": [5]},
+            {"id": "LK-b", "done": True, "run": "r2", "gaps": []},
+        ]
+    }
+    g = await read(fake)
+    got = [(s["id"], s["status"]) for s in feature(g, "halo/layer-keys")["slices"]]
+    assert got == [("LK-a", "done-with-gaps"), ("LK-b", "done"), ("LK-c", "planned")]
+    assert feature(g, "halo/live-keys")["slices"] == []
+    assert g["apps"][0]["slices"] == {"done": 1, "done-with-gaps": 1, "building": 0, "planned": 1}
