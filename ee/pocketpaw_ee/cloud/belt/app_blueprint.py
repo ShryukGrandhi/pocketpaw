@@ -9,7 +9,8 @@
 # first; a feature sits on its ``owned`` paths, else its tasks, else "unknown").
 # Status follows section 1: the first rule that holds wins, and the wave.json
 # ``status`` is only a claim (a built or done claim with no merged feature-done PR
-# is the ``claimed_ahead`` gap).
+# is the ``claimed_ahead`` gap). A v3 feature's wave.json ``slices`` each get a
+# status (done, done-with-gaps, building, planned) off its lead run's ``lead``.
 
 from __future__ import annotations
 
@@ -189,6 +190,31 @@ def feature_status(
     return status, gaps + (["issue_closed_not_done"] if closed and status != "done" else [])
 
 
+def slice_status(slices: list[dict[str, Any]], run: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """A feature's wave.json ``slices`` (safe ids only), each with its ``status``:
+    ``done`` or ``done-with-gaps`` as the lead run's ``lead.slices`` says,
+    ``building`` when a live lead has a PR whose ``Slice:`` line names it, else
+    ``planned``; plus that slice's ``run`` url and ``gaps`` off the run."""
+    run = run or {}
+    lead = run.get("lead") or {}
+    state = {s.get("id"): s for s in lead.get("slices") or [] if isinstance(s, dict)}
+    live = run.get("status") not in _SETTLED
+    named = {i for p in lead.get("prs") or [] for i in p.get("slices") or []} if live else set()
+    rows = []
+    for s in slices:
+        if not SLICE_ID.match(s["id"]):
+            continue
+        got = state.get(s["id"]) or {}
+        gaps = got.get("gaps") or []
+        status = "planned"
+        if got.get("done"):
+            status = "done-with-gaps" if gaps else "done"
+        elif s["id"] in named:
+            status = "building"
+        rows.append(s | {"status": status, "run": got.get("run"), "gaps": gaps})
+    return rows
+
+
 def derive_feature(
     app: str,
     feature: str,
@@ -233,6 +259,7 @@ def derive_feature(
         if run
         else None,
         "tasks": tasks,
+        "slices": slice_status(wave["slices"], run),
         "layers": [x for x in (*LAYERS, "unknown") if x in placed],
         "components": list(dict.fromkeys(f"{app}/{c}" for c in comps if c)),
         "gaps": gaps + ([] if owned else ["feature_no_owned"]),

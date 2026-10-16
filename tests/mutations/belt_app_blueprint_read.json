@@ -223,5 +223,14 @@
     "tests": [
       "tests/cloud/test_belt_app_blueprint_read.py"
     ]
+  },
+  {
+    "label": "an app row does not count its slices",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint_read.py",
+    "find": "sc = Counter(s[\"status\"] for x in mine for s in x[\"slices\"])",
+    "replace": "sc = Counter()",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint_read.py::test_features_carry_their_slices_and_apps_count_them"
+    ]
   }
 ]

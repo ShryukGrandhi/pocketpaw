@@ -457,5 +457,77 @@
     "tests": [
       "tests/cloud/test_belt_app_blueprint.py"
     ]
+  },
+  {
+    "label": "a slice done with gaps reads plain done",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "status = \"done-with-gaps\" if gaps else \"done\"",
+    "replace": "status = \"done\"",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py::test_each_slice_takes_its_status_from_the_lead_run"
+    ]
+  },
+  {
+    "label": "an unsafe slice id is shown",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "        if not SLICE_ID.match(s[\"id\"]):\n            continue\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py::test_each_slice_takes_its_status_from_the_lead_run"
+    ]
+  },
+  {
+    "label": "a settled lead's PRs still mark slices building",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": " if live else set()",
+    "replace": "",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py::test_slices_are_planned_without_a_live_lead_and_absent_without_any"
+    ]
+  },
+  {
+    "label": "no slice is ever building",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "        elif s[\"id\"] in named:",
+    "replace": "        elif False:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py::test_each_slice_takes_its_status_from_the_lead_run"
+    ]
+  },
+  {
+    "label": "a done slice reads planned",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "        if got.get(\"done\"):",
+    "replace": "        if False:",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py::test_each_slice_takes_its_status_from_the_lead_run"
+    ]
+  },
+  {
+    "label": "a feature row drops its slices",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "\"slices\": slice_status(wave[\"slices\"], run),",
+    "replace": "\"slices\": [],",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py::test_each_slice_takes_its_status_from_the_lead_run"
+    ]
+  },
+  {
+    "label": "a slice entry without an id is kept",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "if isinstance(s, dict) and isinstance(s.get(\"id\"), str)",
+    "replace": "if isinstance(s, dict)",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py::test_wave_slices_keep_entries_with_an_id_and_their_waits_keys"
+    ]
+  },
+  {
+    "label": "a string slice field is read as a list",
+    "file": "ee/pocketpaw_ee/cloud/belt/app_blueprint.py",
+    "find": "if isinstance(s.get(k), list | dict)",
+    "replace": "if s.get(k)",
+    "tests": [
+      "tests/cloud/test_belt_app_blueprint.py::test_wave_slices_keep_entries_with_an_id_and_their_waits_keys"
+    ]
   }
 ]
