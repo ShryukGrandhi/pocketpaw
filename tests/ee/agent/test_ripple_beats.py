@@ -30,10 +30,22 @@ ISO = {"parts": [{"id": "ring", "kind": "gear", "at": [0, 0, 30], "r": 22}], "mo
 SCENE = (
     f'<div data-ripple="iso-scene"><script type="application/json">{json.dumps(ISO)}</script></div>'
 )
+PRODUCT = {
+    "parts": [
+        {"id": "shell", "kind": "box", "at": [0, 0, 0], "w": 70, "d": 8, "h": 150},
+        {"id": "battery", "kind": "box", "at": [0, 0, 20], "w": 50, "d": 4, "h": 80, "group": "in"},
+    ],
+    "assemblies": [{"id": "in", "dir": "front", "travel": 40}],
+    "labels": [{"part": "battery", "label": "Battery"}],
+}
+ANATOMY = (
+    '<div data-ripple="anatomy" data-ripple-for="10"><script type="application/json">'
+    f"{json.dumps(PRODUCT)}</script></div>"
+)
 
 
 def test_known_hosts_pass_and_reach_the_render():
-    html = comp(FIGURE + SCENE)
+    html = comp(FIGURE + SCENE + ANATOMY)
     shape, error = validate_motion_graphic(html, 30)
     assert error is None and shape["durationS"] == 18
     assert clean_reel(html) == html
@@ -46,6 +58,12 @@ def test_known_hosts_pass_and_reach_the_render():
         ('<div data-ripple="figure"></div>', "not a Ripple figure"),
         ('<div data-ripple="iso-scene"><script type="application/json">{x</script></div>', "JSON"),
         ('<div data-ripple="iso-scene"></div>', "JSON"),
+        ('<div data-ripple="anatomy"></div>', "JSON"),
+        (
+            '<div data-ripple="anatomy"><script type="application/json">'
+            '{"parts":[{"kind":"torus"}]}</script></div>',
+            "box, cylinder, ball",
+        ),
         ('<div data-ripple="chart"></div>', "unknown"),
     ],
 )
@@ -66,5 +84,6 @@ def test_the_brief_names_every_figure_in_both_prompts():
     reel = _MEDIA_BRIEFS["reel"].format(size="1080x1920", ripple=RIPPLE_BEATS_BRIEF)
     for prompt in (reel, ADD_MOTION_GRAPHIC_DESCRIPTION):
         assert 'data-ripple="figure"' in prompt and 'data-ripple="iso-scene"' in prompt
+        assert 'data-ripple="anatomy"' in prompt
         assert all(fid in prompt for fid in FIGURE_ANCHORS)
     assert "15 to 20 second" in reel
