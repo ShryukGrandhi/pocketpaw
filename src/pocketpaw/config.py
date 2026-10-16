@@ -2448,7 +2448,9 @@ class Settings(BaseSettings):
         default="test_mode",
         description=(
             "Dodo Payments environment — 'test_mode' (default) or 'live_mode'. "
-            "Selects the API base URL the DodoPayments client targets. Set via "
+            "Selects the API base URL the DodoPayments client targets. Webhook "
+            "deliveries grant credits or change plans only in 'live_mode' with "
+            "payments_open on, so a test-card payment never mints credits. Set via "
             "POCKETPAW_DODO_ENVIRONMENT."
         ),
     )
@@ -2712,6 +2714,105 @@ class Settings(BaseSettings):
             "daily call budget and the storage cap. Default False, so OSS / "
             "self-host sees no paywall and the seams do no extra database read. Set "
             "via POCKETPAW_SITES_BILLING_ENFORCED."
+        ),
+    )
+    credits_enforced: bool = Field(
+        default=False,
+        description=(
+            "Chat credit gate only, independent of billing_enforced. When True, "
+            "starting a chat or agent run is refused with HTTP 402 when the "
+            "workspace credit balance is <= 0 (credits.insufficient) or its "
+            "monthly credit ceiling is reached (credits.quota_exceeded), on "
+            "every seam that reads the shared run-start guard (chat HTTP, "
+            "execute_run, the group/DM bridge, /files agent ops, the planner). "
+            "The guard reads billing_enforced OR this flag. Unlike "
+            "billing_enforced it turns on nothing else: the seat, pocket, "
+            "connector, upload, storage, call and sites gates stay off. It "
+            "exists for the early-access launch, where free credits are "
+            "metered but no plan or upgrade surface is live. The platform "
+            "settings route refuses writes to it on purpose: a runtime switch "
+            "that turns enforcement off is a footgun. Default False. Set via "
+            "POCKETPAW_CREDITS_ENFORCED."
+        ),
+    )
+    payments_open: bool = Field(
+        default=False,
+        description=(
+            "Whether customers can pay (plans, top-ups). While False, a "
+            "workspace on the free plan with no purchased top_up or "
+            "subscription_grant in its ledger is platform-funded early access "
+            "(credits.guards.is_platform_funded_free), and the early-access "
+            "guards apply to it. While False the billing service also refuses "
+            "every checkout (top-up, subscribe, partner pay link) with 403 "
+            "payments.closed, and the Dodo webhook grants no credits and changes "
+            "no plan. Flip it together with live payment provider credentials "
+            "(dodo_environment=live_mode). The platform settings route refuses "
+            "writes to it. "
+            "Default False. Set via POCKETPAW_PAYMENTS_OPEN."
+        ),
+    )
+    free_run_max_turns: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "Model requests one platform-funded free run may make (an unpaid "
+            "early-access workspace, credits.guards.free_run_bounds), in place of "
+            "pydantic_ai_max_turns when lower. Such a run is also forced onto the "
+            "pydantic_ai backend and given a total token limit its wallet can pay "
+            "for. Applies only while credits_enforced or billing_enforced is on. "
+            "Set via POCKETPAW_FREE_RUN_MAX_TURNS."
+        ),
+    )
+    free_run_reserve_credits: int = Field(
+        default=100,
+        ge=1,
+        description=(
+            "Credits one platform-funded free run reserves on the daily early-access "
+            "ceiling (credits.guards.reserve_free_run) while it is in flight, or its "
+            "wallet when that is smaller. bill_run then moves the meter to the real "
+            "spend, overrun included, so the ceiling is a soft burn-rate limit: runs "
+            "already in flight may pass it. Higher holds more of the ceiling per "
+            "concurrent run. Set via POCKETPAW_FREE_RUN_RESERVE_CREDITS."
+        ),
+    )
+    free_model_allowlist: list[str] = Field(
+        default=["claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6"],
+        description=(
+            "Models a platform-funded turn on an unpaid early-access workspace may "
+            "use (credits.guards.free_model_denial). Matched exactly, ignoring case "
+            "and one known provider prefix such as litellm:. The per-send model, the "
+            "agent's own model and the model the forced pydantic_ai run really "
+            "uses must all be on it, and priced by the metering ladder, else the "
+            "turn is refused with 400 model.not_allowed. Paid workspaces and BYOK "
+            "turns are not limited. Applies only while credits_enforced or "
+            "billing_enforced is on. pydantic_ai_model is always checked, so it "
+            "must be on this list or every free turn is refused: change the two "
+            "together. Set via POCKETPAW_FREE_MODEL_ALLOWLIST as a JSON list."
+        ),
+    )
+    early_access_grant_credits: int = Field(
+        default=1_000,
+        ge=0,
+        description=(
+            "Early access credits granted ONCE per verified user, into the first "
+            "workspace they own (credits.service.grant_early_access). Fired on "
+            "owned-workspace create and on the guest social upgrade; never into "
+            "a workspace the user was only invited to. Keep it at or below the "
+            "free plan's monthly ceiling. 0 turns the grant off. Grants are "
+            "permanent, so changing it affects new users only. Set via "
+            "POCKETPAW_EARLY_ACCESS_GRANT_CREDITS."
+        ),
+    )
+    password_signup_open: bool = Field(
+        default=True,
+        description=(
+            "Whether new accounts may be created with an email and password. "
+            "When False, POST /auth/register and the guest password upgrade "
+            "(POST /auth/guest/upgrade) are refused with 403 "
+            "auth.password_signup_closed, and social sign-in (Google) is the "
+            "only way in. Existing password accounts still sign in. The "
+            "early-access launch runs with it False. Default True so self-host "
+            "keeps working. Set via POCKETPAW_PASSWORD_SIGNUP_OPEN."
         ),
     )
     billing_dunning_grace_days: int = Field(

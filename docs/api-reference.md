@@ -2401,6 +2401,329 @@ largest token lever on that surface, because the upstream prompt cache does
 not cover tool schemas — a run carrying a tool surface reads zero cached
 tokens every turn.
 
+## Agent chat: the run-start credit gate
+
+Every agent run is checked against the workspace credit wallet before any model
+call: the chat route `POST /cloud/chat/{scope}/{scope_id}/agent`, the worker that
+executes queued and resumed runs, the group/DM agent bridge, `/files` agent ops
+and the planner. The check is on when either `billing_enforced` or
+`credits_enforced` is set (see the configuration reference); with both off it does
+nothing. `credits_enforced` turns on this check and nothing else, which is the
+early-access posture: free credits are metered while the seat, pocket, connector,
+storage and sites gates stay off.
+
+Refusals carry a stable `code` the client branches on. The chat route answers
+before any run row exists, in the standard envelope:
+
+```json
+{"error": {"code": "credits.insufficient", "message": "..."}}
+```
+
+A run that reaches the worker gets exactly one terminal `error` frame on its
+stream, `{"code": "credits.insufficient", "message": "..."}`, and the run doc is
+marked `failed`. No model or backend is started either way.
+
+| Status | Code | Means |
+|--------|------|-------|
+| 503 | `early_access.paused` | free early-access usage is paused, or the day's free ceiling is reached (launch controls below); unpaid workspaces only |
+| 402 | `credits.insufficient` | the wallet balance is at or below 0 |
+| 402 | `credits.quota_exceeded` | month-to-date spend reached the plan's monthly ceiling |
+| 429 | `credits.run_in_progress` | an unpaid early-access workspace already has a chat run active (chat route and worker only) |
+| 400 | `model.not_allowed` | a platform-paid turn on an unpaid early-access workspace asked for a model that is not on `free_model_allowlist` or that nothing prices (see Free-run bounds) |
+
+The pause check runs first, then the balance check, then the quota check, then
+the one-run check, so a workspace that is both
+empty and over its ceiling sees `credits.insufficient`. A run already in flight is never stopped;
+a completed run is always billed, so the last run before the cap can take the
+wallet below 0.
+
+Who pays is decided before the check. Both the chat route and the worker resolve
+the workspace's stored provider key first. A turn on the workspace's own key
+(BYOK) skips the balance and quota check, so it runs at a wallet of 0, and its
+run debits nothing: the run doc records `credential_source: "byok"`, and billing
+keeps the token usage but charges 0 credits. A turn counts as BYOK only when the
+backend serving it spends the key: an agent on `pydantic_ai`, or any agent on a
+deny-by-default surface (the concierge), which always runs on `pydantic_ai`. A
+key stored for an agent on any other backend (for example `claude_agent_sdk`)
+does not pay for that agent's turns, so they are `credential_source:
+"platform"`, like every other turn, including one where looking up the key
+fails: gated and charged. If the per-turn backend for the key cannot be built,
+the turn ends with an `error` frame instead of running on platform credentials.
+With both billing flags off the route skips the key lookup entirely. A stored
+gateway address the egress guard rejects refuses the turn with 422
+`byok.base_url_rejected` (route) or that code on the terminal frame (worker).
+
+`payments_open` (default off) tells the server whether customers can pay. While
+it is off, a workspace on the `free` plan whose ledger holds no applied `top_up`
+or `subscription_grant` is platform-funded early access, the group the
+early-access limits apply to. The server also takes no money while it is off:
+`POST /billing/topup`, `POST /billing/subscribe` and `POST /api/v1/partners/pay-link`
+return 403 `payments.closed` (an approved plan-change proposal records that as a
+failed outcome), and the Dodo
+webhook grants no credits and changes no plan for `payment.succeeded` or
+`subscription.active` / `subscription.renewed`. Such a delivery is recorded with
+`credits_granted=0`, logged at ERROR for review, and acked 200. Webhook grants
+also need `POCKETPAW_DODO_ENVIRONMENT=live_mode`, since the payload carries no
+mode of its own. Refunds, disputes, cancels and dunning still apply.
+
+### Free-run bounds
+
+While the gate above is on, a platform-paid run on an unpaid early-access
+workspace is bounded if it goes through the run executor (`execute_run`): the
+chat route, the worker, the Paw Bar and the concierge. A BYOK run and a paid
+workspace are not bounded.
+
+- One active chat run per workspace. A second send while one is queued or
+  running gets 429 `credits.run_in_progress` from the chat route; if two race
+  past the route, the worker lets the older run through and refuses the newer
+  one with that code on its terminal frame.
+- The run is served by `pydantic_ai` whatever backend the agent is configured
+  for (an agent on another backend runs on the deployment's
+  `pydantic_ai_model`, and a per-send model picked for that backend is dropped).
+  The agent's own tool policy carries over, so a planner opt-in still applies.
+- Only models on `free_model_allowlist` (default `claude-haiku-4-5`,
+  `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`; matched ignoring case and
+  one leading prefix naming a known provider, such as `litellm:`) that the
+  metering prices can price. The
+  per-send model, else the agent's own model, else `pydantic_ai_model` must
+  pass, and so must `pydantic_ai_model` itself when the agent is on another
+  backend, because that is what the forced run really uses. Otherwise the turn
+  is refused with 400 `model.not_allowed`: the chat route checks all of them
+  before any run row, stream or turn counter exists, and the worker checks them
+  again and ends the run with that code on its terminal frame before any
+  backend is built. Since `pydantic_ai_model` is always checked, set it and
+  `POCKETPAW_FREE_MODEL_ALLOWLIST` together: a default off the allowlist
+  refuses every free turn. An
+  allowlisted model that nothing prices is refused too, since it would bill 0.
+  Opus and Fable are not on the default list.
+- At most `free_run_max_turns` (default 20) model requests.
+- A total token limit sized from the wallet the run starts with, at the output
+  price of the model it runs, so the run stops at or before the wallet. A run
+  that hits a limit ends with an `error` frame; the usage it already spent is
+  billed. An unpriced model gets no token limit (the request cap still applies).
+
+Three paths start agent runs without `execute_run` and are not billed: the
+group/DM agent bridge, the `/files` AI edits (`ai-edit`, `spreadsheet-edit`,
+`slides-edit`) and the planner's task runs. A wallet that is never debited
+cannot bound them, so an unpaid early-access workspace is refused there instead,
+under the same flags, with 403 `early_access.not_available`. The `/files` routes
+answer with that code in the standard envelope, the bridge emits one
+`agent.error` with it to the group, and the planner leaves the tasks `proposed`
+and logs it. A paid workspace runs these paths as before.
+
+### Early access grant
+
+Every verified user gets `early_access_grant_credits` (default 1,000) early
+access credits once. The grant lands in the oldest workspace the user owns,
+never in one they were invited to, and is written as a `genesis` ledger entry
+with cause `early_access` and idempotency key `early_access:{user_id}`. It fires
+on every social sign-in (`/auth/social/callback`, so an account that already
+owned a workspace before launch is granted on its next Google sign-in), when a
+verified user creates a workspace they own, and when a guest upgrades through
+social sign-in (`/auth/social/...` link flow); a guest or an unverified account
+gets nothing. A user who owns no workspace yet (joined by invite or domain
+auto-join) is granted when they first create one. A second owned workspace, a
+retry, or deleting the granted workspace and creating another never grants
+again. On sign-in and workspace create the grant is best-effort: a ledger
+failure is logged, the request still succeeds, and the next sign-in retries. The user row records the
+claim in `early_access_workspace_id` and `early_access_granted_at`.
+
+### Spend outside the ledger: not in early access yet
+
+Some features spend on models or providers without writing to the credit
+ledger, so the wallet cannot bound them. For a platform-funded early-access
+workspace (the group defined above) they are refused instead, while the run-start
+gate is on (`billing_enforced` or `credits_enforced`). A paid workspace, or any
+workspace once `payments_open` is on, is not affected.
+
+| Surface | What the caller gets |
+|---------|----------------------|
+| Belt: every `/api/v1/belt/...` route | 403 `early_access.not_available` |
+| Belt mandates: every `/api/v1/belt/mandates/...` route, plan approve included | 403 `early_access.not_available` |
+| Studio: `POST /api/v1/studio/generate`, `/edit`, `/video-elements`, `/video-motion-control`, `/music`, `/transcribe` | 403 `early_access.not_available` (history reads stay open) |
+| Foresight: `POST /api/v1/foresight/scenarios`, `POST /api/v1/foresight/backtests`, and the chat agent's `run_scenario` tool | 403 `early_access.not_available` (the tool returns it as `{"ok": false, "error": "early_access.not_available"}`) |
+| Foresight insights with the LLM synthesizer switched on | the pattern synthesizer's rows instead |
+| Chat media tools (`image_generate`, `audio_generate`, `audio_transcribe`, `video_generate`, `generate_site_image`, `generate_site_video`) | a tool error saying the feature is not in early access yet; no provider call |
+| Paw Bar concierge on a site the workspace owns | the visitor gets the `unavailable` frame with reason `limit`; no run, no model call |
+| LiveKit meeting notes | the call runs without the notes bot |
+
+```json
+{"error": {"code": "early_access.not_available", "message": "This is not in early access yet."}}
+```
+
+Routes attach it with the FastAPI dependency
+`pocketpaw_ee.cloud._core.deps.require_paid_or_early_access_allowed`; other
+callers use `credits.guards.early_access_denial` or `assert_early_access_allowed`.
+Any new feature that spends outside the ledger needs the same check.
+
+### Password sign-up switch
+
+With `password_signup_open` off, the two password sign-up doors refuse:
+
+| Route | Status | Code |
+|-------|--------|------|
+| `POST /auth/register` | 403 | `auth.password_signup_closed` |
+| `POST /auth/guest/upgrade` | 403 | `auth.password_signup_closed` |
+
+Social sign-in is unaffected, and existing password accounts still log in.
+
+### Early-access launch controls
+
+Three platform-wide switches live in one Mongo document (`launch_controls`
+collection, a single row with `key: "global"`). A missing row means the defaults.
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `free_usage_paused` | `false` | Kill switch. While on, every platform-paid agent run on an unpaid early-access workspace is refused (a BYOK turn is not) with 503 `early_access.paused` at the run-start gate above (so only while that gate is on). Paid workspaces are not affected. |
+| `signups_paused` | `false` | Signup pause. Stored and readable; the account-creation check that enforces it is not built yet. |
+| `daily_free_ceiling_credits` | `25000` | Global daily free ceiling, in credits per UTC day, shared by every unpaid workspace. See "Daily free ceiling" below. `0` refuses every free run. |
+
+Every process (web and arq worker) reads the row through a 30-second in-process
+cache, so a flip takes effect everywhere within 30 seconds with no restart. If
+the read fails, the server logs an error and uses the defaults, so the pause
+flags fail open; the per-workspace credit gate still applies. The daily ceiling
+fails closed instead: while the row cannot be read, free runs are refused.
+
+#### Daily free ceiling
+
+Every platform-paid agent run on an unpaid early-access workspace (not a BYOK
+turn, not a paid workspace) reserves an estimate on one platform-wide meter
+before the model is called: the `daily_usage` row with `meter:
+"early_access_credits"`, `subject_type: "workspace"`, `subject_id:
+"__platform__"` and the UTC `day`. The estimate is `free_run_reserve_credits`
+(default 100, env `POCKETPAW_FREE_RUN_RESERVE_CREDITS`), or the wallet the run
+starts on in whole credits rounded up when that is smaller. It is a per-run hold,
+not the most the run may spend, so many users chatting at once do not fill the
+ceiling with holds while real spend is low. If the reservation would take the day past
+`daily_free_ceiling_credits`, or the meter or the control row cannot be read,
+the run ends at once with 503 `early_access.paused` (terminal `error` frame,
+run `failed`) and no model call. Paid and BYOK runs never touch the meter.
+
+When the run is billed, the reservation is reconciled to the real spend (whole
+credits rounded up): an unused estimate is given back, so a run refused or
+dropped before the model call releases all of it, and spend past the estimate
+is added even above the ceiling, so the next reservations see it. Each run is
+reconciled once, however often it is billed. The meter therefore reads
+"credits spent today plus credits held by runs in flight".
+
+The ceiling is a soft burn-rate limit, not a hard cap: a run that spends more
+than its hold still finishes, so runs already in flight can take the day past the
+ceiling by up to (concurrent free runs) x (run spend minus the hold). Each user's
+one-time grant still bounds what that user can ever spend.
+
+Operators change the switches with `PUT /api/v1/platform/launch-controls`
+(`platform.settings.write`, audited as `platform.launch_controls.write`) and read
+them with `GET /api/v1/platform/launch-controls` (`platform.settings.read`):
+
+```json
+PUT /api/v1/platform/launch-controls
+{"free_usage_paused": true, "reason": "cost spike"}
+
+200 {"signups_paused": false, "free_usage_paused": true, "daily_free_ceiling_credits": 25000}
+```
+
+Only the fields sent change. `reason` is required (422
+`platform.launch_controls.reason_required`), and a body with no field to change
+is 422 `platform.launch_controls.no_changes`. The writing process sees the change
+at once. An operator can also flip the row in Mongo directly:
+
+```js
+db.launch_controls.updateOne({key: "global"}, {$set: {free_usage_paused: true}}, {upsert: true})
+```
+
+### Early-access waitlist
+
+`POST /api/v1/early-access/waitlist` takes an email from a visitor who cannot
+sign up yet. No sign-in.
+
+```json
+{"email": "ada@example.com", "source": "ripple"}
+```
+
+`source` is optional free text (at most 64 characters). The email is stored
+lowercased in the `waitlist` collection with its `source` and `created_at`.
+The answer is 204 whether or not the email was already on the list, and a repeat
+join adds nothing. A malformed email is 422. Each IP gets 5 joins an hour; past
+that the answer is 429 `early_access.waitlist_rate_limited`.
+
+### Early-access client contract
+
+Three reads and one write the client uses to show early access. All of them are
+display only: every limit is enforced on the server.
+
+`GET /entitlements` carries the deployment's payment posture and the models a
+free workspace may use, both read from settings (`POCKETPAW_PAYMENTS_OPEN`,
+`POCKETPAW_FREE_MODEL_ALLOWLIST`) and the same for every workspace:
+
+```json
+{
+  "workspace_id": "...",
+  "plan": "free",
+  "monthly_credit_allotment": 0,
+  "features": [],
+  "payments_open": false,
+  "free_model_allowlist": ["claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6"]
+}
+```
+
+(other entitlement fields omitted). While `payments_open` is false the client
+renders no upgrade, plan, pricing or top-up surface, and its model pickers offer
+only `free_model_allowlist` to a free workspace.
+
+`POST /api/v1/early-access/notify` records that the signed-in user wants to hear
+when plans open. No body. It sets `User.notify_plans_at` on the first call and
+returns that time on every call, so a repeat click changes nothing:
+
+```json
+{"notified_at": "2026-10-16T09:00:00+00:00"}
+```
+
+No session is 401. Nothing is emailed; the launch stats count the stamp.
+
+`GET /auth/me` carries two early-access stamps, null until each happens:
+`early_access_granted_at` (the one-time credit grant landed) and
+`notify_plans_at` (the notify call above). Every early-access timestamp here is
+a UTC ISO string with an explicit `+00:00` offset.
+
+### Early-access launch stats
+
+`GET /api/v1/platform/stats/early-access?days=14` (`platform.stats.read`,
+audited once per load as `platform.stats.read`) returns the launch numbers for
+the trailing `days` UTC days, today included (default 14, 1 to 90, otherwise
+422). Every day is present, zero-filled. All live queries, no rollup.
+
+```json
+{
+  "days": [
+    {"date": "2026-10-16", "signups": 12, "credits_burned": 840, "notify": 3, "waitlist": 1}
+  ],
+  "cap_share": 0.25,
+  "today": {"meter": 840, "ceiling": 25000},
+  "controls": {"signups_paused": false, "free_usage_paused": false, "daily_free_ceiling_credits": 25000},
+  "errors": []
+}
+```
+
+- `signups`: users created that day (ObjectId time). Guest rows are not counted.
+- `credits_burned`: applied spend debits (`compute_spend`, `litellm_spend`) on
+  unpaid workspaces, in whole credits rounded up. Unpaid means the workspace's
+  plan resolves to `free` (no plan, or a plan outside the catalog, counts as
+  free) and its ledger holds no applied `top_up` or `subscription_grant`,
+  whether or not payments are open.
+- `notify`: users whose `notify_plans_at` falls that day. `waitlist`: waitlist
+  joins that day.
+- `cap_share`: granted users (`early_access_granted_at` set) whose granted
+  workspace balance is at or below 0, over all granted users. `0.0` when nobody
+  is granted.
+- `today`: the early-access meter (credits spent plus held by runs in flight,
+  see "Daily free ceiling") against `daily_free_ceiling_credits`. `null` when
+  the meter cannot be read.
+- `controls`: the launch controls, read fresh.
+- `errors`: one line per block that failed. Only three blocks degrade this way:
+  cap share (reported as `0.0`), the meter (`today` is `null`) and a control read
+  that fell back to defaults. A failed signup, notify, waitlist or burn query
+  fails the request with a 500.
+
 ## Agent Activity
 
 HR-12a. The workspace-scoped answer to "which of my agents are working
