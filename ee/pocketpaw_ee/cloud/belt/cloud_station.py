@@ -3,71 +3,46 @@
 # The headless station's mode for a host that can't carry the build
 # (``POCKETPAW_MANDATE_DISPATCHER=headless`` + ``POCKETPAW_FACTORY_DEVELOP=cloud``).
 # ``CloudTaskDispatcher`` files an approved task as the usual queued run, then:
-#   LAUNCH  ONE trusted launch clone (``POCKETPAW_FACTORY_CLOUD_LAUNCH_DIR``, never
-#           the bound repo) serves every allowlisted GitHub repo, re-pointed and
-#           detached at ``origin/<base>`` (the run's base, else the bound repo's
-#           checked-out branch, stored on the run); task text is injection-
-#           screened; ``claude --cloud "<brief>"`` runs under ``pty_run.py`` (a
-#           folder-trust prompt fails fast). Worker brief: one PR to <base>, ``Closes
-#           #<issue>`` + ``Belt-Run: <run id>`` (or a comment on an open PR already
-#           closing it), the label, the charter checks, no AI attribution, the
-#           seat's instructions fenced; with a fixer's, ``orient.reuse_block`` (the
-#           clone's C4 components for the issue) and the docs-MCP line.
-#   TRACK   ``gh`` finds the PR by its marker, else ADOPTS an open one closing the
-#           issue; the repo's lane + CI gate it; Clef shadow-scores it; CI
-#           ``snapshots`` PNGs are kept. NUDGE: green + MERGEABLE for LANE_NUDGE s
-#           gets ``gh workflow run``, once per interval per repo. STUCK
-#           (CONFLICTING, red past FIX_GRACE, or a failed review): ONE fixer per
-#           head on the branch, kind ``rebase``/``ci``/``review``, up to
-#           FIX_ATTEMPTS, then the diff escalates. MERGED -> approved as
-#           ``system:fast-lane``, executed, then the TESTER. REFUSED -> diff gate.
-#           TIMEOUT -> ``headless_error``. NO PR by NO_PR_TIMEOUT: a worker's issue
-#           comment releases the run (``needs-human``), else RELAUNCHES, then the
-#           run is RELEASED (rejected).
-#   REVIEW  ``POCKETPAW_FACTORY_CLOUD_REVIEWER=1``: a tracked head with no verdict
-#           and green CI (its commit's check runs when the PR rollup has none, as
-#           the lane reads them) gets ONE reviewer, REVIEW_CAP in flight at most;
-#           Belt posts ``belt/review`` pending. The reviewer judges the diff against
-#           the issue and docs/review-rubric.md, engineering.md, design.md, and
-#           posts ONE comment ``Belt-Review: pass|fail`` / ``Head: <sha>`` (fail:
-#           file:line items); never a status or a push. Belt reads it (after the
-#           launch, this head) and posts the status; a fail's items go to Clef first
-#           (``clef.judge_review``; live, a round of only follow-ups passes) and the
-#           holding ones to a ``review`` fixer. No verdict by REVIEW_TIMEOUT or the
-#           deadline, no session or an unowned stale pending: success "review timed out".
-#   LESSONS a merged PR a ``ci``/``review`` fixer got through, and each bug the
-#           tester files on the line (also judged: ``clef.judge_tester_bugs``),
-#           become one deduplicated lesson in the mandate's soul (tagged repo ·
-#           line); a worker brief recalls the top 5, fenced, capped at 1,200.
-#   TESTER  ``POCKETPAW_FACTORY_CLOUD_TESTER=1`` + a live ``tester`` seat: ONE
-#           session per landed run tries to break it, files bugs, puts tests in one
-#           ``Belt-Test`` PR (tracked like the worker's, its own fixer cap, into
-#           ``tester``), fixes nothing; it never holds or fails the land.
-#   RESUME  at startup ``resume_all`` re-tracks (never relaunches) each pending run
-#           with ``headless_state="cloud"`` and no diff, carrying ``fixes``,
-#           ``reviews``, ``relaunches``, ``adopted_pr``; settles a review an ended
-#           tracker left pending; with the tester on, each open tester PR too. A
-#           run whose tracker died on a ``TRACK:`` error inside its timeout is
-#           tracked again with the error cleared (lesson 45). The tracker's gh
-#           reads retry transient failures with backoff first (lesson 42).
-#   LEAD    ``recipe == "feature-lead"``: ONE session per feature issue, briefed
-#           from the launch clone's ``docs/factory/lead.md`` plus the issue, the
-#           packet, the run id and the lead contract's rules. Every PR with
-#           ``Belt-Lead: <run id>`` is kept on ``lead.prs``; none is reviewed or
-#           fixed by Belt (the lead's critics are its review). DONE: a merged
-#           ``feature-done`` PR, green dev CI on its merge commit and a
-#           ``Belt-Contact-Sheet:`` issue comment since the launch, or the feature
-#           issue closed (done at once, never nudged or relaunched). STALL: no
-#           ``lead/<feature>`` commit, PR update or issue comment (its progress)
-#           for LEAD_STALL: a ``claude -p --cloud`` nudge, then a resume relaunch,
-#           then ``needs-human`` and the run released. WAITING is no stall and gets
-#           no rung: the ``Next:`` of the branch's RECORD.md (read with its last
-#           commit) names CI or the lane, and a run on the base is live or ended
-#           inside LEAD_STALL. LEAD_TIMEOUT (8 h, from the launch, or from the last
-#           progress while waiting) settles like the last rung (labelled and
-#           released, never a develop failure) once the lead is also silent for a
-#           stall window; a lead still working stops at twice it from the launch.
-#           No no-PR rule.
+#   LAUNCH  one trusted launch clone (``POCKETPAW_FACTORY_CLOUD_LAUNCH_DIR``, never the
+#           bound repo) serves every allowlisted repo, detached at ``origin/<base>``;
+#           the task is injection-screened; ``claude --cloud "<brief>"`` runs under
+#           ``pty_run.py``. A worker opens ONE PR with ``Closes #<issue>``, ``Belt-Run:
+#           <run id>``, the label and the charter checks, and no AI attribution.
+#   TRACK   gh finds the PR by its marker (else adopts one closing the issue); the
+#           lane and CI gate it; Clef shadow-scores it; CI ``snapshots`` PNGs are kept.
+#           Green + MERGEABLE nudges the lane once per interval per repo. STUCK
+#           (conflict, red past FIX_GRACE, a failed review) gets one fixer per head,
+#           up to FIX_ATTEMPTS, then the diff escalates. MERGED: approved as
+#           ``system:fast-lane``, executed, then the tester. No PR by NO_PR_TIMEOUT:
+#           a worker's comment releases it (``needs-human``), else a relaunch, then
+#           release. gh reads retry transient failures with backoff (lesson 42).
+#   REVIEW  ``POCKETPAW_FACTORY_CLOUD_REVIEWER=1``: one reviewer per green head
+#           (REVIEW_CAP in flight) posts ``Belt-Review: pass|fail`` + ``Head: <sha>``;
+#           Belt turns it into the ``belt/review`` status (a fail's items go through
+#           ``clef.judge_review`` to a ``review`` fixer); no verdict in time passes.
+#   LESSONS a merged PR a ``ci``/``review`` fixer got through, and each tester bug, is
+#           one deduplicated lesson in the mandate's soul; a brief recalls the top 5.
+#   TESTER  ``POCKETPAW_FACTORY_CLOUD_TESTER=1`` + a ``tester`` seat: one session per
+#           landed run files bugs and one ``Belt-Test`` PR; it never holds the land.
+#   RESUME  at startup every launched run with no diff is tracked again (never
+#           relaunched), as is one whose tracker died on a TRACK error (lesson 45).
+#   LEAD    ``recipe == "feature-lead"``: one session per feature issue, briefed from
+#           the clone's ``docs/factory/lead.md``, the issue, the packet and the run id.
+#           Its ``Belt-Lead: <run id>`` PRs are kept on ``lead.prs`` with the slices
+#           their ``Slice:`` line names; Belt never reviews or fixes them.
+#           DONE v3 (the feature's ``.wave.json`` in the clone listed ``slices`` at
+#           launch: ``lead.slice_ids``): every slice has a ``Belt-Slice-Done: <slice> <run url>``
+#           comment since the launch whose run is a ``success`` ci.yml run on the base
+#           holding the slice's last merged PR, then the ``Belt-Contact-Sheet:``
+#           comment; ``lead.slices`` keeps each slice's state and gaps. DONE v2 (no
+#           slices, or launched before them): a merged ``feature-done`` PR, green dev
+#           CI on its merge commit and the contact sheet. A closed feature issue is
+#           done at once. STALL: no branch commit, PR update or comment for LEAD_STALL
+#           gets a nudge, a resume relaunch, then ``needs-human`` and release; a RECORD
+#           ``Next:`` naming CI or the lane while a base run is live is a wait, not a
+#           stall. LEAD_TIMEOUT (8 h from the launch, or the last progress while
+#           waiting) settles like the last rung once the lead is silent too; a lead
+#           still working stops at twice it. No no-PR rule.
 # Only git, gh and the launcher run locally; an approved escalated diff lands on the line.
 
 from __future__ import annotations
@@ -91,7 +66,7 @@ from pathlib import Path
 from typing import Any, ClassVar, cast
 
 from pocketpaw_ee.cloud.belt import clef, orient
-from pocketpaw_ee.cloud.belt.app_blueprint import SLICE_ID, parse_record, parse_slices
+from pocketpaw_ee.cloud.belt.app_blueprint import SLICE_ID, parse_record, parse_wave
 from pocketpaw_ee.cloud.belt.develop_station import (
     _GIT,
     ClaudeCodeDevelop,
@@ -133,17 +108,17 @@ _PACKET = re.compile(r"docs/blueprints/([\w.-]+)/features/([\w.-]+)\.md")
 _SAFE_FEATURE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _FEATURE_DONE = "feature-done"
 _CONTACT_SHEET = "Belt-Contact-Sheet:"
-# v3 (the packet has a Slices table): one ``Belt-Slice-Done: <slice> <run url>``
-# issue line per slice, optionally ending `` gaps: #n #m``; each lead PR names
-# its slices in a ``Slice: <id>[, <id>]`` body line; a slice's run must be this
-# workflow. A packet over the cap fails the launch unread.
+# v3 (the feature's ``.wave.json`` lists ``slices``): one ``Belt-Slice-Done:
+# <slice> <run url>`` issue line per slice, optionally ending `` gaps: #n #m``;
+# each lead PR names its slices in a ``Slice: <id>[, <id>]`` body line; a
+# slice's run must be this workflow. A wave.json over the cap fails the launch.
 _SLICE_DONE = "Belt-Slice-Done:"
 _SLICE_DONE_LINE = re.compile(
     r"^[ \t]*Belt-Slice-Done:[ \t]+(\S+)[ \t]+(\S+)(?:[ \t]+gaps:(.*))?", re.M
 )
 _SLICE_LINE = re.compile(r"^Slice:[ \t]*(.+)$", re.M)
 _SLICE_WORKFLOW = ".github/workflows/ci.yml"
-_PACKET_BYTES = 256 * 1024
+_WAVE_BYTES = 256 * 1024
 _CI_DONE_OK = {"success", "neutral", "skipped"}
 # A lead's RECORD ``Next:`` that names a wait it cannot shorten: CI or the lane.
 _WAITS_ON_CI = re.compile(r"\bCI\b|\b[Ll]ane\b")
@@ -579,10 +554,10 @@ class CloudTaskDispatcher:
     ) -> dict[str, Any]:
         """The lead's feature from its task: the issue it cites and the packet
         ``docs/blueprints/<app>/features/<feature>.md`` the task names, else the
-        one the issue's body links, and the ids of the packet's Slices table as
-        the launch clone (at ``origin/<base>``) has it (``_packet_slices``). A
-        missing issue or packet, or a feature name unsafe in a branch, fails the
-        launch."""
+        one the issue's body links, and the slice ids of the feature's
+        ``.wave.json`` beside it as the launch clone (at ``origin/<base>``) has
+        it (``_wave_slices``). A missing issue or packet, or a feature name
+        unsafe in a branch, fails the launch."""
         issue = _ISSUE.search(request.task)
         if not issue:
             raise CloudStationError("LAUNCH: a feature lead's task names no feature issue")
@@ -607,7 +582,7 @@ class CloudTaskDispatcher:
             "packet": packet.group(0),
             "issue": int(issue.group(1)),
             "branch": f"lead/{feature}",
-            "slice_ids": _packet_slices(launch, packet.group(0)),
+            "slice_ids": _wave_slices(launch, packet.group(0)),
         }
 
     async def _track_lead(
@@ -872,9 +847,8 @@ class CloudTaskDispatcher:
             row["pr"] = last["number"] if last else None
             was = kept.get(sid) or {}
             if line and last:
-                same = was.get("done") and (was.get("run"), was.get("pr")) == (
-                    row["run"],
-                    row["pr"],
+                same = (
+                    was.get("done") and was.get("pr") == row["pr"] and was.get("run") == row["run"]
                 )
                 row["done"] = bool(same) or await self._slice_green(
                     slug, base, row["run"], last["merge_sha"], cwd
@@ -2155,7 +2129,7 @@ def _lead_brief(
         lines = f"lines `{LEAD_MARKER} {request.action_id}`, `Feature: {feature}` and `Slice: "
         lines += "<slice>` (the slice ids it serves, comma separated), then "
         done = (
-            f"- Done, slice by slice. Slices: {', '.join(ids)} (the packet's Slices table). "
+            f"- Done, slice by slice. Slices: {', '.join(ids)} (the packet's slices). "
             f"A slice is done when a completed, successful ci.yml run on {base} (scoped with "
             f"`app={app}`, or a full run) contains its last merged PR, the newest one whose "
             f"`Slice:` line names it. Then comment on #{issue} with the line `{_SLICE_DONE} "
@@ -2170,7 +2144,7 @@ def _lead_brief(
             "At most 2 fix rounds per slice; findings still open after the second become "
             "`gap` issues and the slice is done with gaps.",
         ]
-    else:  # v2: the packet has no Slices table
+    else:  # v2: the wave.json lists no slices
         lines = f"lines `{LEAD_MARKER} {request.action_id}` and `Feature: {feature}`, then "
         done = (
             f"- Done: the last PR also carries the label `{_FEATURE_DONE}`. Once it has merged "
@@ -2277,23 +2251,24 @@ def _slice_lines(comments: list[dict[str, Any]], since: float) -> dict[str, dict
     return said
 
 
-def _packet_slices(launch: Path, packet: str) -> list[str]:
-    """The slice ids of the packet's Slices table in the launch clone, in order,
-    deduplicated; [] when the clone has no such file or table (the v2 done
-    rule). A packet outside the clone or over ``_PACKET_BYTES``, or an unsafe
-    id, fails the launch. ponytail: read once per launch, so a packet re-cut
-    mid-flight counts from the lead's next relaunch."""
-    path = launch / packet
+def _wave_slices(launch: Path, packet: str) -> list[str]:
+    """The ``slices`` ids of the feature's ``.wave.json`` (beside the packet) in
+    the launch clone, in order, deduplicated; [] when it is missing, not a JSON
+    object or lists no slices (the v2 rule, unchanged). One outside the clone or
+    over ``_WAVE_BYTES``, or an unsafe id, fails the launch. ponytail: read once
+    per launch, so slices re-cut mid-flight count from the lead's next relaunch."""
+    wave = packet.removesuffix(".md") + ".wave.json"
+    path = launch / wave
     if not path.is_file():
         return []
     if not path.resolve().is_relative_to(launch.resolve()):
-        raise CloudStationError(f"LAUNCH: packet {packet} is outside the launch clone")
-    if path.stat().st_size > _PACKET_BYTES:
-        raise CloudStationError(f"LAUNCH: packet {packet} is over {_PACKET_BYTES} bytes")
-    rows = parse_slices(path.read_text(encoding="utf-8", errors="replace"))
-    ids = list(dict.fromkeys(r["id"] for r in rows))
+        raise CloudStationError(f"LAUNCH: {wave} is outside the launch clone")
+    if path.stat().st_size > _WAVE_BYTES:
+        raise CloudStationError(f"LAUNCH: {wave} is over {_WAVE_BYTES} bytes")
+    parsed = parse_wave(path.read_text(encoding="utf-8", errors="replace")) or {}
+    ids = list(dict.fromkeys(s["id"] for s in parsed.get("slices") or []))
     if bad := [i for i in ids if not SLICE_ID.match(i)]:
-        raise CloudStationError(f"LAUNCH: packet {packet} has unsafe slice ids {bad[:5]!r}")
+        raise CloudStationError(f"LAUNCH: {wave} has unsafe slice ids {bad[:5]!r}")
     return ids
 
 

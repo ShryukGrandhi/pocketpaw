@@ -29,7 +29,7 @@ _LAYER_RULES = (
     ("app", re.compile(r".*-app|apps")),
 )
 _FIELD = re.compile(r"^(Stage|Next):[ \t]*(\S.*?)[ \t]*$", re.M)
-# A packet slice id (``contract``, ``S1``): what Belt builds lines and argv from.
+# A wave.json slice id (``CT-a``, ``S1``): what Belt builds lines and argv from.
 SLICE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 _SETTLED = {"landed", "rejected", "failed"}
 
@@ -37,7 +37,9 @@ _SETTLED = {"landed", "rejected", "failed"}
 def parse_wave(text: str) -> dict[str, Any] | None:
     """A feature's ``.wave.json`` as plan fields, or ``None`` when it is not a
     JSON object. ``issue`` is the ``feature_issue`` number only when it reads
-    ``#N`` exactly ("file when ready" and "later" are not filed)."""
+    ``#N`` exactly ("file when ready" and "later" are not filed). ``slices`` (a
+    v3 packet's) keeps each entry with a string ``id``, unvalidated, and its
+    ``waits`` keys (``<feature>``, ``<feature>:<slice>`` or a sibling slice)."""
     try:
         raw = json.loads(text)
     except ValueError:
@@ -46,7 +48,8 @@ def parse_wave(text: str) -> dict[str, Any] | None:
         return None
     issue = re.fullmatch(r"#(\d+)", str(raw.get("feature_issue") or "").strip())
     waits = [c for c in str(raw.get("waits_on") or "").split(";") if "not blocking" not in c]
-    owned = raw.get("owned")
+    owned, slices = raw.get("owned"), raw.get("slices")
+    slices = slices if isinstance(slices, list) else []
     return {
         "title": raw.get("title"),
         "wave": str(raw.get("wave") or "").removeprefix("W"),
@@ -57,6 +60,20 @@ def parse_wave(text: str) -> dict[str, Any] | None:
         # ponytail: refs are plain numbers; B3 resolves which repo each lives in
         "waits_on": [int(n) for c in waits for n in re.findall(r"#(\d+)", c)],
         "owned": [p for p in owned if isinstance(p, str)] if isinstance(owned, list) else [],
+        "slices": [
+            {
+                "id": s["id"],
+                "behavior": s.get("behavior"),
+                **{
+                    k: [x for x in s[k] if isinstance(x, str)]
+                    if isinstance(s.get(k), list | dict)  # waits is {ref: [task ids]}
+                    else []
+                    for k in ("tasks", "journeys", "waits")
+                },
+            }
+            for s in slices
+            if isinstance(s, dict) and isinstance(s.get("id"), str)
+        ],
     }
 
 
@@ -91,44 +108,6 @@ def parse_record(text: str | None) -> dict[str, Any]:
         task = {k: row.get(k) or None for k in ("id", "wave", "state")}
         tasks.append(task | {"files": files, "pr": int(pr.group(1)) if pr else None})
     return {"stage": fields.get("Stage"), "next": fields.get("Next"), "tasks": tasks}
-
-
-def parse_slices(text: str | None) -> list[dict[str, Any]]:
-    """A packet's Slices table (the first table whose header has ``slice`` and
-    ``tasks``), one row per slice: ``id`` and ``behavior``, and ``tasks``,
-    ``journeys`` and ``waits`` as lists (``–`` is none). Backticks and bold are
-    stripped; ids are NOT validated (``SLICE_ID`` is the caller's). [] with none."""
-    rows: list[dict[str, Any]] = []
-    header: list[str] | None = None
-    for line in (text or "").splitlines():
-        if not line.startswith("|"):
-            if rows:
-                break  # the table ended
-            header = None
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if header is None:
-            names = [c.lower() for c in cells]
-            header = names if {"slice", "tasks"} <= set(names) else []
-            continue
-        if not header or set(cells[0]) <= set("-: "):
-            continue
-        row = dict(zip(header, cells, strict=False))
-
-        def items(key: str, row: dict[str, str] = row) -> list[str]:
-            parts = (p.strip(" `*") for p in re.split(r"[,;]", row.get(key, "")))
-            return [p for p in parts if p not in {"", "–", "-"}]
-
-        rows.append(
-            {
-                "id": row["slice"].strip(" `*"),
-                "behavior": row.get("behavior") or None,
-                "tasks": items("tasks"),
-                "journeys": items("journeys"),
-                "waits": items("waits on"),
-            }
-        )
-    return rows
 
 
 def resolve_files(tokens: list[str], tree: list[str]) -> list[str]:

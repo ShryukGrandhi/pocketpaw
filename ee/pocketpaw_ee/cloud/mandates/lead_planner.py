@@ -91,10 +91,10 @@ def _task(sighting: dict[str, Any], number: str) -> PlannedTask:
         evidence_refs=[str(sighting["id"])],
         # The planner reads no packet, so the outcome names both done rules.
         expected_outcome=(
-            f"#{number} shipped by its feature lead, slice by slice when its packet has a "
-            "Slices table: every slice done on a green ci.yml run that holds its last PR "
+            f"#{number} shipped by its feature lead, slice by slice when its wave.json lists "
+            "slices: every slice done on a green ci.yml run that holds its last PR "
             "(builders never wait on CI or critics, findings queue, at most 2 fix rounds per "
-            "slice), then a contact sheet on the issue. A packet without slices: a merged "
+            "slice), then a contact sheet on the issue. A feature without slices: a merged "
             "feature-done PR, dev CI green and a contact sheet"
         ),
         recipe=LEAD_RUN_KIND,

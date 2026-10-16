@@ -631,5 +631,6 @@ def test_the_expected_outcome_names_slices_and_keeps_the_v2_rule():
     (task,) = lead_planner.plan(1, [_s(42, "p1")], 3).tasks
     out = task.expected_outcome
     assert out.startswith("#42 shipped by its feature lead, slice by slice")
+    assert "every slice done on a green ci.yml run that holds its last PR" in out
     assert "never wait on CI or critics" in out and "at most 2 fix rounds per slice" in out
-    assert "A packet without slices: a merged feature-done PR, dev CI green" in out
+    assert "A feature without slices: a merged feature-done PR, dev CI green" in out
