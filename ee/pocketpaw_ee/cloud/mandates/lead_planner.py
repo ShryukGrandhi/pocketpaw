@@ -17,13 +17,17 @@
 #
 # NEVER TWICE, UNTIL RE-ARMED: an issue labelled ``needs-human`` is skipped,
 # read off the LIVE labels (``labels``) the caller passes, else the ones filed
-# with the sighting. The station's only way to end a lead short of done (the
-# stall ladder's last rung, the lead timeout) labels the issue ``needs-human``,
-# then rejects the run; a human removes the label to retry. So a ``rejected``
-# citing task (``tasks``, the ones ``service._backlog`` lists) holds the issue
-# only while the label is on, and a re-armed lead released again is held again.
-# A ``failed`` or ``develop failed`` task never went through that path, so no
-# label marks it and nobody has looked: it holds the issue for good.
+# with the sighting. The station's ways to end a lead short of done (a release,
+# a stale-base refusal) label the issue ``needs-human``, then reject the run; a
+# human removes the label to retry. A rejected run never counts as a failure.
+#
+# CIRCUIT BREAKER: a lead that failed (``failed`` or ``develop failed``) is
+# tried again until ``BREAKER`` failures. ``failed`` is the issue's failed lead
+# run ids across ALL its sightings (the caller unions them and keeps them on
+# the sighting), so re-filing the issue can't reset the count. ``trips`` names
+# each issue at the limit with a one-line reason; the caller labels it
+# ``needs-human`` and records the count as ``breaker_at``. A human taking the
+# label off re-arms it for ``BREAKER`` more failures.
 #
 # The plan needs no human: each feature issue comes from an approved blueprint
 # and packet, so the shift trigger approves it as ``APPROVER``.
@@ -44,13 +48,13 @@ _SOURCE = re.compile(r"^github:([\w.-]+/[\w.-]+)#(\d+)$")
 # The station's issue reference (``cloud_station._ISSUE``).
 _ISSUE_REF = re.compile(r"(?<![\w/&])#(\d+)\b")
 _NEEDS_HUMAN = "needs-human"
-# A citing lead task in one of these died outside the station's release path,
-# so no ``needs-human`` label asks a human to look: it holds the issue for good.
-# A ``rejected`` one (released, or rejected by hand) defers to the label.
+# A lead task in one of these failed outside the station's release path. A
+# ``rejected`` one (released, or rejected by hand) defers to the label.
 # ponytail: if the release's label write fails, a rejected task with no label
 # frees the issue next shift; reading the label's add time off the issue's events
 # (after the run started) would close that.
-_FAILED = frozenset({"failed", "develop failed"})
+FAILED = frozenset({"failed", "develop failed"})
+BREAKER = 3
 _PRIORITY = {"p1": 1, "p2": 2, "p3": 3}
 _UNRANKED = len(_PRIORITY) + 1
 
@@ -71,11 +75,38 @@ def _labels(sighting: dict[str, Any]) -> list[str]:
     return list(live if live is not None else (sighting.get("evidence") or {}).get("labels") or [])
 
 
+def _flagged(sighting: dict[str, Any]) -> bool:
+    return _NEEDS_HUMAN in {str(lb).strip().lower() for lb in _labels(sighting)}
+
+
+def _tripped(sighting: dict[str, Any]) -> bool:
+    """``BREAKER`` failed leads since the breaker last tripped (a human re-armed it)."""
+    failed = len(set(sighting.get("failed") or []))
+    return failed - int(sighting.get("breaker_at") or 0) >= BREAKER
+
+
 def _held(sighting: dict[str, Any]) -> bool:
-    """Labelled ``needs-human``, or a citing lead task that failed."""
-    if _NEEDS_HUMAN in {str(lb).strip().lower() for lb in _labels(sighting)}:
-        return True
-    return any(str(t.get("status") or "") in _FAILED for t in sighting.get("tasks") or [])
+    """Labelled ``needs-human``, or the breaker tripped."""
+    return _flagged(sighting) or _tripped(sighting)
+
+
+def trips(sightings: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    """Each issue sighting whose breaker trips now (not labelled yet), with the
+    one-line reason the caller comments when it labels it ``needs-human``."""
+    out = []
+    for s in sightings:
+        if _SOURCE.match(str((s.get("evidence") or {}).get("source") or "")) and (
+            _tripped(s) and not _flagged(s)
+        ):
+            runs = sorted(set(s.get("failed") or []))
+            out.append(
+                (
+                    s,
+                    f"Belt: {len(runs)} feature lead attempts failed ({', '.join(runs)}); "
+                    "held until a human removes needs-human.",
+                )
+            )
+    return out
 
 
 def _task(sighting: dict[str, Any], number: str) -> PlannedTask:
@@ -103,8 +134,9 @@ def _task(sighting: dict[str, Any], number: str) -> PlannedTask:
 
 def plan(shift_no: int, sightings: list[dict[str, Any]], budget: int) -> PlanProposal:
     """One ``feature-lead`` task per free feature issue in ``sightings`` (each
-    ``{id, evidence, ts}``, optionally the live ``labels`` and the citing
-    ``tasks``), p1 first, then oldest, at most ``budget``."""
+    ``{id, evidence, ts}``, optionally the live ``labels``, the issue's
+    ``failed`` lead run ids and ``breaker_at``), p1 first, then oldest, at most
+    ``budget``."""
     issues = []
     for s in sightings:
         found = _SOURCE.match(str((s.get("evidence") or {}).get("source") or ""))
@@ -124,4 +156,4 @@ def plan(shift_no: int, sightings: list[dict[str, Any]], budget: int) -> PlanPro
     return PlanProposal(shift_no=shift_no, tasks=tasks)
 
 
-__all__ = ["APPROVER", "plan", "priority"]
+__all__ = ["APPROVER", "BREAKER", "FAILED", "plan", "priority", "trips"]

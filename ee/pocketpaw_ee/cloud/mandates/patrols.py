@@ -28,7 +28,8 @@
 #                    ``Depends on`` issue still open is blocked (fail safe);
 #                    a ref in the line's trailing note, or after ``none``, is not.
 #                    ``flag_needs_spec`` comments on a ``github:`` source issue
-#                    and labels it ``needs-spec`` (once) for the auto plan gate.
+#                    and labels it ``needs-spec`` (once) for the auto plan gate;
+#                    ``flag_needs_human`` does the same with ``needs-human``.
 #   * ``upstream`` — commits on a pinned GitHub dependency since the pin: the
 #                    ``rev`` comes from a TOML pin file in the bound repo, the
 #                    delta from ``gh api repos/<repo>/compare/<pin>...HEAD``.
@@ -726,6 +727,7 @@ _AREA_PREFIX = re.compile(r"^([A-Za-z0-9][\w.\-/ ]{0,30}?):\s")
 
 
 NEEDS_SPEC = "needs-spec"
+NEEDS_HUMAN = "needs-human"
 _SPEC_SOURCE = re.compile(r"^github:([\w.-]+/[\w.-]+)#(\d+)$")
 
 
@@ -734,29 +736,43 @@ async def flag_needs_spec(source: str, reason: str, gh: GhFn | None = None) -> b
     names and label it ``needs-spec``, so a human or a later spec pass rewrites
     it. Once per issue: one already labelled is left alone. True when it
     commented; never raises."""
+    return await _flag(source, reason, NEEDS_SPEC, "fbca04", gh) in {"labelled", "commented"}
+
+
+async def flag_needs_human(source: str, reason: str, gh: GhFn | None = None) -> bool:
+    """``flag_needs_spec`` with ``needs-human``: True when the label is on the
+    issue afterwards (put there now, or already there)."""
+    return await _flag(source, reason, NEEDS_HUMAN, "d93f0b", gh) in {"labelled", "already"}
+
+
+async def _flag(source: str, reason: str, label: str, color: str, gh: GhFn | None) -> str:
+    """Comment ``reason`` and add ``label`` once: "labelled", "commented" (the
+    label write failed), "already" (labelled before) or "" (nothing done)."""
     found = _SPEC_SOURCE.match(source or "")
     if not found or any(p in {".", ".."} or p.startswith("-") for p in found[1].split("/")):
-        return False
+        return ""
     slug, number = found.groups()
     runner = gh or _default_gh
     try:
         code, out, _ = await runner(["gh", "issue", "view", number, "-R", slug, "--json", "labels"])
         labels = json.loads(out).get("labels") if code == 0 else None
-        if not isinstance(labels, list) or NEEDS_SPEC in {lb.get("name") for lb in labels}:
-            return False
+        if not isinstance(labels, list):
+            return ""
+        if label in {lb.get("name") for lb in labels}:
+            return "already"
         # Creating a label that exists fails harmlessly.
-        await runner(["gh", "label", "create", NEEDS_SPEC, "-R", slug, "--color", "fbca04"])
+        await runner(["gh", "label", "create", label, "-R", slug, "--color", color])
         code, _, err = await runner(
             ["gh", "issue", "comment", number, "-R", slug, "--body", reason]
         )
         if code != 0:
-            logger.warning("needs-spec: comment on %s#%s failed: %s", slug, number, err[-200:])
-            return False
-        await runner(["gh", "issue", "edit", number, "-R", slug, "--add-label", NEEDS_SPEC])
-        return True
-    except Exception:  # noqa: BLE001 — a missed flag never fails the gate
-        logger.warning("needs-spec: flagging %s failed", source, exc_info=True)
-        return False
+            logger.warning("%s: comment on %s#%s failed: %s", label, slug, number, err[-200:])
+            return ""
+        code, _, _ = await runner(["gh", "issue", "edit", number, "-R", slug, "--add-label", label])
+        return "labelled" if code == 0 else "commented"
+    except Exception:  # noqa: BLE001 — a missed flag never fails the gate or the shift
+        logger.warning("%s: flagging %s failed", label, source, exc_info=True)
+        return ""
 
 
 async def _default_gh(argv: list[str]) -> tuple[int, str, str]:

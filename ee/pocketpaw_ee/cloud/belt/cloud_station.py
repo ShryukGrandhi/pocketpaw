@@ -28,19 +28,19 @@
 #           relaunched), as is one whose tracker died on a TRACK error (lesson 45).
 #   LEAD    ``recipe == "feature-lead"``: one session per feature issue, briefed from
 #           the clone's ``docs/factory/lead.md``, the issue, the packet, the run id and a
-#           PACK built on this Mac: ``loom orient``, ``kb search`` and ``soul recall`` (the
-#           mandate's and the team soul), each timed; a failed one is a note; 3k cap.
-#           Its ``Belt-Lead: <run id>`` PRs are kept on ``lead.prs`` with the slices
-#           their ``Slice:`` line names; Belt never reviews or fixes them.
-#           DONE v3 (the feature's ``.wave.json`` in the clone listed ``slices`` at
-#           launch: ``lead.slice_ids``): every slice has a ``Belt-Slice-Done: <slice> <run url>``
-#           comment since the launch whose run is a ``success`` ci.yml run on the base
-#           holding the slice's last merged PR, then the ``Belt-Contact-Sheet:``
-#           comment; ``lead.slices`` keeps each slice's state and gaps. DONE v2 (no
-#           slices, or launched before them): a merged ``feature-done`` PR, green dev
-#           CI on its merge commit and the contact sheet. A closed feature issue is
-#           done at once. STALL: no branch commit, PR update or comment for LEAD_STALL
-#           gets a nudge, a resume relaunch, then ``needs-human`` and release; a RECORD
+#           PACK built on this Mac (``loom orient``, ``kb search``, ``soul recall``; 3k cap).
+#           A ``lead/<feature>`` already on origin past LEAD_REBASE_BEHIND commits behind
+#           the base gets a rebase-first rule; past LEAD_REFUSE_BEHIND the launch (or a
+#           relaunch) is refused: a note and ``needs-human`` on the issue, the run released.
+#           ``Belt-Lead: <run id>`` PRs are kept on ``lead.prs`` with their ``Slice:`` ids;
+#           Belt never reviews or fixes them. DONE v3 (``lead.slice_ids`` from the
+#           feature's ``.wave.json`` at launch): every slice has a ``Belt-Slice-Done:
+#           <slice> <run url>`` comment since the launch whose run is a ``success``
+#           ci.yml run on the base holding the slice's last merged PR, then the
+#           ``Belt-Contact-Sheet:`` comment. DONE v2: a merged ``feature-done`` PR, green
+#           dev CI on its merge commit and the sheet. A closed feature issue is done at
+#           once. STALL: no branch commit, PR update or comment for LEAD_STALL gets a
+#           nudge, a resume relaunch, then ``needs-human`` and release; a RECORD
 #           ``Next:`` naming CI or the lane while a base run is live is a wait, not a
 #           stall. LEAD_TIMEOUT (8 h from the launch, or the last progress while
 #           waiting) settles like the last rung once the lead is silent too; a lead
@@ -217,6 +217,15 @@ class CloudStationError(RuntimeError):
     """A cloud run that cannot launch or resolve; the message names the step."""
 
 
+class StaleBaseError(CloudStationError):
+    """A lead branch too far behind its base to launch on; the message is the
+    note left on the feature issue. Settled as a release, never a failure."""
+
+    def __init__(self, slug: str, note: str) -> None:
+        super().__init__(note)
+        self.slug = slug
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name) or default)
@@ -352,6 +361,10 @@ class CloudTaskDispatcher:
     lead_stall_seconds: float = 1800.0
     lead_git_name: str = ""
     lead_git_email: str = ""
+    # A lead branch on origin this many commits behind the base: past the first
+    # the brief says rebase first, past the second the launch is refused.
+    lead_rebase_behind: int = 40
+    lead_refuse_behind: int = 150
     # A lead's orientation pack: the workspace holding ``.loom/``, ``soul-protocol/``
     # and ``.soul/shared/`` (unset: the launch clone's nearest ancestor with a
     # ``.loom`` dir), the loom, kb and uv binaries, and one tool's timeout.
@@ -425,8 +438,12 @@ class CloudTaskDispatcher:
 
         async def launch_and_track() -> None:
             worker = await self._blobs._worker(blob)
-            async with _LAUNCH_LOCK:
-                slug, session = await self._launch(run_ref, blob, worker)
+            try:
+                async with _LAUNCH_LOCK:
+                    slug, session = await self._launch(run_ref, blob, worker)
+            except StaleBaseError as exc:
+                await self._refuse(store, run_ref, blob, exc)
+                return
             cloud = {"session_url": session, "launched_at": self.wall()}
             issue = _ISSUE.search(str(blob.get("task") or ""))
             url = f"https://github.com/{slug}/issues/{issue.group(1)}" if issue else None
@@ -958,6 +975,9 @@ class CloudTaskDispatcher:
                     *(lead.get("sessions") or []),
                     {"session_url": url, "at": entry["at"]},
                 ]
+            except StaleBaseError as exc:
+                await self._refuse(store, run_ref, blob, exc)
+                return False
             except Exception as exc:  # noqa: BLE001 — a failed relaunch is the next stall's
                 entry["error"] = str(exc)[:600]
         lead["stalls"] = [*stalls, entry]
@@ -970,6 +990,33 @@ class CloudTaskDispatcher:
         )
         logger.info("belt cloud: feature lead %s stalled: %s", run_ref, entry["kind"])
         return True
+
+    async def _behind(self, launch: Path, branch: str, base: str) -> int:
+        """Commits ``origin/<base>`` has that the lead branch lacks, on the launch
+        clone; 0 when the branch is not on origin (a first launch) or unreadable."""
+        ref = f"refs/remotes/origin/{branch}"
+        argv = [*_GIT, "fetch", "-q", "origin", f"+refs/heads/{branch}:{ref}"]
+        if (await self.runner(argv, cwd=launch, timeout=120.0))[0] != 0:
+            return 0
+        argv = [*_GIT, "rev-list", "--count", f"{ref}..origin/{base}"]
+        code, out, _ = await self.runner(argv, cwd=launch, timeout=60.0)
+        return int(out.strip()) if code == 0 and out.strip().isdigit() else 0
+
+    async def _refuse(
+        self, store: Any, run_ref: str, blob: dict[str, Any], exc: StaleBaseError
+    ) -> None:
+        """A launch refused on a stale lead branch: the note on the feature issue,
+        ``needs-human`` (the planner holds it until a human re-arms it) and the
+        run released, so the refusal never counts as a failed attempt."""
+        cwd = Path(self.launch_dir).expanduser()
+        issue = str((blob.get("lead") or {}).get("issue") or "")
+        argv = ["gh", "issue", "comment", issue, "-R", exc.slug, "--body", str(exc)]
+        try:
+            await self._ok(argv, cwd, "LAUNCH: note the stale base")
+        except Exception:  # noqa: BLE001 — the label and the release still tell a human
+            logger.info("belt cloud: stale-base note on #%s failed", issue, exc_info=True)
+        await self._flag_issue(exc.slug, issue, cwd)
+        await self._release(store, run_ref, blob, str(exc))
 
     async def _land_lead(
         self,
@@ -1131,6 +1178,14 @@ class CloudTaskDispatcher:
         if _is_lead(blob) and not (fix or test or review):
             lead = blob.setdefault("lead", {})
             lead.update(await self._lead_feature(request, slug, launch))
+            behind = await self._behind(launch, lead["branch"], base)
+            if behind > self.lead_refuse_behind:
+                raise StaleBaseError(
+                    slug,
+                    f"Belt: {lead['branch']} is {behind} commits behind {base} (over "
+                    f"{self.lead_refuse_behind}); rebase it onto {base}, then remove "
+                    "needs-human to relaunch.",
+                )
             code, out, _ = await self.runner([*_GIT, "rev-parse", "HEAD"], cwd=launch, timeout=60.0)
             sha = out.strip() if code == 0 and _HEX_SHA.match(out.strip()) else ""
             pack = await self._lead_pack(request, slug, launch, lead, found.get("soul_path"))
@@ -1145,6 +1200,7 @@ class CloudTaskDispatcher:
                 resume=retry,
                 stall_seconds=self.lead_stall_seconds,
                 pack=pack,
+                behind=behind if behind > self.lead_rebase_behind else 0,
             )
         elif review:
             brief = _review_brief(request, slug, base, review)
@@ -2217,6 +2273,7 @@ def _lead_brief(
     resume: bool = False,
     stall_seconds: float = 1800.0,
     pack: str = "",
+    behind: int = 0,
 ) -> str:
     """A feature lead's brief: the playbook ``docs/factory/lead.md`` from the
     launch clone (at ``origin/<base>``), then this run (the feature issue, the
@@ -2272,6 +2329,14 @@ def _lead_brief(
         ]
     rules = [
         f"Step one: check out {base}{at}.",
+        *(
+            [
+                f"Before the first stage, rebase {branch} onto origin/{base}: it is {behind} "
+                "commits behind. Push it with --force-with-lease."
+            ]
+            if behind
+            else []
+        ),
         f"Set the repo-local git identity before your first commit: {who}.",
         "No attribution line anywhere, comments included: no Co-Authored-By trailer, no "
         "Claude-Session link, no Generated with Claude Code line.",
@@ -2868,6 +2933,8 @@ def wire_cloud() -> bool:
         lead_stall_seconds=_env_float("POCKETPAW_FACTORY_CLOUD_LEAD_STALL", 1800.0),
         lead_git_name=(os.environ.get("POCKETPAW_FACTORY_LEAD_GIT_NAME") or "").strip(),
         lead_git_email=(os.environ.get("POCKETPAW_FACTORY_LEAD_GIT_EMAIL") or "").strip(),
+        lead_rebase_behind=int(_env_float("POCKETPAW_FACTORY_CLOUD_LEAD_REBASE_BEHIND", 40)),
+        lead_refuse_behind=int(_env_float("POCKETPAW_FACTORY_CLOUD_LEAD_REFUSE_BEHIND", 150)),
         workspace_root=(os.environ.get("POCKETPAW_FACTORY_WORKSPACE_ROOT") or "").strip(),
         loom_bin=orient.loom_binary(),
         kb_bin=_tool("POCKETPAW_FACTORY_KB_BIN", "kb", Path.home() / "go" / "bin" / "kb"),
