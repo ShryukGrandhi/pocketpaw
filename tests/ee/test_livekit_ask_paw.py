@@ -296,6 +296,7 @@ async def test_answer_failure_apologises_emits_error_and_frees_the_lock(
     cmds = await _commands(pubsub)
     assert [c["type"] for c in cmds] == ["say"]
     assert _states(events) == ["thinking", "error", "idle"]
+    assert events[-1].data["state"] == "idle" and events[-1].data["question"] == "?"
     assert "no providers" not in (events[-1].data["error"] or "")
     grounding.post.assert_not_awaited()
     assert await redis.get(f"livekit:ask:lock:{GROUP}") is None
@@ -349,6 +350,56 @@ async def test_post_call_bot_message_mirrors_the_notes_write_path(events) -> Non
     assert new and new[0].data["senderName"] == "Paw" and new[0].data["group_id"] == GROUP
 
 
+async def test_answer_stopped_from_another_process_does_not_go_idle_twice(
+    redis, grounding, events
+) -> None:
+    assert await assistant.acquire_ask_lock(GROUP, "a1")
+
+    async def stream(system, user):
+        yield "First sentence. "
+        assert await assistant.stop_ask(GROUP) == "a1"
+        yield "Second sentence."
+
+    with patch.object(assistant, "stream_text", stream):
+        await assistant.answer_call_question(
+            group_id=GROUP,
+            workspace_id=WS,
+            user_id="u1",
+            asked_by_name="Ann",
+            question="?",
+            ask_id="a1",
+        )
+
+    assert _states(events) == ["thinking", "speaking"]
+
+
+async def test_capture_failure_still_ends_with_one_idle(redis, events) -> None:
+    assert await assistant.acquire_ask_lock(GROUP, "a1")
+    with patch.object(
+        assistant, "capture_spoken_question", AsyncMock(side_effect=ConnectionError("x"))
+    ):
+        await assistant.answer_spoken_question(
+            group_id=GROUP, workspace_id=WS, user_id="u1", asked_by_name="Ann", ask_id="a1"
+        )
+    assert _states(events) == ["idle"]
+    assert await assistant.ask_lock_holder(GROUP) is None
+
+
+async def test_spoken_question_after_stop_stays_quiet(redis, events) -> None:
+    assert await assistant.acquire_ask_lock(GROUP, "a1")
+    await assistant.stop_ask(GROUP)
+    await redis.rpush("livekit:ask:q:a1", "too late")
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(f"livekit:bot:cmd:{GROUP}")
+    with patch.object(assistant, "answer_call_question", AsyncMock()) as ans:
+        await assistant.answer_spoken_question(
+            group_id=GROUP, workspace_id=WS, user_id="u1", asked_by_name="Ann", ask_id="a1"
+        )
+    ans.assert_not_awaited()
+    assert await _commands(pubsub) == []
+    assert _states(events) == []
+
+
 async def test_lock_release_only_by_its_holder(redis) -> None:
     assert await assistant.acquire_ask_lock(GROUP, "a1")
     assert not await assistant.acquire_ask_lock(GROUP, "a2")
@@ -375,6 +426,7 @@ async def test_spoken_question_not_caught_says_so_and_goes_idle(redis, events) -
 
 
 async def test_spoken_question_is_answered(redis) -> None:
+    assert await assistant.acquire_ask_lock(GROUP, "a1")
     await redis.rpush("livekit:ask:q:a1", "what did we decide")
     with patch.object(assistant, "answer_call_question", AsyncMock(return_value="x")) as ans:
         await assistant.answer_spoken_question(
@@ -590,6 +642,9 @@ async def make_client(redis):
 
     clients: list[AsyncClient] = []
 
+    bot = redis.pubsub()
+    await bot.subscribe(f"livekit:bot:cmd:{GROUP}")
+
     async def _make(user_id: str = "u1", notes_allowed: bool = True) -> AsyncClient:
         app = FastAPI()
         add_error_handler(app)
@@ -617,6 +672,7 @@ async def make_client(redis):
         yield _make
     for c in clients:
         await c.aclose()
+    await bot.aclose()
 
 
 async def test_ask_returns_202_with_an_ask_id_and_holds_the_lock(make_client, redis) -> None:
@@ -626,6 +682,26 @@ async def test_ask_returns_202_with_an_ask_id_and_holds_the_lock(make_client, re
     ask_id = resp.json()["ask_id"]
     assert await assistant.ask_lock_holder(GROUP) == ask_id
     assert make_client.started == [GROUP]
+
+
+async def test_ask_is_409_offline_when_no_bot_is_in_the_call(make_client, redis) -> None:
+    client = await make_client("u1")
+    other = "g-empty"
+    group = SimpleNamespace(workspace_id=WS, members=["u1"])
+    with patch(
+        "pocketpaw_ee.cloud.chat.group_service._get_group_domain_or_none",
+        AsyncMock(return_value=group),
+    ):
+        for path, body in (("ask", {"question": "hi"}), ("ask/listen", {"phase": "start"})):
+            resp = await client.post(f"/livekit/rooms/{other}/{path}", json=body)
+            assert resp.status_code == 409, path
+            assert resp.json()["error"] == {
+                "code": "livekit.assistant_offline",
+                "message": "Paw isn't in this call.",
+            }
+    assert await assistant.ask_lock_holder(other) is None
+    assert await redis.get("livekit:ask:rate:u1") is None
+    assert make_client.started == []
 
 
 async def test_concurrent_ask_is_409_busy(make_client) -> None:

@@ -216,5 +216,14 @@
     "tests": [
       "tests/ee/test_livekit_ask_paw.py"
     ]
+  },
+  {
+    "label": "ask: answer with no bot in the call",
+    "file": "ee/pocketpaw_ee/cloud/livekit/router.py",
+    "find": "    if not await _assistant_redis(assistant.bot_in_call(group_id)):\n        raise ConflictError(\"livekit.assistant_offline\", \"Paw isn't in this call.\")\n",
+    "replace": "",
+    "tests": [
+      "tests/ee/test_livekit_ask_paw.py"
+    ]
   }
 ]

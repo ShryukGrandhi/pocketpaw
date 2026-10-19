@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 ASK_LOCK_KEY = "livekit:ask:lock:{group_id}"
 ASK_LOCK_TTL_SECONDS = 90
+ASK_STOPPED_KEY = "livekit:ask:stopped:{ask_id}"
+ASK_STOPPED_TTL_SECONDS = 120
 ASK_RATE_KEY = "livekit:ask:rate:{user_id}"
 ASK_RATE_LIMIT = 10
 ASK_RATE_WINDOW_SECONDS = 60
@@ -119,6 +121,13 @@ async def force_release_ask_lock(group_id: str) -> None:
     await _redis().delete(ASK_LOCK_KEY.format(group_id=group_id))
 
 
+async def bot_in_call(group_id: str) -> bool:
+    """True when a call bot is subscribed to this call's command channel."""
+    channel = REDIS_BOT_CMD_CHANNEL.format(group_id=group_id)
+    counts = await _redis().pubsub_numsub(channel)
+    return any(int(count) > 0 for _, count in counts)
+
+
 async def allow_ask(user_id: str) -> bool:
     """Fixed-window per-user rate limit: ``ASK_RATE_LIMIT`` asks a minute."""
     redis = _redis()
@@ -177,8 +186,16 @@ def start_ask_task(group_id: str, coro: Awaitable[Any]) -> asyncio.Task:
     return task
 
 
-async def stop_ask(group_id: str) -> None:
-    """Silence Paw now: cancel the running answer, tell the bot to stop, free the lock."""
+async def stop_ask(group_id: str) -> str | None:
+    """Silence Paw now: cancel the running answer, tell the bot to stop, free the lock.
+
+    Returns the ask_id that was stopped. It is marked stopped so an answer
+    running in another web process ends quietly: the stop route emits that
+    ask's one ``idle``.
+    """
+    holder = await ask_lock_holder(group_id)
+    if holder:
+        await _redis().set(ASK_STOPPED_KEY.format(ask_id=holder), "1", ex=ASK_STOPPED_TTL_SECONDS)
     task = _ask_tasks.pop(group_id, None)
     if task is not None and not task.done():
         task.cancel()
@@ -186,6 +203,17 @@ async def stop_ask(group_id: str) -> None:
         await publish_bot_command(group_id, {"type": "stop", "ask_id": None})
     finally:
         await force_release_ask_lock(group_id)
+    return holder
+
+
+async def _idle_unless_stopped(ask_id: str, question: str | None, who: dict[str, str]) -> None:
+    """The lock moved on: stopped (that route already went idle) or expired (we go idle)."""
+    try:
+        stopped = bool(await _redis().exists(ASK_STOPPED_KEY.format(ask_id=ask_id)))
+    except Exception:
+        stopped = False
+    if not stopped:
+        await emit_assistant_state(state="idle", question=question, **who)
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +357,8 @@ async def answer_call_question(
     started = time.monotonic()
     spoken: list[str] = []
     try:
+        if await ask_lock_holder(group_id) != ask_id:
+            raise _AskStopped
         await emit_assistant_state(state="thinking", question=question, **who)
 
         call, kb, facts = await asyncio.gather(
@@ -382,7 +412,7 @@ async def answer_call_question(
         raise
     except _AskStopped:
         logger.info("Ask Paw: %s in group %s was stopped or timed out", ask_id, group_id)
-        await emit_assistant_state(state="idle", question=question, **who)
+        await _idle_unless_stopped(ask_id, question, who)
         return None
     except Exception:
         logger.warning("Ask Paw: answering %s in group %s failed", ask_id, group_id, exc_info=True)
@@ -433,14 +463,25 @@ async def answer_spoken_question(
     except Exception:
         logger.warning("Ask Paw: reading spoken question %s failed", ask_id, exc_info=True)
         question = ""
+    try:
+        still_held = await ask_lock_holder(group_id) == ask_id
+    except Exception:
+        still_held = True
+    if not still_held:
+        await _idle_unless_stopped(ask_id, question or None, who)
+        return None
     if not question:
         try:
             await publish_bot_command(
                 group_id, {"type": "say", "ask_id": ask_id, "text": DIDNT_CATCH_THAT}
             )
-            await emit_assistant_state(state="idle", **who)
-        finally:
+        except Exception:
+            logger.warning("Ask Paw: could not say it missed %s", ask_id, exc_info=True)
+        await emit_assistant_state(state="idle", **who)
+        try:
             await release_ask_lock(group_id, ask_id)
+        except Exception:
+            logger.warning("Ask Paw: could not release lock for group %s", group_id)
         return None
     return await answer_call_question(
         group_id=group_id,

@@ -25,8 +25,10 @@ and group membership, EXCEPT the public invite validate/join endpoints
 which allow external guests without a Pocketpaw account. Recording endpoints
 additionally require workspace ownership. Ask Paw endpoints additionally need
 the meeting-notes bot to be allowed for the workspace (403
-``livekit.assistant_unavailable``), take one question per call at a time (409
-``livekit.assistant_busy``) and cap each member at 10 asks a minute (429).
+``livekit.assistant_unavailable``), refuse when no call bot is listening on the
+call's command channel (409 ``livekit.assistant_offline``), take one question
+per call at a time (409 ``livekit.assistant_busy``) and cap each member at 10
+asks a minute (429).
 
 ``/rooms/{group_id}/leave`` was the one exception to that guarantee until
 2026-08-11 — it emitted ``CallParticipantLeft`` to the group's members with
@@ -469,6 +471,8 @@ async def _require_ask_access(group_id: str, user: Any, workspace_id: str) -> No
 
 
 async def _claim_ask_slot(group_id: str, user_id: str) -> str:
+    if not await _assistant_redis(assistant.bot_in_call(group_id)):
+        raise ConflictError("livekit.assistant_offline", "Paw isn't in this call.")
     if not await _assistant_redis(assistant.allow_ask(user_id)):
         raise RateLimited(
             "livekit.assistant_rate_limited", "Too many questions - wait a moment and try again."
@@ -571,8 +575,7 @@ async def ask_paw_stop(
 ):
     """Silence Paw: any member may stop the current answer, not only the asker."""
     await _require_ask_access(group_id, user, workspace_id)
-    holder = await _assistant_redis(assistant.ask_lock_holder(group_id))
-    await _assistant_redis(assistant.stop_ask(group_id))
+    holder = await _assistant_redis(assistant.stop_ask(group_id))
     await assistant.emit_assistant_state(
         group_id=group_id,
         state="idle",

@@ -111,12 +111,13 @@ Errors use the usual `{"error": {"code", "message"}}` envelope:
 |--------|------|------|
 | 403 | `livekit.room_forbidden` | Not a member of the group in this workspace (guests included) |
 | 403 | `livekit.assistant_unavailable` | The bot is off for this workspace (unpaid early access) |
+| 409 | `livekit.assistant_offline` | No call bot is in the call (`PUBSUB NUMSUB livekit:bot:cmd:{group_id}` is 0); checked on `/ask` and `/ask/listen` start |
 | 409 | `livekit.assistant_busy` | Another question is being answered in this call |
 | 409 | `livekit.assistant_ask_mismatch` | `listen` `end` with an `ask_id` that no longer holds the call |
 | 429 | `livekit.assistant_rate_limited` | More than 10 asks a minute from one member |
 | 503 | `livekit.assistant_offline` | Redis is unreachable |
 
-Progress is the realtime event `call.assistant_state`, sent to the group's members:
+Progress is the realtime event `call.assistant_state`, sent to the group's members. Every ask ends with exactly one `idle`: after the answer, after `error`, after `/ask/stop` (whose `idle` names the member who stopped it), after a missed spoken question, and when the 90s lock runs out mid-answer.
 
 ```json
 { "group_id": "...", "state": "listening | thinking | speaking | idle | error",
@@ -133,6 +134,7 @@ The API process and the bot subprocess talk only through Redis:
 | `livekit:bot:cmd:{group_id}` (pub/sub) | API | `say {ask_id, text}`, `say_end`, `stop`, `listen_start {ask_id, identity}`, `listen_end {ask_id, identity}` |
 | `livekit:ask:q:{ask_id}` (list, 120s TTL) | bot | The words the asker spoke during the listen window ("" if none) |
 | `livekit:ask:lock:{group_id}` (string, 90s TTL) | API | The `ask_id` answering right now; one question per call |
+| `livekit:ask:stopped:{ask_id}` (string, 120s TTL) | API | Set by `/ask/stop` so an answer running in another web process ends without a second `idle` |
 | `livekit:ask:rate:{user_id}` (counter, 60s window) | API | Per-member ask count |
 
 ## Instant Meetings
