@@ -399,6 +399,7 @@ async def answer_call_question(
             error="Paw couldn't answer that right now.",
             **who,
         )
+        await emit_assistant_state(state="idle", question=question, **who)
         return None
     finally:
         try:

@@ -295,7 +295,7 @@ async def test_answer_failure_apologises_emits_error_and_frees_the_lock(
 
     cmds = await _commands(pubsub)
     assert [c["type"] for c in cmds] == ["say"]
-    assert _states(events) == ["thinking", "error"]
+    assert _states(events) == ["thinking", "error", "idle"]
     assert "no providers" not in (events[-1].data["error"] or "")
     grounding.post.assert_not_awaited()
     assert await redis.get(f"livekit:ask:lock:{GROUP}") is None
