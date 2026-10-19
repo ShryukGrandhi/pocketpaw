@@ -725,6 +725,15 @@ class CallParticipantLeft(Event):
     EVENT_TYPE: ClassVar[str] = "call.participant_left"
 
 
+# Ask Paw: the in-call assistant's state for one question (listening, thinking,
+# speaking, idle, error). Emitted by ``livekit/assistant.py`` and the Ask Paw
+# routes; payload {group_id, state, ask_id, asked_by, asked_by_name, question,
+# answer, error}.
+@dataclass
+class CallAssistantState(Event):
+    EVENT_TYPE: ClassVar[str] = "call.assistant_state"
+
+
 # Meetings — the realtime ``meeting.updated`` the meetings service emits.
 # Every other ``meeting.*`` event is owned by ``meetings/events.py``.
 @dataclass

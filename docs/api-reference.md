@@ -2546,6 +2546,7 @@ workspace once `payments_open` is on, is not affected.
 | Chat media tools (`image_generate`, `audio_generate`, `audio_transcribe`, `video_generate`, `generate_site_image`, `generate_site_video`) | a tool error saying the feature is not in early access yet; no provider call |
 | Paw Bar concierge on a site the workspace owns | the visitor gets the `unavailable` frame with reason `limit`; no run, no model call |
 | LiveKit meeting notes | the call runs without the notes bot |
+| LiveKit Ask Paw: `POST /api/v1/livekit/rooms/{group_id}/ask`, `/ask/listen`, `/ask/stop` | 403 `livekit.assistant_unavailable` (see `docs/concepts/livekit.mdx`, Ask Paw) |
 
 ```json
 {"error": {"code": "early_access.not_available", "message": "This is not in early access yet."}}

@@ -302,6 +302,8 @@ class AudienceResolver:
         # panel needs to light up for the receiver and clear for everyone on
         # end. Notes posting also fans out so peer tabs can scroll to the
         # newly-created meeting-notes message without a manual refetch.
+        # assistant_state is Ask Paw's per-question state; every member sees
+        # who asked and what Paw is doing, since the answer is spoken to all.
         # participant_joined / participant_left keep the pre-join roster chip
         # ("who's already in the call") honest for members who haven't joined
         # yet. The joiner is NOT excluded: their own tab needs the roster too,
@@ -310,6 +312,7 @@ class AudienceResolver:
         if t in {
             "call.started",
             "call.ended",
+            "call.assistant_state",
             "call.notes_posted",
             "call.participant_joined",
             "call.participant_left",
