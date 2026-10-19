@@ -1,48 +1,23 @@
-"""LiveKit Call Agent — meeting notes bot with Deepgram STT.
+"""LiveKit call bot: transcribes a group call, writes meeting notes, voices Ask Paw.
 
-Architecture
-------------
-This module provides a lightweight agent that connects to a LiveKit room,
-transcribes the conversation using Deepgram's speech-to-text API, and speaks
-Ask Paw answers back into the call on demand.
+Runs as a subprocess (``python -m pocketpaw_ee.cloud.livekit.agent``) that
+``service.py`` spawns per call, so WebRTC and Deepgram stay out of the API event
+loop. It joins with ``auto_subscribe=False`` and subscribes to microphone audio
+only (``_should_subscribe``): decoding everyone's video made big calls unstable.
+Each participant's mic is piped into Deepgram STT (Nova-3, ``language="multi"``,
+needs ``DEEPGRAM_API_KEY``); final segments are kept in memory, summarised every
+5 minutes into ``livekit:progressive:{group_id}``, and merged into the notes
+printed to stdout as one JSON line when the room empties or SIGTERM arrives.
 
-1. Connects to the LiveKit room via ``livekit.rtc.Room`` (WebRTC)
-2. Subscribes to remote MICROPHONE AUDIO tracks only — never video or
-   screenshare. The room is joined with ``auto_subscribe=False`` and each
-   audio publication is opted in via ``_should_subscribe`` /
-   ``publication.set_subscribed(True)``. This keeps the bot's per-participant
-   load flat: auto-subscribe would otherwise pull (and decode) every
-   participant's video, which the bot never uses (Bug A — the call got
-   unstable past a few participants).
-3. Pipes each track through Deepgram STT streaming for real-time transcription
-4. Accumulates transcript segments with speaker identification
-5. Detects when the room empties (via polling + room events)
-6. Generates a meeting summary using the configured LLM
-7. Posts the meeting notes to the group chat
-
-Ask Paw (live voice answers)
-----------------------------
-Every final transcript segment is mirrored to the Redis list
-``livekit:transcript:{group_id}`` so the API process can answer questions with
-live call context. The bot publishes one microphone track ("paw-voice") and
-listens on the pub/sub channel ``livekit:bot:cmd:{group_id}`` for commands from
-``assistant.py``: ``say`` (voice a sentence via Deepgram TTS), ``say_end``,
-``stop`` (drop queued speech and cut the current sentence), ``listen_start`` /
-``listen_end`` (capture one member's spoken question and hand it back on
-``livekit:ask:q:{ask_id}``). Redis failures never interrupt transcription.
-
-Usage
------
-The agent is started automatically by the ``LiveKitService`` when a room
-is created, or can be run as a standalone script:
-
-    python -m ee.cloud.livekit.agent --room group-call-abc123
-
-Deepgram Configuration
-----------------------
-Requires the ``DEEPGRAM_API_KEY`` environment variable (set in ``.env``).
-The Deepgram STT uses Nova-3 with ``language="multi"`` for multilingual
-transcription, supporting all Deepgram languages simultaneously.
+Ask Paw: every final segment is mirrored to ``livekit:transcript:{group_id}``
+(cleared at start). The bot publishes one microphone track ("paw-voice") and
+takes commands from ``assistant.py`` on ``livekit:bot:cmd:{group_id}``: ``say``
+(voice a sentence via Deepgram TTS), ``say_end``, ``stop``, ``listen_start`` /
+``listen_end`` (capture the asker's spoken question onto
+``livekit:ask:q:{ask_id}``; an unclosed window hands back "" after 20s). When an
+answer has played out, or was cut by ``stop``, it pushes to
+``livekit:ask:done:{ask_id}``. Paw's lines stay in the notes transcript, but Paw
+is never listed as a participant. Redis failures never interrupt transcription.
 """
 
 from __future__ import annotations
@@ -95,6 +70,8 @@ REDIS_TRANSCRIPT_TTL = 6 * 3600
 REDIS_BOT_CMD_CHANNEL = "livekit:bot:cmd:{group_id}"
 REDIS_ASK_QUESTION_KEY = "livekit:ask:q:{ask_id}"
 REDIS_ASK_QUESTION_TTL = 120
+REDIS_ASK_DONE_KEY = "livekit:ask:done:{ask_id}"
+REDIS_ASK_DONE_TTL = 120
 
 BOT_IDENTITY = "call-bot"
 PAW_SPEAKER = "Paw"
@@ -102,6 +79,8 @@ PAW_SPEAKER = "Paw"
 # Deepgram finalizes a flushed utterance shortly after the push-to-talk release;
 # segments arriving inside this grace still belong to the question.
 _LISTEN_END_GRACE_SECONDS = 1.5
+# A push-to-talk window nobody closes is dropped after this, handing back "".
+_LISTEN_WINDOW_SECONDS = 20.0
 
 _TTS_MODEL = "aura-2-andromeda-en"
 _TTS_SAMPLE_RATE = 24000
@@ -192,8 +171,9 @@ class CallMeetingAgent:
         self._stt_streams: dict[str, Any] = {}
         self._audio_source: Any = None
         self._tts: Any = None
-        self._say_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._say_queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
         self._speaking_task: asyncio.Task | None = None
+        self._speaking_ask_id: str = ""
         self._listen_windows: dict[str, tuple[str, float]] = {}
         self._bg_tasks: set[asyncio.Task] = set()
 
@@ -822,38 +802,50 @@ class CallMeetingAgent:
             if text:
                 self._say_queue.put_nowait((ask_id, text))
         elif kind == "say_end":
-            logger.info("Agent: Ask Paw answer %s fully queued", ask_id)
+            if ask_id:
+                self._say_queue.put_nowait((ask_id, None))
         elif kind == "stop":
             self._stop_speaking()
         elif kind == "listen_start":
             identity = str(cmd.get("identity") or "")
             if ask_id and identity:
                 self._listen_windows[ask_id] = (identity, time.time())
+                self._spawn_bg(self._expire_listen(ask_id))
         elif kind == "listen_end":
             if ask_id:
-                self._spawn_bg(self._finish_listen(ask_id, str(cmd.get("identity") or "")))
+                self._spawn_bg(self._finish_listen(ask_id))
         else:
             logger.debug("Agent: unknown command type %r", kind)
 
     def _stop_speaking(self) -> None:
-        """Drop queued sentences and cut the one being spoken."""
+        """Drop queued sentences, cut the one being spoken, and report those asks done."""
+        stopped: set[str] = set()
         while not self._say_queue.empty():
-            self._say_queue.get_nowait()
+            ask_id, _ = self._say_queue.get_nowait()
+            stopped.add(ask_id)
         if self._speaking_task is not None and not self._speaking_task.done():
+            stopped.add(self._speaking_ask_id)
             self._speaking_task.cancel()
         if self._audio_source is not None:
             try:
                 self._audio_source.clear_queue()
             except Exception:
                 pass
+        for ask_id in stopped - {""}:
+            self._spawn_bg(self._signal_done(ask_id))
 
     async def _speaker_worker(self) -> None:
-        """Voice queued sentences one at a time, in order."""
+        """Voice queued sentences one at a time; a ``None`` text marks an answer's end."""
         while self._running:
             ask_id, text = await self._say_queue.get()
+            if text is None:
+                await self._wait_for_playout()
+                await self._signal_done(ask_id)
+                continue
             if self._tts is None or self._audio_source is None:
                 logger.info("Agent: no voice available, dropping Ask Paw sentence (%s)", ask_id)
                 continue
+            self._speaking_ask_id = ask_id
             self._speaking_task = asyncio.create_task(self._speak(text))
             try:
                 await self._speaking_task
@@ -866,6 +858,7 @@ class CallMeetingAgent:
                 logger.warning("Agent: TTS failed for Ask Paw sentence (%s): %s", ask_id, exc)
             finally:
                 self._speaking_task = None
+                self._speaking_ask_id = ""
 
     async def _speak(self, text: str) -> None:
         async with self._tts.synthesize(text) as stream:
@@ -873,13 +866,46 @@ class CallMeetingAgent:
                 await self._audio_source.capture_frame(audio.frame)
         self.add_transcript_segment(speaker=PAW_SPEAKER, text=text, identity=BOT_IDENTITY)
 
-    async def _finish_listen(self, ask_id: str, identity: str) -> None:
-        """Close a push-to-talk window and hand the question back to the API process."""
+    async def _wait_for_playout(self) -> None:
+        if self._audio_source is None:
+            return
+        try:
+            await self._audio_source.wait_for_playout()
+        except Exception as exc:
+            logger.debug("Agent: wait_for_playout failed: %s", exc)
+
+    async def _signal_done(self, ask_id: str) -> None:
+        """Tell the API process an answer has finished playing (or was cut)."""
+        await self._push_ask_key(REDIS_ASK_DONE_KEY.format(ask_id=ask_id), "1", REDIS_ASK_DONE_TTL)
+
+    async def _push_ask_key(self, key: str, value: str, ttl: int) -> None:
+        redis = await self._get_redis()
+        if redis is None:
+            return
+        try:
+            await redis.rpush(key, value)
+            await redis.expire(key, ttl)
+        except Exception as exc:
+            logger.warning("Agent: could not write %s: %s", key, exc)
+
+    async def _expire_listen(self, ask_id: str) -> None:
+        await asyncio.sleep(_LISTEN_WINDOW_SECONDS)
+        if self._listen_windows.pop(ask_id, None) is not None:
+            logger.info("Agent: listen window %s expired without an end", ask_id)
+            await self._push_ask_key(
+                REDIS_ASK_QUESTION_KEY.format(ask_id=ask_id), "", REDIS_ASK_QUESTION_TTL
+            )
+
+    async def _finish_listen(self, ask_id: str) -> None:
+        """Close a push-to-talk window and hand the asker's words back to the API process.
+
+        Only the window's own identity is captured; whoever sent ``listen_end``
+        cannot redirect it to another participant.
+        """
         window = self._listen_windows.pop(ask_id, None)
         text = ""
         if window is not None:
-            window_identity, started_at = window
-            identity = identity or window_identity
+            identity, started_at = window
             stream = self._stt_streams.get(identity)
             if stream is not None:
                 try:
@@ -887,24 +913,16 @@ class CallMeetingAgent:
                 except Exception as exc:
                     logger.debug("Agent: STT flush failed for %s: %s", identity, exc)
             await asyncio.sleep(_LISTEN_END_GRACE_SECONDS)
-            parts = []
-            for seg in self.transcript_segments:
-                if seg.get("identity") == identity and seg["timestamp"] >= started_at:
-                    seg["kind"] = "ask"
-                    parts.append(seg["text"])
-            text = " ".join(parts).strip()
+            text = " ".join(
+                seg["text"]
+                for seg in self.transcript_segments
+                if seg.get("identity") == identity and seg["timestamp"] >= started_at
+            ).strip()
         else:
             logger.info("Agent: listen_end for %s without a listen window", ask_id)
-
-        redis = await self._get_redis()
-        if redis is None:
-            return
-        try:
-            key = REDIS_ASK_QUESTION_KEY.format(ask_id=ask_id)
-            await redis.rpush(key, text)
-            await redis.expire(key, REDIS_ASK_QUESTION_TTL)
-        except Exception as exc:
-            logger.warning("Agent: could not hand back spoken question %s: %s", ask_id, exc)
+        await self._push_ask_key(
+            REDIS_ASK_QUESTION_KEY.format(ask_id=ask_id), text, REDIS_ASK_QUESTION_TTL
+        )
 
     async def _disconnect_rtc(self) -> None:
         """Disconnect from the LiveKit RTC room."""
@@ -1047,7 +1065,8 @@ class CallMeetingAgent:
             transcript_lines = []
             for seg in self.transcript_segments:
                 speaker = seg.get("speaker", "Unknown")
-                speakers_seen.add(speaker)
+                if seg.get("identity") != BOT_IDENTITY:
+                    speakers_seen.add(speaker)
                 transcript_lines.append(f"[{speaker}]: {seg['text']}")
             transcript_text = "\n".join(transcript_lines)
 

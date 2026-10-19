@@ -7,9 +7,16 @@ room; this module talks to it only through Redis:
   ``livekit:progressive:{group_id}`` (5-minute summaries) without consuming them;
 - PUBLISHes commands on ``livekit:bot:cmd:{group_id}`` (``say``, ``say_end``,
   ``stop``, ``listen_start``, ``listen_end``);
-- BLPOPs a spoken question from ``livekit:ask:q:{ask_id}`` after ``listen_end``;
-- holds ``livekit:ask:lock:{group_id}`` (SET NX EX, value = ask_id) so one call
-  answers one question at a time. Only the holder releases it, except ``stop``.
+- BLPOPs a spoken question from ``livekit:ask:q:{ask_id}`` after ``listen_end``,
+  and ``livekit:ask:done:{ask_id}`` before going idle, so ``idle`` and the lock
+  release wait (bounded) until the answer has actually played;
+- holds ``livekit:ask:lock:{group_id}`` (SET NX EX, value = ask_id; the asker in
+  ``livekit:ask:asker:{ask_id}``) so one call answers one question at a time.
+  Only the holder releases it, except ``stop`` and the push-to-talk watchdog.
+
+Every ask ends with exactly one ``idle``: after the answer, after ``error``, on
+``stop`` (the route emits it), on a missed or abandoned spoken question, and when
+the lock is lost mid-answer.
 
 Grounding is the live call, the workspace knowledge base and workspace-shared
 memory facts. The room has several members, so nothing member-private is read:
@@ -33,6 +40,7 @@ from pocketpaw_ee.cloud._core.realtime.emit import emit
 from pocketpaw_ee.cloud._core.realtime.events import CallAssistantState
 from pocketpaw_ee.cloud.livekit.agent import (
     _REDIS_PROGRESSIVE_KEY,
+    REDIS_ASK_DONE_KEY,
     REDIS_ASK_QUESTION_KEY,
     REDIS_BOT_CMD_CHANNEL,
     REDIS_TRANSCRIPT_KEY,
@@ -43,7 +51,10 @@ from pocketpaw_ee.cloud.livekit.prompts import ASK_PAW_PROMPT
 logger = logging.getLogger(__name__)
 
 ASK_LOCK_KEY = "livekit:ask:lock:{group_id}"
-ASK_LOCK_TTL_SECONDS = 90
+ASK_LOCK_TTL_SECONDS = 120
+ASK_ASKER_KEY = "livekit:ask:asker:{ask_id}"
+ASK_LISTENING_KEY = "livekit:ask:listening:{ask_id}"
+LISTEN_WATCHDOG_SECONDS = 25.0
 ASK_STOPPED_KEY = "livekit:ask:stopped:{ask_id}"
 ASK_STOPPED_TTL_SECONDS = 120
 ASK_RATE_KEY = "livekit:ask:rate:{user_id}"
@@ -57,12 +68,23 @@ _MEMORY_FETCH_LIMIT = 200
 _MEMORY_TOP_K = 8
 _SHARED_MEMORY_USER_IDS = (None, "", "default")
 
+_PLAYBACK_BASE_SECONDS = 4.0
+_PLAYBACK_PER_SENTENCE_SECONDS = 3.0
+_PLAYBACK_MAX_SECONDS = 45.0
+
 DIDNT_CATCH_THAT = "Sorry, I didn't catch that."
 _APOLOGY = "Sorry, I couldn't answer that right now."
 
 _RELEASE_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+_REFRESH_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], ARGV[2])
 end
 return 0
 """
@@ -75,6 +97,7 @@ _STOPWORDS = frozenset(
 )
 
 _ask_tasks: dict[str, asyncio.Task] = {}
+_watchdogs: set[asyncio.Task] = set()
 
 
 class _AskStopped(Exception):
@@ -102,9 +125,25 @@ def new_ask_id() -> str:
 # ---------------------------------------------------------------------------
 
 
-async def acquire_ask_lock(group_id: str, ask_id: str) -> bool:
+async def acquire_ask_lock(group_id: str, ask_id: str, user_id: str = "") -> bool:
+    """Take the call's one question slot; ``user_id`` is recorded as the asker."""
+    redis = _redis()
     key = ASK_LOCK_KEY.format(group_id=group_id)
-    return bool(await _redis().set(key, ask_id, nx=True, ex=ASK_LOCK_TTL_SECONDS))
+    if not await redis.set(key, ask_id, nx=True, ex=ASK_LOCK_TTL_SECONDS):
+        return False
+    if user_id:
+        await redis.set(ASK_ASKER_KEY.format(ask_id=ask_id), user_id, ex=ASK_LOCK_TTL_SECONDS)
+    return True
+
+
+async def ask_asker(ask_id: str) -> str | None:
+    return await _redis().get(ASK_ASKER_KEY.format(ask_id=ask_id))
+
+
+async def refresh_ask_lock(group_id: str, ask_id: str) -> bool:
+    """Restart the lock's TTL for the answer phase, only if ``ask_id`` still holds it."""
+    key = ASK_LOCK_KEY.format(group_id=group_id)
+    return bool(await _redis().eval(_REFRESH_LUA, 1, key, ask_id, ASK_LOCK_TTL_SECONDS))
 
 
 async def ask_lock_holder(group_id: str) -> str | None:
@@ -130,12 +169,12 @@ async def bot_in_call(group_id: str) -> bool:
 
 async def allow_ask(user_id: str) -> bool:
     """Fixed-window per-user rate limit: ``ASK_RATE_LIMIT`` asks a minute."""
-    redis = _redis()
     key = ASK_RATE_KEY.format(user_id=user_id)
-    count = await redis.incr(key)
-    if count == 1:
-        await redis.expire(key, ASK_RATE_WINDOW_SECONDS)
-    return count <= ASK_RATE_LIMIT
+    async with _redis().pipeline(transaction=True) as pipe:
+        pipe.set(key, 0, ex=ASK_RATE_WINDOW_SECONDS, nx=True)
+        pipe.incr(key)
+        _, count = await pipe.execute()
+    return int(count) <= ASK_RATE_LIMIT
 
 
 async def publish_bot_command(group_id: str, command: dict[str, Any]) -> None:
@@ -196,6 +235,7 @@ async def stop_ask(group_id: str) -> str | None:
     holder = await ask_lock_holder(group_id)
     if holder:
         await _redis().set(ASK_STOPPED_KEY.format(ask_id=holder), "1", ex=ASK_STOPPED_TTL_SECONDS)
+        await _redis().delete(ASK_LISTENING_KEY.format(ask_id=holder))
     task = _ask_tasks.pop(group_id, None)
     if task is not None and not task.done():
         task.cancel()
@@ -204,6 +244,81 @@ async def stop_ask(group_id: str) -> str | None:
     finally:
         await force_release_ask_lock(group_id)
     return holder
+
+
+async def begin_listening(ask_id: str) -> None:
+    await _redis().set(ASK_LISTENING_KEY.format(ask_id=ask_id), "1", ex=ASK_LOCK_TTL_SECONDS)
+
+
+async def end_listening(ask_id: str) -> bool:
+    """Close the listening phase; False if the watchdog (or stop) already closed it."""
+    return bool(await _redis().delete(ASK_LISTENING_KEY.format(ask_id=ask_id)))
+
+
+async def _listen_watchdog(group_id: str, ask_id: str, who: dict[str, str]) -> None:
+    await asyncio.sleep(LISTEN_WATCHDOG_SECONDS)
+    try:
+        if not await end_listening(ask_id):
+            return
+        if not await release_ask_lock(group_id, ask_id):
+            return
+    except Exception:
+        logger.warning("Ask Paw: listen watchdog for %s failed", ask_id, exc_info=True)
+        return
+    logger.info("Ask Paw: push-to-talk %s in group %s was never ended", ask_id, group_id)
+    await emit_assistant_state(state="idle", **who)
+
+
+def start_listen_watchdog(group_id: str, ask_id: str, user_id: str, asked_by_name: str) -> None:
+    """End a push-to-talk ask whose ``end`` never arrives: release the lock, go idle."""
+    task = asyncio.ensure_future(
+        _listen_watchdog(group_id, ask_id, _who(group_id, ask_id, user_id, asked_by_name))
+    )
+    _watchdogs.add(task)
+    task.add_done_callback(_watchdogs.discard)
+
+
+async def abort_claimed_ask(group_id: str, ask_id: str, user_id: str, asked_by_name: str) -> None:
+    """A step after taking the lock failed: free the slot and end the ask with idle."""
+    try:
+        await end_listening(ask_id)
+        await release_ask_lock(group_id, ask_id)
+    except Exception:
+        logger.warning("Ask Paw: could not free the slot for %s", ask_id, exc_info=True)
+    await emit_assistant_state(state="idle", **_who(group_id, ask_id, user_id, asked_by_name))
+
+
+async def wait_for_playback(ask_id: str, sentences: int) -> bool:
+    """Block until the bot reports the answer played out (or was cut), within a bound."""
+    timeout = min(
+        _PLAYBACK_BASE_SECONDS + _PLAYBACK_PER_SENTENCE_SECONDS * sentences,
+        _PLAYBACK_MAX_SECONDS,
+    )
+    try:
+        result = await _blocking_redis().blpop(
+            [REDIS_ASK_DONE_KEY.format(ask_id=ask_id)], timeout=timeout
+        )
+    except Exception:
+        logger.warning("Ask Paw: waiting for playback of %s failed", ask_id, exc_info=True)
+        return False
+    if not result:
+        logger.info("Ask Paw: no playback-done signal for %s within %.0fs", ask_id, timeout)
+    return bool(result)
+
+
+async def _say_and_wait(group_id: str, ask_id: str, text: str) -> None:
+    """Voice one fixed line and wait for it to play; failures only log."""
+    try:
+        await publish_bot_command(group_id, {"type": "say", "ask_id": ask_id, "text": text})
+        await publish_bot_command(group_id, {"type": "say_end", "ask_id": ask_id})
+    except Exception:
+        logger.warning("Ask Paw: could not say %r for %s", text, ask_id, exc_info=True)
+        return
+    await wait_for_playback(ask_id, 1)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
 
 
 async def _idle_unless_stopped(ask_id: str, question: str | None, who: dict[str, str]) -> None:
@@ -357,7 +472,7 @@ async def answer_call_question(
     started = time.monotonic()
     spoken: list[str] = []
     try:
-        if await ask_lock_holder(group_id) != ask_id:
+        if not await refresh_ask_lock(group_id, ask_id):
             raise _AskStopped
         await emit_assistant_state(state="thinking", question=question, **who)
 
@@ -399,12 +514,16 @@ async def answer_call_question(
 
             await post_call_bot_message(
                 group_id,
-                f"**Q ({asked_by_name}):** {question}\n**Paw:** {answer}",
+                f"**Q ({_one_line(asked_by_name)}):** {_one_line(question)}\n"
+                f"**Paw:** {_one_line(answer)}",
                 "Paw",
             )
         except Exception:
             logger.warning("Ask Paw: could not post Q&A to group %s", group_id, exc_info=True)
 
+        await wait_for_playback(ask_id, len(spoken))
+        if await ask_lock_holder(group_id) != ask_id:
+            raise _AskStopped
         await emit_assistant_state(state="idle", question=question, answer=answer, **who)
         return answer
     except asyncio.CancelledError:
@@ -416,19 +535,20 @@ async def answer_call_question(
         return None
     except Exception:
         logger.warning("Ask Paw: answering %s in group %s failed", ask_id, group_id, exc_info=True)
-        if not spoken:
-            try:
-                await publish_bot_command(
-                    group_id, {"type": "say", "ask_id": ask_id, "text": _APOLOGY}
-                )
-            except Exception:
-                logger.debug("Ask Paw: apology publish failed", exc_info=True)
         await emit_assistant_state(
             state="error",
             question=question,
             error="Paw couldn't answer that right now.",
             **who,
         )
+        if spoken:
+            try:
+                await publish_bot_command(group_id, {"type": "say_end", "ask_id": ask_id})
+                await wait_for_playback(ask_id, len(spoken))
+            except Exception:
+                logger.debug("Ask Paw: say_end after failure not sent", exc_info=True)
+        else:
+            await _say_and_wait(group_id, ask_id, _APOLOGY)
         await emit_assistant_state(state="idle", question=question, **who)
         return None
     finally:
@@ -471,12 +591,7 @@ async def answer_spoken_question(
         await _idle_unless_stopped(ask_id, question or None, who)
         return None
     if not question:
-        try:
-            await publish_bot_command(
-                group_id, {"type": "say", "ask_id": ask_id, "text": DIDNT_CATCH_THAT}
-            )
-        except Exception:
-            logger.warning("Ask Paw: could not say it missed %s", ask_id, exc_info=True)
+        await _say_and_wait(group_id, ask_id, DIDNT_CATCH_THAT)
         await emit_assistant_state(state="idle", **who)
         try:
             await release_ask_lock(group_id, ask_id)

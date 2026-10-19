@@ -225,5 +225,50 @@
     "tests": [
       "tests/ee/test_livekit_ask_paw.py"
     ]
+  },
+  {
+    "label": "ask: let any member end someone's push-to-talk",
+    "file": "ee/pocketpaw_ee/cloud/livekit/router.py",
+    "find": "    if holder != body.ask_id or asker != user_id:\n",
+    "replace": "    if holder != body.ask_id:\n",
+    "tests": [
+      "tests/ee/test_livekit_ask_paw.py"
+    ]
+  },
+  {
+    "label": "ask: go idle before the answer has played",
+    "file": "ee/pocketpaw_ee/cloud/livekit/assistant.py",
+    "find": "        await wait_for_playback(ask_id, len(spoken))\n        if await ask_lock_holder(group_id) != ask_id:\n",
+    "replace": "        if await ask_lock_holder(group_id) != ask_id:\n",
+    "tests": [
+      "tests/ee/test_livekit_ask_paw.py"
+    ]
+  },
+  {
+    "label": "ask: bot token back to listen-only",
+    "file": "ee/pocketpaw_ee/cloud/livekit/service.py",
+    "find": "        \"call-bot\",\n        can_publish=True,\n",
+    "replace": "        \"call-bot\",\n        can_publish=False,\n",
+    "tests": [
+      "tests/ee/test_livekit_service.py"
+    ]
+  },
+  {
+    "label": "ask: bot token publishes camera and screen too",
+    "file": "ee/pocketpaw_ee/cloud/livekit/service.py",
+    "find": "        publish_sources=[\"microphone\"],\n        can_publish_data=False,\n",
+    "replace": "",
+    "tests": [
+      "tests/ee/test_livekit_service.py"
+    ]
+  },
+  {
+    "label": "ask: assistant_state no longer reaches the group",
+    "file": "ee/pocketpaw_ee/cloud/_core/realtime/audience.py",
+    "find": "            \"call.assistant_state\",\n",
+    "replace": "",
+    "tests": [
+      "tests/cloud/realtime/test_audience.py"
+    ]
   }
 ]
