@@ -171,5 +171,50 @@
     "tests": [
       "tests/cloud/livekit/test_scheduled_meeting_group_scope.py"
     ]
+  },
+  {
+    "label": "ask: skip the group check",
+    "file": "ee/pocketpaw_ee/cloud/livekit/router.py",
+    "find": "    await livekit_service.require_call_group(group_id, str(user.id), workspace_id)\n    if not await livekit_service._meeting_notes_allowed(workspace_id):",
+    "replace": "    if not await livekit_service._meeting_notes_allowed(workspace_id):",
+    "tests": [
+      "tests/ee/test_livekit_ask_paw.py"
+    ]
+  },
+  {
+    "label": "ask: answer even when the bot is not allowed",
+    "file": "ee/pocketpaw_ee/cloud/livekit/router.py",
+    "find": "    if not await livekit_service._meeting_notes_allowed(workspace_id):",
+    "replace": "    if False:",
+    "tests": [
+      "tests/ee/test_livekit_ask_paw.py"
+    ]
+  },
+  {
+    "label": "ask: read the asker's private KB scope",
+    "file": "ee/pocketpaw_ee/cloud/livekit/assistant.py",
+    "find": "        f\"workspace:{workspace_id}\", question, limit=3",
+    "replace": "        f\"user:{workspace_id}\", question, limit=3",
+    "tests": [
+      "tests/ee/test_livekit_ask_paw.py"
+    ]
+  },
+  {
+    "label": "ask: read member-attributed memory facts",
+    "file": "ee/pocketpaw_ee/cloud/livekit/assistant.py",
+    "find": "        if (entry.metadata or {}).get(\"user_id\") not in _SHARED_MEMORY_USER_IDS:\n            continue\n",
+    "replace": "",
+    "tests": [
+      "tests/ee/test_livekit_ask_paw.py"
+    ]
+  },
+  {
+    "label": "ask: release a lock someone else holds",
+    "file": "ee/pocketpaw_ee/cloud/livekit/assistant.py",
+    "find": "    return bool(await _redis().eval(_RELEASE_LUA, 1, key, ask_id))",
+    "replace": "    return bool(await _redis().delete(key))",
+    "tests": [
+      "tests/ee/test_livekit_ask_paw.py"
+    ]
   }
 ]

@@ -16,11 +16,17 @@ Endpoints:
 - ``POST /api/v1/livekit/invites/{token}/join`` — join as guest (public, no auth)
 - ``GET /api/v1/livekit/rooms/{group_id}/invites`` — list active invites
 - ``DELETE /api/v1/livekit/rooms/{group_id}/invites/{invite_id}`` — revoke invite
+- ``POST /api/v1/livekit/rooms/{group_id}/ask`` — Ask Paw a typed question, answered aloud
+- ``POST /api/v1/livekit/rooms/{group_id}/ask/listen`` — push-to-talk for a spoken question
+- ``POST /api/v1/livekit/rooms/{group_id}/ask/stop`` — silence Paw and free the call's ask slot
 
 All routes require an active enterprise license, user authentication,
 and group membership, EXCEPT the public invite validate/join endpoints
 which allow external guests without a Pocketpaw account. Recording endpoints
-additionally require workspace ownership.
+additionally require workspace ownership. Ask Paw endpoints additionally need
+the meeting-notes bot to be allowed for the workspace (403
+``livekit.assistant_unavailable``), take one question per call at a time (409
+``livekit.assistant_busy``) and cap each member at 10 asks a minute (429).
 
 ``/rooms/{group_id}/leave`` was the one exception to that guarantee until
 2026-08-11 — it emitted ``CallParticipantLeft`` to the group's members with
@@ -51,11 +57,13 @@ deadline and ``in_progress``, and an ended/expired meeting is 410
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable
+from typing import Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from pocketpaw_ee.cloud._core.errors import Forbidden
+from pocketpaw_ee.cloud._core.errors import CloudError, ConflictError, Forbidden, RateLimited
 from pocketpaw_ee.cloud._core.realtime.emit import emit
 from pocketpaw_ee.cloud._core.realtime.events import (
     CallEnded,
@@ -68,6 +76,7 @@ from pocketpaw_ee.cloud.chat.group_service import (
     _require_domain_group_member,
 )
 from pocketpaw_ee.cloud.license import require_license
+from pocketpaw_ee.cloud.livekit import assistant
 from pocketpaw_ee.cloud.livekit import service as livekit_service
 from pocketpaw_ee.cloud.shared.deps import current_user, current_workspace_id
 
@@ -415,6 +424,163 @@ async def end_call(
         logger.warning("Failed to emit CallEnded event for group %s", group_id)
 
     return EndCallResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Ask Paw endpoints
+# ---------------------------------------------------------------------------
+
+_T = TypeVar("_T")
+
+
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=500)
+
+
+class AskListenRequest(BaseModel):
+    phase: Literal["start", "end"]
+    ask_id: str | None = Field(default=None, max_length=64)
+
+
+class AskResponse(BaseModel):
+    ask_id: str
+
+
+async def _assistant_redis(op: Awaitable[_T]) -> _T:
+    """Ask Paw's lock, rate limit and bot channel all live in Redis."""
+    try:
+        return await op
+    except CloudError:
+        raise
+    except Exception as exc:
+        logger.warning("Ask Paw: Redis unavailable: %s", exc)
+        raise CloudError(
+            503, "livekit.assistant_offline", "Paw can't take questions right now."
+        ) from exc
+
+
+async def _require_ask_access(group_id: str, user: Any, workspace_id: str) -> None:
+    await require_license()
+    await livekit_service.require_call_group(group_id, str(user.id), workspace_id)
+    if not await livekit_service._meeting_notes_allowed(workspace_id):
+        raise Forbidden(
+            "livekit.assistant_unavailable", "Paw isn't available for calls in this workspace."
+        )
+
+
+async def _claim_ask_slot(group_id: str, user_id: str) -> str:
+    if not await _assistant_redis(assistant.allow_ask(user_id)):
+        raise RateLimited(
+            "livekit.assistant_rate_limited", "Too many questions - wait a moment and try again."
+        )
+    ask_id = assistant.new_ask_id()
+    if not await _assistant_redis(assistant.acquire_ask_lock(group_id, ask_id)):
+        raise ConflictError(
+            "livekit.assistant_busy", "Paw is already answering a question in this call."
+        )
+    return ask_id
+
+
+def _display_name(user: Any) -> str:
+    return getattr(user, "full_name", None) or str(user.id)
+
+
+@router.post("/rooms/{group_id}/ask", response_model=AskResponse, status_code=202)
+async def ask_paw(
+    group_id: str,
+    body: AskRequest,
+    user=Depends(current_user),
+    workspace_id: str = Depends(current_workspace_id),
+):
+    """Ask Paw a typed question; the answer is spoken in the call and posted to chat."""
+    await _require_ask_access(group_id, user, workspace_id)
+    ask_id = await _claim_ask_slot(group_id, str(user.id))
+    assistant.start_ask_task(
+        group_id,
+        assistant.answer_call_question(
+            group_id=group_id,
+            workspace_id=workspace_id,
+            user_id=str(user.id),
+            asked_by_name=_display_name(user),
+            question=body.question.strip() or body.question,
+            ask_id=ask_id,
+        ),
+    )
+    return AskResponse(ask_id=ask_id)
+
+
+@router.post("/rooms/{group_id}/ask/listen", response_model=AskResponse, status_code=202)
+async def ask_paw_listen(
+    group_id: str,
+    body: AskListenRequest,
+    user=Depends(current_user),
+    workspace_id: str = Depends(current_workspace_id),
+):
+    """Push-to-talk: ``start`` opens a capture window on the caller's mic, ``end`` answers it.
+
+    The caller's LiveKit identity is their user id (see ``/token``), which is
+    what the bot keys the capture window on.
+    """
+    await _require_ask_access(group_id, user, workspace_id)
+    user_id = str(user.id)
+
+    if body.phase == "start":
+        ask_id = await _claim_ask_slot(group_id, user_id)
+        await _assistant_redis(
+            assistant.publish_bot_command(
+                group_id, {"type": "listen_start", "ask_id": ask_id, "identity": user_id}
+            )
+        )
+        await assistant.emit_assistant_state(
+            group_id=group_id,
+            state="listening",
+            ask_id=ask_id,
+            asked_by=user_id,
+            asked_by_name=_display_name(user),
+        )
+        return AskResponse(ask_id=ask_id)
+
+    holder = await _assistant_redis(assistant.ask_lock_holder(group_id))
+    if not body.ask_id or holder != body.ask_id:
+        raise ConflictError(
+            "livekit.assistant_ask_mismatch", "That question is no longer being listened for."
+        )
+    await _assistant_redis(
+        assistant.publish_bot_command(
+            group_id, {"type": "listen_end", "ask_id": body.ask_id, "identity": user_id}
+        )
+    )
+    assistant.start_ask_task(
+        group_id,
+        assistant.answer_spoken_question(
+            group_id=group_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            asked_by_name=_display_name(user),
+            ask_id=body.ask_id,
+        ),
+    )
+    return AskResponse(ask_id=body.ask_id)
+
+
+@router.post("/rooms/{group_id}/ask/stop")
+async def ask_paw_stop(
+    group_id: str,
+    user=Depends(current_user),
+    workspace_id: str = Depends(current_workspace_id),
+):
+    """Silence Paw: any member may stop the current answer, not only the asker."""
+    await _require_ask_access(group_id, user, workspace_id)
+    holder = await _assistant_redis(assistant.ask_lock_holder(group_id))
+    await _assistant_redis(assistant.stop_ask(group_id))
+    await assistant.emit_assistant_state(
+        group_id=group_id,
+        state="idle",
+        ask_id=holder,
+        asked_by=str(user.id),
+        asked_by_name=_display_name(user),
+    )
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
