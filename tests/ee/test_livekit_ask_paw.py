@@ -995,3 +995,58 @@ async def test_rate_counter_always_has_a_ttl(redis) -> None:
         assert await assistant.allow_ask("u1")
     assert await redis.get("livekit:ask:rate:u1") == "3"
     assert 0 < await redis.ttl("livekit:ask:rate:u1") <= assistant.ASK_RATE_WINDOW_SECONDS
+
+
+async def test_command_listener_retries_subscribe(redis, monkeypatch) -> None:
+    monkeypatch.setattr(agent_mod, "_SUBSCRIBE_BACKOFF_SECONDS", (0,))
+    a = _agent(redis)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ConnectionError("redis blip")
+        return redis
+
+    with patch.object(a, "_get_command_redis", side_effect=flaky):
+        listener = asyncio.create_task(a._command_listener())
+        try:
+            for _ in range(100):
+                if await redis.publish(f"livekit:bot:cmd:{GROUP}", "x") > 0:
+                    break
+                await asyncio.sleep(0.01)
+            await redis.publish(
+                f"livekit:bot:cmd:{GROUP}", json.dumps({"type": "say", "text": "Back."})
+            )
+            await _until(lambda: not a._say_queue.empty())
+        finally:
+            a._running = False
+            await asyncio.wait_for(listener, timeout=3)
+    assert calls["n"] == 3
+    assert a._say_queue.get_nowait() == ("", "Back.")
+
+
+async def test_kb_gets_a_longer_budget_than_the_other_sources(redis, grounding) -> None:
+    budgets: dict[str, float] = {}
+
+    async def spy(label, coro, default, timeout=assistant._GATHER_TIMEOUT_SECONDS):
+        budgets[label] = timeout
+        coro.close()
+        return default
+
+    assert await assistant.acquire_ask_lock(GROUP, "a1")
+    await _played(redis)
+
+    async def stream(system, user):
+        yield "Ok."
+
+    with patch.object(assistant, "_bounded", spy), patch.object(assistant, "stream_text", stream):
+        await assistant.answer_call_question(
+            group_id=GROUP,
+            workspace_id=WS,
+            user_id="u1",
+            asked_by_name="Ann",
+            question="?",
+            ask_id="a1",
+        )
+    assert budgets == {"live transcript": 1.5, "knowledge base": 3.0, "memory facts": 1.5}

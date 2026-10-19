@@ -62,6 +62,8 @@ ASK_RATE_LIMIT = 10
 ASK_RATE_WINDOW_SECONDS = 60
 
 _GATHER_TIMEOUT_SECONDS = 1.5
+# kb-go is a subprocess per search; spawn plus search often runs past 1.5s.
+_KB_TIMEOUT_SECONDS = 3.0
 _TRANSCRIPT_TAIL_SEGMENTS = 2000
 _KB_MAX_CHARS = 4000
 _MEMORY_FETCH_LIMIT = 200
@@ -414,12 +416,14 @@ async def _memory_facts(workspace_id: str, question: str) -> list[str]:
     return [content for _, content in scored[:_MEMORY_TOP_K]]
 
 
-async def _bounded(label: str, coro: Awaitable[Any], default: Any) -> Any:
+async def _bounded(
+    label: str, coro: Awaitable[Any], default: Any, timeout: float = _GATHER_TIMEOUT_SECONDS
+) -> Any:
     started = time.monotonic()
     try:
-        return await asyncio.wait_for(coro, timeout=_GATHER_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(coro, timeout=timeout)
     except TimeoutError:
-        logger.warning("Ask Paw: %s timed out after %.1fs", label, _GATHER_TIMEOUT_SECONDS)
+        logger.warning("Ask Paw: %s timed out after %.1fs", label, timeout)
     except Exception:
         logger.warning("Ask Paw: %s failed", label, exc_info=True)
     finally:
@@ -478,7 +482,9 @@ async def answer_call_question(
 
         call, kb, facts = await asyncio.gather(
             _bounded("live transcript", read_live_transcript(group_id), ""),
-            _bounded("knowledge base", _kb_context(workspace_id, question), ""),
+            _bounded(
+                "knowledge base", _kb_context(workspace_id, question), "", _KB_TIMEOUT_SECONDS
+            ),
             _bounded("memory facts", _memory_facts(workspace_id, question), []),
         )
         gathered = time.monotonic()

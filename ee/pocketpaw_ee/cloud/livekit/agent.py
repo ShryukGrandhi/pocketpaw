@@ -82,6 +82,8 @@ _LISTEN_END_GRACE_SECONDS = 1.5
 # A push-to-talk window nobody closes is dropped after this, handing back "".
 _LISTEN_WINDOW_SECONDS = 20.0
 
+_SUBSCRIBE_BACKOFF_SECONDS = (1, 2, 5, 10)
+
 _TTS_MODEL = "aura-2-andromeda-en"
 _TTS_SAMPLE_RATE = 24000
 
@@ -756,16 +758,36 @@ class CallMeetingAgent:
         return get_blocking_redis()
 
     async def _command_listener(self) -> None:
-        """Consume Ask Paw commands from ``livekit:bot:cmd:{group_id}``."""
-        try:
-            redis = self._get_command_redis()
-        except Exception as exc:
-            logger.warning("Agent: Redis unavailable, Ask Paw commands disabled: %s", exc)
-            return
+        """Consume Ask Paw commands from ``livekit:bot:cmd:{group_id}``.
+
+        SUBSCRIBE is retried with backoff for as long as the bot runs, so a
+        Redis blip at join time doesn't leave Paw deaf for the whole call.
+        """
         channel = REDIS_BOT_CMD_CHANNEL.format(group_id=self.group_id)
-        pubsub = redis.pubsub()
+        attempt = 0
+        pubsub: Any = None
+        while self._running:
+            try:
+                pubsub = self._get_command_redis().pubsub()
+                await pubsub.subscribe(channel)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                backoff = _SUBSCRIBE_BACKOFF_SECONDS
+                delay = backoff[min(attempt, len(backoff) - 1)]
+                attempt += 1
+                logger.warning(
+                    "Agent: Ask Paw subscribe failed (attempt %d), retrying in %ss: %s",
+                    attempt,
+                    delay,
+                    exc,
+                )
+                pubsub = None
+                await asyncio.sleep(delay)
+        if pubsub is None:
+            return
         try:
-            await pubsub.subscribe(channel)
             logger.info("Agent: listening for Ask Paw commands on %s", channel)
             while self._running:
                 try:
