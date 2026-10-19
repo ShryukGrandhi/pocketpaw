@@ -325,7 +325,7 @@ async def test_answer_stops_speaking_once_the_lock_is_gone(redis, grounding, eve
         )
 
     assert [c.get("text") for c in await _commands(pubsub)] == ["First sentence."]
-    assert _states(events) == ["thinking", "speaking"]
+    assert _states(events) == ["thinking", "speaking", "idle"]
     grounding.post.assert_not_awaited()
 
 

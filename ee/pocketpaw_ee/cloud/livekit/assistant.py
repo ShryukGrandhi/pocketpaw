@@ -76,7 +76,7 @@ _ask_tasks: dict[str, asyncio.Task] = {}
 
 
 class _AskStopped(Exception):
-    """The ask lock moved on (``stop`` from any web process); speak no further."""
+    """The ask lock moved on (``stop`` from any web process, or it expired); stop speaking."""
 
 
 def _redis() -> Any:
@@ -381,7 +381,8 @@ async def answer_call_question(
         logger.info("Ask Paw: %s in group %s was stopped", ask_id, group_id)
         raise
     except _AskStopped:
-        logger.info("Ask Paw: %s in group %s was stopped elsewhere", ask_id, group_id)
+        logger.info("Ask Paw: %s in group %s was stopped or timed out", ask_id, group_id)
+        await emit_assistant_state(state="idle", question=question, **who)
         return None
     except Exception:
         logger.warning("Ask Paw: answering %s in group %s failed", ask_id, group_id, exc_info=True)
