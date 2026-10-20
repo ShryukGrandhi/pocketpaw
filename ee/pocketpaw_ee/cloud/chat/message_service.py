@@ -802,14 +802,24 @@ async def patch_ui_state(
       * ``group``  — caller must be a group member.
       * ``pocket`` / ``session`` — caller must own the linked Session.
 
-    Last-write-wins on the entire ``spec_id`` (no field-level merge);
-    Ripple's ``onStateChange`` always carries the full state snapshot.
+    ``spec_id`` picks the target: ``spec_<n>`` splices into the n-th content
+    fence, ``att_<n>`` merges into ``meta["state"]`` of the n-th ripple
+    attachment (agent replies store their spec there, fence stripped).
+    A ``spec_<n>`` with no matching fence falls back to ``att_<n>``: a live
+    stream still shows the fence client-side after the server stripped it.
+    Patch keys are shallow-merged over the stored state. Known limit: a reply
+    with 2+ fences keeps the later ones in content, so ``spec_0`` there still
+    hits a content fence rather than the attachment.
 
     Emits ``message.ui_state.updated`` with routing keys (``group_id`` for
     group messages, ``user_id`` for pocket/session messages) so other tabs /
-    members of the room re-fetch / re-render content via the WS bridge.
+    members of the room re-fetch / re-render content via the WS bridge. For
+    ``att_`` patches the payload also carries the full updated ``attachments``.
     """
-    from pocketpaw_ee.cloud.chat.ripple_content_patcher import patch_content_with_state
+    from pocketpaw_ee.cloud.chat.ripple_content_patcher import (
+        patch_attachments_with_state,
+        patch_content_with_state,
+    )
 
     # Treat malformed ids (e.g. ``m<timestamp>`` placeholders the FE assigns
     # before the cloud ObjectId arrives) as 404 — InvalidId would otherwise
@@ -845,28 +855,48 @@ async def patch_ui_state(
     else:
         raise NotFound("message", message_id)
 
-    new_content = patch_content_with_state(msg.content or "", spec_id, state)
-    if new_content is None:
-        # Fence not found / malformed JSON — surface a 404 so the FE can
-        # fall back to in-memory state rather than silently dropping the
-        # patch. (A 500 would be wrong: nothing crashed, the target just
-        # doesn't exist in the document we have.)
+    # Where the spec lives decides where the state is written: ``att_<n>`` is
+    # a ripple attachment (the run pipeline strips agent fences into one),
+    # ``spec_<n>`` is a fence still inside the content.
+    new_attachments = None
+    new_content: str | None
+    if spec_id.startswith("att_"):
+        new_attachments = patch_attachments_with_state(msg.attachments, spec_id, state)
+        new_content = msg.content or ""
+    else:
+        new_content = patch_content_with_state(msg.content or "", spec_id, state)
+        if new_content is None and spec_id.startswith("spec_"):
+            # During a live run the client still renders the extracted spec as
+            # a fence in the streaming bubble, so a click before any reload
+            # sends ``spec_<n>``. The server already moved that fence into the
+            # ripple attachment, so retry there with the same index.
+            new_attachments = patch_attachments_with_state(
+                msg.attachments, "att_" + spec_id[len("spec_") :], state
+            )
+            if new_attachments is not None:
+                new_content = msg.content or ""
+    if new_content is None or (spec_id.startswith("att_") and new_attachments is None):
+        # Spec not found / malformed — surface a 404 so the FE can fall back
+        # to in-memory state rather than silently dropping the patch. (A 500
+        # would be wrong: nothing crashed, the target just doesn't exist in
+        # the document we have.)
         raise NotFound("ui_spec", f"{message_id}/{spec_id}")
 
-    msg.content = new_content
+    data: dict = {
+        "message_id": message_id,
+        "spec_id": spec_id,
+        "state": state,
+        "content": new_content,
+    }
+    if new_attachments is not None:
+        # Reassign the whole list so Beanie sees the change and writes it.
+        msg.attachments = [_AttachmentDoc(**a) for a in new_attachments]
+        data["attachments"] = [a.model_dump(mode="json") for a in msg.attachments]
+    else:
+        msg.content = new_content
     await msg.save()
 
-    await emit(
-        MessageUiStateUpdated(
-            data={
-                "message_id": message_id,
-                "spec_id": spec_id,
-                "state": state,
-                "content": new_content,
-                **route_key,
-            }
-        )
-    )
+    await emit(MessageUiStateUpdated(data={**data, **route_key}))
     return {"ok": True}
 
 
