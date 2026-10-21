@@ -1,12 +1,13 @@
 # tests/ee/agent/test_ripple_beats.py — Ripple explainer diagrams in HyperFrames
 # compositions: the pre-dispatch check, the 15-20 s reel window, and the brief
-# reaching the Studio tool. Reels carry an anatomy film, not Ripple
-# (test_anatomy_film.py), so the reel paths here include one.
+# reaching the Studio tool. clean_reel defaults to the film route
+# (test_anatomy_film.py covers the routing), so the reel paths here include one.
 from __future__ import annotations
 
 import json
 
 import pytest
+from pocketpaw_ee.agent.mcp_servers.anatomy_film import ANATOMY_FILM_EXAMPLES
 from pocketpaw_ee.agent.mcp_servers.ripple_beats import FIGURE_ANCHORS, validate_ripple_beats
 from pocketpaw_ee.agent.mcp_servers.timeline import (
     ADD_MOTION_GRAPHIC_DESCRIPTION,
@@ -33,7 +34,7 @@ SCENE = (
 )
 FILM = (
     '<div data-anatomy-film data-start="2" data-duration="12"><script type="application/json">'
-    + json.dumps({"parts": [{"id": "body", "kind": "box", "at": [0, 0, 0], "w": 60}]})
+    + json.dumps(ANATOMY_FILM_EXAMPLES[0])
     + "</script></div>"
 )
 
