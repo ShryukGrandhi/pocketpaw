@@ -21,6 +21,15 @@
 # Cached per (repo, sha, component, open PR numbers): a new trunk sha or a PR
 # opening or closing reads again. An id outside the owned system's components
 # is 404 ``belt.component_not_found``; the read's own errors pass through.
+#
+# ``read_file`` (``&file=``) opens one file of that listing (an exact path match,
+# else 404 ``belt.file_not_found``, so nothing outside the listing is read):
+# ``{sha, path, lang, symbols, symbols_skipped, excerpt}``. ``symbols`` come from
+# ``architecture_symbols`` (the world-model is the workspace's, not ``sha``'s, so
+# a line can drift on an old ``at``), each with the file url plus ``#L<line>``.
+# ``excerpt`` is Ripple's ``C4Code`` shape ``{startLine, before, language}``:
+# ``EXCERPT_LINES`` lines from ``line`` (the top by default), ``None`` for an
+# empty, binary or over-``MAX_MODEL_BYTES`` file, or a failed git read.
 
 from __future__ import annotations
 
@@ -31,15 +40,16 @@ from typing import Any
 from urllib.parse import quote
 
 from . import app_blueprint_read as abr
-from . import architecture_history
+from . import architecture_history, architecture_symbols
 from . import architecture_read as ar
 from .architecture_live import _LIMIT
 from .orient import _dicts, _owned_system, path_index
-from .service import BeltConsoleError
+from .service import MAX_MODEL_BYTES, BeltConsoleError
 
 logger = logging.getLogger(__name__)
 _CACHE_MAX = 256
 _CHUNK = 500  # pathspecs per git grep
+EXCERPT_LINES = 40
 # ponytail: drop-all when full; an LRU if the viewer ever walks many shas
 _CACHE: dict[tuple[str, str, str, tuple[int, ...]], dict[str, Any]] = {}
 _LANG = {
@@ -66,10 +76,60 @@ async def read_code(
     workspace_id: str, repo: str, component: str, *, at: str = "", gh: abr.Run | None = None
 ) -> dict[str, Any]:
     """The component's files at the architecture read's sha (see the header)."""
+    return await _files(await _read(workspace_id, repo, at), component, gh)
+
+
+async def read_file(
+    workspace_id: str,
+    repo: str,
+    component: str,
+    file: str,
+    *,
+    at: str = "",
+    line: int = 0,
+    gh: abr.Run | None = None,
+) -> dict[str, Any]:
+    """One of the component's files: its symbols and an excerpt (see the header)."""
+    body = await _read(workspace_id, repo, at)
+    listing = await _files(body, component, gh)
+    row = next((f for f in listing["files"] if f["path"] == file), None)  # exact: no traversal
+    if row is None:
+        raise BeltConsoleError(404, "No such file in this component.", "belt.file_not_found")
+    symbols, skipped = await architecture_symbols.symbols_for(Path(body["repo"]), file)
+    for s in symbols:
+        s["url"] = f"{row['url']}#L{s['line']}" if row["url"] and s["line"] else row["url"]
+    excerpt = None
+    if row["loc"]:  # None: binary; 0: empty
+        try:
+            excerpt = await _excerpt(abr._git(Path(body["repo"])), listing["sha"], file, line)
+        except abr.ReadFailed:
+            logger.warning("Excerpt of %s at %s failed", file, listing["sha"], exc_info=True)
+    return {
+        "sha": listing["sha"], "path": file, "lang": row["lang"], "symbols": symbols,
+        "symbols_skipped": skipped, "excerpt": excerpt,
+    }  # fmt: skip
+
+
+async def _excerpt(git: abr.Run, sha: str, path: str, line: int) -> dict[str, Any] | None:
+    """``EXCERPT_LINES`` lines from ``line`` (clamped; the top when 0), sized by
+    ``ls-tree`` first so an oversized blob is never read."""
+    entry = await abr._ok(git, ["--literal-pathspecs", "ls-tree", "-l", sha, "--", path])
+    _mode, kind, obj, size = (entry.split("\t", 1)[0].split() + ["", "", "", ""])[:4]
+    if kind != "blob" or not size.isdigit() or int(size) > MAX_MODEL_BYTES:
+        return None
+    lines = (await abr._ok(git, ["cat-file", "blob", obj])).splitlines()
+    start = max(1, min(line, len(lines)))
+    before = lines[start - 1 : start - 1 + EXCERPT_LINES]
+    return {"startLine": start, "before": before, "language": lang(path)}
+
+
+async def _read(workspace_id: str, repo: str, at: str) -> dict[str, Any]:
     if at:
-        body = await architecture_history.read_at(workspace_id, repo, at)
-    else:
-        body = await ar.read_architecture(workspace_id, repo)
+        return await architecture_history.read_at(workspace_id, repo, at)
+    return await ar.read_architecture(workspace_id, repo)
+
+
+async def _files(body: dict[str, Any], component: str, gh: abr.Run | None) -> dict[str, Any]:
     system = _owned_system(body["model"]) or {}
     comps = [c for k in _dicts(system.get("containers")) for c in _dicts(k.get("components"))]
     comp = next((c for c in comps if str(c.get("id")) == component), None)

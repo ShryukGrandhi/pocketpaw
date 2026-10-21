@@ -3550,7 +3550,7 @@ Source: `ee/pocketpaw_ee/cloud/belt/architecture_history.py`.
 - 404 `belt.repo_not_found` outside the allowlist, `belt.architecture_not_found`
   when the clone has no trunk. Not cached.
 
-### `GET /api/v1/belt/architecture/code?repo=<path>&component=<id>[&at=<sha>]`
+### `GET /api/v1/belt/architecture/code?repo=<path>&component=<id>[&at=<sha>][&file=<path>&line=<n>]`
 
 One component's files, for the viewer's Code tab. RBAC `belt.read`. Source:
 `ee/pocketpaw_ee/cloud/belt/architecture_code.py`.
@@ -3576,6 +3576,34 @@ One component's files, for the viewer's Code tab. RBAC `belt.read`. Source:
   `no_paths: true`: the component has no `paths` (`files: []`).
 - An id that is not a component of the repo's own system is 404
   `belt.component_not_found`.
+
+#### File mode: `&file=<path>[&line=<n>]`
+
+One file of that listing: its symbols and a code excerpt.
+
+```json
+{
+  "sha": "<the read's sha>", "path": "src/ui/a.py", "lang": "python",
+  "symbols": [ { "name": "build", "kind": "function", "line": 42, "callers": 3,
+                 "url": "https://github.com/<slug>/blob/<sha>/src/ui/a.py#L42" } ],
+  "symbols_skipped": null,
+  "excerpt": { "startLine": 1, "before": ["..."], "language": "python" }
+}
+```
+
+- `file` must be exactly one of the component's listed paths, else 404
+  `belt.file_not_found`. Nothing outside that listing is read.
+- `symbols` come from the repo's loom world-model,
+  `worldmodel-<repo dir name>.json` in `POCKETPAW_FACTORY_LOOM_DIR` (else the
+  nearest `.loom/` above the repo). They are sorted by `callers` (distinct
+  calling symbols), then by line. The model reflects the workspace checkout,
+  not `sha`, so lines can drift on an old `at`. Loom reads Python and Go only.
+- `symbols_skipped` says why `symbols` is empty when no model could be used:
+  `"no model"`, `"too large"` (over 25 MB, never parsed) or `"unreadable"`.
+  `null` means the model was read.
+- `excerpt` is 40 lines starting at `line` (clamped to the file; the top when
+  omitted), in Ripple's `C4Code` shape. It is `null` for an empty or binary
+  file, one over 1 MB, or a failed git read.
 - `at=<sha>` lists the files at that trunk commit, through the `at` read above
   (its 404s apply; `prs` stay `[]` there, as that read has no live block).
 - Cached per repo, sha, component and the set of open PR numbers.

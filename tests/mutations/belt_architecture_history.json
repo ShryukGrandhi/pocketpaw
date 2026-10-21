@@ -47,8 +47,8 @@
   {
     "label": "architecture code: at is ignored",
     "file": "ee/pocketpaw_ee/cloud/belt/architecture_code.py",
-    "find": "    if at:\n        body = await architecture_history.read_at(",
-    "replace": "    if False:\n        body = await architecture_history.read_at(",
+    "find": "    if at:\n        return await architecture_history.read_at(workspace_id, repo, at)\n",
+    "replace": "    if False:\n        return await architecture_history.read_at(workspace_id, repo, at)\n",
     "tests": [
       "tests/cloud/test_belt_architecture_history.py::test_the_code_read_at_a_commit_uses_that_sha"
     ]
