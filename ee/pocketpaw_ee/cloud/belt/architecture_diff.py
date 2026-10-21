@@ -7,9 +7,9 @@
 # ``systems`` and their nested ``containers`` / ``components`` / ``children``
 # (the first occurrence of an id wins). An element is changed when one of its
 # own fields differs (nested lists are not its fields) or it moved under another
-# parent (``parent``). Relationships have no id: one is its ``(source, target)``
-# pair (``from`` / ``to`` accepted), so a relabelled one is neither added nor
-# removed.
+# parent (``parent``). Relationships have no id: they match by ``(source, target)``
+# (``from`` / ``to`` accepted) counting copies, so a second one between the same
+# ends is added or removed on its own and a relabelled one is neither.
 #
 # ``removed_elements`` carries what a viewer needs to draw what is gone: each
 # topmost removed element, its ``parent`` id (``None`` at the top level) and the
@@ -50,12 +50,26 @@ def _own(el: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in el.items() if k not in _NESTED}
 
 
-def _rels(model: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
-    out: dict[tuple[str, str], dict[str, Any]] = {}
+def _rels(model: dict[str, Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    out: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for r in _list(model.get("relationships")):
         if isinstance(r, dict):
             ends = (str(r.get("source", r.get("from"))), str(r.get("target", r.get("to"))))
-            out.setdefault(ends, r)
+            out.setdefault(ends, []).append(r)
+    return out
+
+
+def _extra(rels: dict[tuple[str, str], list[Any]], other: dict[tuple[str, str], list[Any]]):
+    """Copies in ``rels`` with no partner in ``other`` (identical pairs first, then relabels)."""
+    out = []
+    for ends, mine in rels.items():
+        theirs, alone = list(other.get(ends, [])), []
+        for r in mine:
+            if r in theirs:
+                theirs.remove(r)
+            else:
+                alone.append(r)
+        out += alone[len(theirs) :]
     return out
 
 
@@ -97,8 +111,8 @@ def diff_models(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
             for i in top
         ],
         "relationships": {
-            "added": [r for k, r in r_new.items() if k not in r_old],
-            "removed": [r for k, r in r_old.items() if k not in r_new],
+            "added": _extra(r_new, r_old),
+            "removed": _extra(r_old, r_new),
         },
     }
 

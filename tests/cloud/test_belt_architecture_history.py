@@ -148,11 +148,11 @@ async def test_diff_returns_the_read_plus_what_changed_since_the_commit(origin, 
 
 
 @pytest.mark.parametrize("bad", ["--all", "zz12345", "deadbeefdeadbeef"])
-async def test_diff_guards_its_sha_like_at(origin, bad):
+async def test_diff_guards_its_sha_like_at_with_its_own_code(origin, bad):
     body = await ah.read_at("repo", origin.shas[2])
     with pytest.raises(BeltConsoleError) as err:
         await ah.read_diff("repo", bad, body)
-    assert (err.value.status_code, err.value.code) == (404, "belt.commit_not_found")
+    assert (err.value.status_code, err.value.code) == (404, "belt.diff_commit_not_found")
 
 
 @pytest.mark.parametrize("boom", [OSError("no git"), RuntimeError("command timed out")])
@@ -185,5 +185,5 @@ def test_route_diff_adds_the_diff_and_a_bad_one_is_404(origin, monkeypatch):
         plain = client.get("/api/v1/belt/architecture", params=params)
     assert ok.status_code == 200 and ok.json()["diff"]["added"] == []
     assert ok.json()["model"]["scope"] == "v3"
-    assert bad.status_code == 404 and bad.json()["error"]["code"] == "belt.commit_not_found"
+    assert bad.status_code == 404 and bad.json()["error"]["code"] == "belt.diff_commit_not_found"
     assert "diff" not in plain.json()

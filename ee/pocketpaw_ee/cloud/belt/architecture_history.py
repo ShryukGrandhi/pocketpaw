@@ -73,7 +73,10 @@ async def read_history(repo: str) -> list[dict[str, Any]]:
             raise _unavailable(err)
         rows = [line.split("\x1f", 2) for line in out.splitlines() if line]
         gate = asyncio.Semaphore(8)
-        counts = await asyncio.gather(*(_counts(path, s, gate) for s, _d, _m in rows))
+        jobs = (_counts(path, s, gate) for s, _d, _m in rows)
+        counts = await asyncio.gather(*jobs, return_exceptions=True)  # none left running
+        if fail := next((c for c in counts if isinstance(c, BaseException)), None):
+            raise fail
     except (OSError, RuntimeError) as exc:  # git missing, or it timed out
         raise _unavailable(str(exc)) from None
     return [
@@ -111,7 +114,11 @@ async def read_at(repo: str, at: str, *, gh: abr.Run | None = None) -> dict[str,
 
 async def read_diff(repo: str, at: str, body: dict[str, Any]) -> dict[str, Any]:
     """``body`` (a read) plus ``diff``: its model against trunk commit ``at``'s."""
-    old = await read_at(repo, at)
+    try:
+        old = await read_at(repo, at)
+    except BeltConsoleError as exc:  # a bad sha gets its own code, apart from at='s
+        code = "belt.diff_commit_not_found" if exc.code == "belt.commit_not_found" else exc.code
+        raise BeltConsoleError(exc.status_code, exc.message, code) from None
     return {**body, "diff": diff_models(old["model"]["model"], body["model"]["model"])}
 
 

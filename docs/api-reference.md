@@ -3534,9 +3534,10 @@ One repo's committed C4 model, for the architecture viewer. RBAC `belt.read`
   expiry. An empty `at` is the normal read.
 - `diff=<sha>` adds `diff` to the body (the normal read, or the `at` read):
   what changed in this read's model since that trunk commit (source:
-  `architecture_diff.py`). The sha is checked exactly as `at` is, with the same
-  404s. Elements are matched by `id` at every level; relationships by their
-  `(source, target)` pair.
+  `architecture_diff.py`). The sha is checked exactly as `at` is; a bad one is
+  404 `belt.diff_commit_not_found`. Elements are matched by `id` at every level;
+  relationships by their `(source, target)` pair, counting copies, so a second
+  relationship between the same ends is added or removed on its own.
 
   ```json
   "diff": {
