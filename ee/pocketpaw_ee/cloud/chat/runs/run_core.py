@@ -16,8 +16,10 @@ pocket, Paw Bar run, timeline, craft projections, SSE queue, artifacts) before
 override, preamble and attachments, calls ``AgentPool.run`` and maps backend
 events to SSE frames: chunks, thinking, tool chips, plan updates, ripple /
 artifact / studio frames, editor envelopes (``_EDITOR_ENVELOPE_MARKERS``:
-timeline and ``craft_edit``), ``open_surface``, usage. A rate-limited provider
-gets ``agent.provider_busy``; other backend errors ``agent.backend_error``.
+timeline and ``craft_edit``), ``open_surface``, usage. Provider failures a user
+can act on (busy, out of credit, token limit, malformed output) become plain
+sentences (``_backend_error_frame``), as does an unreachable provider; other
+diagnostics reach chat scrubbed of secrets and addresses; raw text stays in logs.
 
 Behind ``POCKETPAW_SESSION_SUPERVISOR`` it resumes the agent's native CLI
 session and can lease a warm client.
@@ -33,19 +35,18 @@ then ``guards.reserve_free_run`` must fit the run under the daily early-access
 ceiling or it ends with ``early_access.paused``.
 
 Every terminal path persists the streamed text as an assistant ``Message`` with
-its steps, records token usage (latest-wins), and sets the stream TTL; a
-concierge run never trains the agent's soul. Invariants: the cancel check keeps
-its held chunk in ``full_text`` without appending it; ``mark_cloud_chat_run`` and
-the artifact collector are bound before the prewarm task exists; the host-cancel
-cleanup is shielded and drained (``drain_pending_cleanups``) before DB close; a
-supervised turn that ends without ``done`` demotes its session (``mark_crashed``);
-every step of the backend's generator (and its final ``aclose``) runs in one
-Context so spans held across ``yield`` attach and detach cleanly, and that
-``aclose`` is time-bounded with a cancel during it deferred, so it never skips
-the sink/turn/supervisor bookkeeping after it. The agent event generator is
-closed explicitly when the loop exits (a stop breaks out of it), before any
-terminal write, so a cancelled run is fully torn down by the time its status
-says so.
+its steps, records token usage (latest-wins), and sets the stream TTL. A looping
+reply (``RepetitionGuard``) is stopped and kept to one copy: completed with a
+notice when its tools did work, failed otherwise. A concierge run never trains
+the agent's soul; a Sites run neither trains it nor reads its recall (each Sites
+chat is about one site). Invariants: the cancel check keeps its held chunk in
+``full_text`` without appending it; ``mark_cloud_chat_run`` and the artifact
+collector are bound before the prewarm task exists; the host-cancel cleanup is
+shielded and drained before DB close; a supervised turn that ends without
+``done`` demotes its session; every step of the backend's generator (and its
+time-bounded final ``aclose``) runs in one Context, so spans attach cleanly and
+the sink/turn/supervisor bookkeeping is never skipped; the generator is closed
+before any terminal write, so a cancelled run is torn down when its status says so.
 """
 
 from __future__ import annotations
@@ -71,6 +72,11 @@ from pocketpaw.agents.backend import (  # type: ignore[import-untyped]
 from pocketpaw.agents.errors import AgentDisabled  # type: ignore[import-untyped]
 from pocketpaw.agents.pool import (  # type: ignore[import-untyped]
     get_agent_pool,
+)
+from pocketpaw.agents.repetition_guard import (  # type: ignore[import-untyped]
+    REPETITION_STOPPED_CODE,
+    REPETITION_STOPPED_MESSAGE,
+    RepetitionGuard,
 )
 from pocketpaw.agents.session_supervisor import (  # type: ignore[import-untyped]
     get_session_supervisor,
@@ -196,15 +202,180 @@ PROVIDER_BUSY_CODE = "agent.provider_busy"
 PROVIDER_BUSY_MESSAGE = "The AI provider is busy right now, try again in a moment."
 
 
-def _backend_error_frame(message: str) -> dict[str, str]:
-    """The ``error`` frame for a backend-yielded error.
+# The other provider and model failures a user can act on. Each maps to a plain
+# sentence that says what happened and what to do; the raw provider text stays in
+# the logs and on the run doc, never in the chat.
+#
+# Order matters. Diagnostics an operator must read first (auth, unknown model,
+# bad base URL, connection refused, unsupported parameter, and the run-limit
+# text that names the setting to raise) pass through raw and win over
+# everything, which also keeps the LiteLLM 401 rewrite (it embeds the original
+# error) intact. Then token limit beats out of credit (a token count can contain
+# "402"), and out of credit beats busy (OpenAI reports an empty balance as a 429).
+# The provider is unreachable or misconfigured on the operator's side: the
+# LiteLLM 401 rewrite, a bad base URL, a refused connection, a DNS failure. On
+# the cloud the provider config is the operator's, so a tenant gets a plain
+# sentence and never the proxy address or the ``POCKETPAW_*`` setting names.
+_PROVIDER_SETUP_RE = re.compile(
+    r"LiteLLM proxy rejected|base[ _-]?url|connection (?:refused|error|reset)"
+    r"|connecterror|failed to establish|name or service not known|getaddrinfo"
+    r"|nodename nor servname|temporary failure in name resolution",
+    re.IGNORECASE,
+)
+# A status code only counts next to a status word, so "128,404 tokens" is not a 404.
+_STATUS_CTX = r"(?:status[ _]?code\W{0,3}|\bhttp\W{0,3}|\berror\W{0,3}|\bcode\W{0,3})"
+_PASSTHROUGH_RE = re.compile(
+    _STATUS_CTX + r"40[134]\b|\b40[134]\W{0,3}(?:unauthori[sz]ed|forbidden|not found)"
+    r"|authenticat|unauthori[sz]ed"
+    r"|invalid[ _-]?api[ _-]?key|incorrect api key|api[ _-]?key (?:is )?(?:missing|invalid|not)"
+    r"|permission[ _-]denied|model[ _-]?not[ _-]?found|not_found_error|does not exist"
+    r"|unknown model|no such model|request_limit|total_tokens_limit"
+    r"|unsupported (?:parameter|value)|unrecognized (?:request )?argument"
+    r"|extra inputs are not permitted",
+    re.IGNORECASE,
+)
+_TOKEN_LIMIT_RE = re.compile(
+    r"token limit|context[ _-]length|maximum context|context window|prompt is too long"
+    r"|max_tokens",
+    re.IGNORECASE,
+)
+_OUT_OF_CREDIT_RE = re.compile(
+    r"(?:status[ _]?code\W{0,3}|\bhttp\W{0,3}|\berror\W{0,3}|\bcode\W{0,3})402\b"
+    r"|\b402\W{0,3}payment required|insufficient[ _-]?(?:balance|credit|funds|quota)"
+    r"|payment required|credit balance is too low|exceeded your current quota",
+    re.IGNORECASE,
+)
+_MALFORMED_OUTPUT_RE = re.compile(
+    r"validation errors? for|pydantic_core|ValidationError|Field required"
+    r"|UnexpectedModelBehavior|Exceeded maximum retries",
+)
 
-    A busy provider gets a stable code and a plain message; the raw provider text
-    (already logged by the caller) never reaches the client or the run doc.
+OUT_OF_CREDIT_CODE = "agent.provider_out_of_credit"
+OUT_OF_CREDIT_MESSAGE = (
+    "This model has run out of credit. Pick a different model from the model menu "
+    "and send your message again."
+)
+TOKEN_LIMIT_CODE = "agent.token_limit"
+TOKEN_LIMIT_MESSAGE = (
+    "This reply ran past the model's length limit before it finished. Try a shorter "
+    "message or ask for a smaller change, or switch to a model with a larger limit."
+)
+MALFORMED_OUTPUT_CODE = "agent.malformed_output"
+MALFORMED_OUTPUT_MESSAGE = (
+    "The model sent back something this app could not read, so the reply stopped. "
+    "Try again, and switch model if it keeps happening."
+)
+INTERNAL_ERROR_MESSAGE = "Something went wrong on our side, so the reply stopped. Try again."
+PROVIDER_SETUP_CODE = "agent.provider_unreachable"
+PROVIDER_SETUP_MESSAGE = (
+    "The AI provider isn't reachable or isn't set up right. An admin needs to check "
+    "the model settings."
+)
+
+# Exceptions raised by a provider SDK or an agent backend, by defining module.
+# Only these are read for provider wording on the crash path; an exception from
+# our own code (a Beanie or Pydantic ValidationError in a store) is internal.
+_PROVIDER_EXC_MODULES = (
+    "pydantic_ai",
+    "litellm",
+    "openai",
+    "anthropic",
+    "google",
+    "mistralai",
+    "groq",
+    "cohere",
+    "claude_agent_sdk",
+    "pocketpaw.agents",
+    "pocketpaw.llm",
+)
+
+
+_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s'\"<>)\]]+", re.IGNORECASE)
+_HOST_PORT_RE = re.compile(
+    r"\b(?:localhost|\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9-]+(?:\.[a-z0-9-]+)+):\d{2,5}\b",
+    re.IGNORECASE,
+)
+_IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_ENV_NAME_RE = re.compile(r"\bPOCKETPAW_[A-Z0-9_]+\b")
+
+
+def _scrub_for_chat(text: str) -> str:
+    """Make raw error text safe to show a tenant.
+
+    Secrets go through ``redact_output`` (API keys, bearer tokens, ``api_key=``).
+    URLs, host:port pairs, IPs and ``POCKETPAW_*`` setting names are operator
+    config on the cloud, so they are replaced too. The run doc keeps the raw text.
     """
-    if _PROVIDER_BUSY_RE.search(message):
-        return {"code": PROVIDER_BUSY_CODE, "message": PROVIDER_BUSY_MESSAGE}
-    return {"code": "agent.backend_error", "message": message}
+    from pocketpaw.security.redact import redact_output  # type: ignore[import-untyped]
+
+    text = redact_output(text)
+    text = _URL_RE.sub("[url]", text)
+    text = _HOST_PORT_RE.sub("[host]", text)
+    text = _IP_RE.sub("[host]", text)
+    return _ENV_NAME_RE.sub("[setting]", text)
+
+
+def _classify_error(message: str) -> dict[str, str]:
+    """The chat ``error`` frame for raw provider/backend error text.
+
+    Setup failures get a plain admin-facing sentence. Operator diagnostics in
+    ``_PASSTHROUGH_RE`` (auth, unknown model, run-limit settings, unsupported
+    parameters) keep their wording because the wording is the fix, scrubbed of
+    secrets and internal addresses. Known user-facing failures (token limit, out
+    of credit, busy, malformed output) get plain sentences. Anything else passes
+    through scrubbed as ``agent.backend_error``.
+    """
+    if _PROVIDER_SETUP_RE.search(message):
+        return {"code": PROVIDER_SETUP_CODE, "message": PROVIDER_SETUP_MESSAGE}
+    if not _PASSTHROUGH_RE.search(message):
+        if _TOKEN_LIMIT_RE.search(message):
+            return {"code": TOKEN_LIMIT_CODE, "message": TOKEN_LIMIT_MESSAGE}
+        if _OUT_OF_CREDIT_RE.search(message):
+            return {"code": OUT_OF_CREDIT_CODE, "message": OUT_OF_CREDIT_MESSAGE}
+        if _PROVIDER_BUSY_RE.search(message):
+            return {"code": PROVIDER_BUSY_CODE, "message": PROVIDER_BUSY_MESSAGE}
+        if _MALFORMED_OUTPUT_RE.search(message):
+            return {"code": MALFORMED_OUTPUT_CODE, "message": MALFORMED_OUTPUT_MESSAGE}
+    return {"code": "agent.backend_error", "message": _scrub_for_chat(message)}
+
+
+def _backend_error_frame(message: str) -> dict[str, str]:
+    """The ``error`` frame for a backend-yielded error (see ``_classify_error``).
+
+    The caller keeps the raw text in the logs and on the run doc.
+    """
+    return _classify_error(message)
+
+
+def _is_provider_exception(exc: BaseException) -> bool:
+    for cls in type(exc).__mro__:
+        module = getattr(cls, "__module__", "") or ""
+        if module.startswith(_PROVIDER_EXC_MODULES):
+            return True
+    return False
+
+
+def _is_validation_error(exc: BaseException) -> bool:
+    return any(cls.__name__ == "ValidationError" for cls in type(exc).__mro__)
+
+
+def _crash_error_frame(exc: Exception) -> dict[str, str]:
+    """The ``error`` frame for a run that crashed.
+
+    Provider/backend exceptions are classified like a backend error. Our own
+    validation errors (a store or model rejecting data) are internal: a generic
+    sentence, never their field-by-field text. Everything else keeps the
+    ``agent.run_failed`` text it always had, scrubbed. The raw text goes on the
+    run doc.
+    """
+    text = str(exc)
+    if _is_provider_exception(exc):
+        frame = _classify_error(text)
+        if frame["code"] != "agent.backend_error":
+            return frame
+    elif _is_validation_error(exc):
+        return {"code": "agent.run_failed", "message": INTERNAL_ERROR_MESSAGE}
+    return {"code": "agent.run_failed", "message": _scrub_for_chat(text)}
 
 
 def _stream_ttl() -> int:
@@ -1103,6 +1274,48 @@ def _normalize_and_strip(
 _CONCIERGE_SESSION_PREFIX = "cloud:concierge:"
 
 
+def _is_sites_run(ctx: ScopeContext) -> bool:
+    """True when this run is a /sites chat (create or refine).
+
+    Each Sites chat is about ONE site. The per-agent soul is shared by every
+    chat the agent has, and its recall is keyed on the user's message, so two
+    site briefs ("a site for my pottery studio" / "...tattoo studio") recall each
+    other's replies: that was the cross-session bleed. Sites runs therefore
+    neither feed ``pool.observe`` nor read the soul recall.
+    """
+    sc = ctx.surface_context
+    return sc is not None and sc.kind is SurfaceKind.SITES
+
+
+# The soul memory tools ``tool_bridge`` injects on the function-tool backends
+# (pydantic_ai and friends) when a soul is active. Bare names: that is how those
+# backends match a deny set, and the Claude SDK path ignores a name it does not
+# carry. Denied on /sites so the model cannot pull another chat's memories back
+# in by calling a tool, which would reopen the read side ``_is_sites_run`` shut.
+_SOUL_MEMORY_TOOL_IDS = frozenset(
+    {
+        "soul_context",
+        "soul_core_memory",
+        "soul_edit_core",
+        "soul_evaluate",
+        "soul_forget",
+        "soul_recall",
+        "soul_reload",
+        "soul_remember",
+        "soul_status",
+    }
+)
+
+
+def _deny_soul_tools_on_sites(ctx: ScopeContext, profile: SurfaceProfile) -> SurfaceProfile:
+    """``profile`` with the soul memory tools denied when this is a Sites run."""
+    if not _is_sites_run(ctx):
+        return profile
+    from dataclasses import replace
+
+    return replace(profile, deny_mcp_tool_ids=profile.deny_mcp_tool_ids | _SOUL_MEMORY_TOOL_IDS)
+
+
 def _is_concierge_run(spec: RunSpec) -> bool:
     """True when this run is a Paw Bar concierge (anonymous-visitor) chat.
 
@@ -1160,6 +1373,12 @@ async def _persist_and_complete(
         logger.debug(
             "skipping pool.observe for concierge run %s — anonymous visitor input "
             "must not train the per-agent soul",
+            spec.run_id,
+        )
+    elif _is_sites_run(ctx):
+        logger.debug(
+            "skipping pool.observe for sites run %s: a site's brief must not "
+            "reach the agent's other chats",
             spec.run_id,
         )
     else:
@@ -1919,6 +2138,10 @@ async def _drive_agent_loop(
             surface_preamble=surface_preamble,
             surface_cache_key=surface_cache_key,
         )
+        if _is_sites_run(ctx):
+            # UX-8: no cross-session soul recall in a Sites chat (see
+            # ``_is_sites_run``). Withheld otherwise, so other runs are unchanged.
+            run_kwargs["soul_recall"] = False
         if surface_allow_mcp is not None:
             run_kwargs["allow_mcp_tool_ids"] = surface_allow_mcp
         # CX-2 — per-agent EXCLUSIVE tool policy. When the RESOLVED agent declares
@@ -2521,6 +2744,7 @@ async def _drive_agent_loop(
                     ctx.target_agent_id,
                     message[:200],
                 )
+                ctx.backend_error_detail = message
                 yield ("error", _backend_error_frame(message))
                 if sup_acq is not None:
                     # Supervised: a backend ``error`` event is NOT automatically a
@@ -3042,7 +3266,7 @@ async def execute_run(spec: RunSpec) -> None:
     # ripple-omit + _drive_agent_loop tool-deny/allow) read ctx.resolved_profile
     # instead of re-resolving. Never raises — a missing/foreign pocket degrades
     # to the surface base (today's behavior).
-    ctx.resolved_profile = await _resolve_entity_profile(ctx)
+    ctx.resolved_profile = _deny_soul_tools_on_sites(ctx, await _resolve_entity_profile(ctx))
 
     # ART-3: reject a run whose workspace agent-jail is over quota BEFORE the
     # prewarm + mark-running + agent spin-up, so a tenant that filled its scratch
@@ -3184,6 +3408,8 @@ async def execute_run(spec: RunSpec) -> None:
         # ``stream_end`` frame and the persisted run doc carry actual counts instead
         # of the old hardcoded ``{}``.
         usage: dict[str, Any] = {}
+        repetition = RepetitionGuard()
+        tool_work_done = False
         agent_events = _iter_agent_events(spec, ctx)
         try:
             async for event_name, event_data in agent_events:
@@ -3203,7 +3429,42 @@ async def execute_run(spec: RunSpec) -> None:
                     cancelled = True
                     break
                 if event_name == "chunk":
-                    full_text += _chunk_text(event_data)
+                    chunk_text = _chunk_text(event_data)
+                    full_text += chunk_text
+                    if repetition.feed(chunk_text):
+                        # UX-4: the model is looping on one sentence or paragraph.
+                        # Stop reading (the ``finally`` closes the backend) and keep
+                        # one copy of the loop. The tripping chunk is never
+                        # forwarded. A run whose tools already did work ends
+                        # COMPLETED with the notice appended, so that work is not
+                        # reported as a failure; a text-only run ends failed with
+                        # the notice as its error.
+                        logger.warning(
+                            "execute_run %s: reply repeated itself, stopping it", spec.run_id
+                        )
+                        full_text = repetition.kept_text(full_text)
+                        if tool_work_done:
+                            notice = {
+                                "content": f"\n\n{REPETITION_STOPPED_MESSAGE}",
+                                "type": "text",
+                            }
+                            full_text += notice["content"]
+                            recorder.observe("chunk", notice)
+                            await transport.append_event(spec.run_id, "chunk", notice)
+                            break
+                        stop_frame = {
+                            "code": REPETITION_STOPPED_CODE,
+                            "message": REPETITION_STOPPED_MESSAGE,
+                        }
+                        recorder.observe("error", stop_frame)
+                        await transport.append_event(spec.run_id, "error", stop_frame)
+                        backend_error_message = REPETITION_STOPPED_MESSAGE
+                        break
+                elif event_name in ("tool_start", "tool_result"):
+                    # Text on either side of a tool call is not one run of text.
+                    repetition.break_run()
+                    if event_name == "tool_result":
+                        tool_work_done = True
                 elif event_name == "token_usage":
                     if isinstance(event_data, dict) and event_data:
                         # LATEST-WINS, FLOORED. Every backend reports a
@@ -3264,11 +3525,7 @@ async def execute_run(spec: RunSpec) -> None:
         except Exception as exc:
             error = exc
             logger.exception("execute_run %s crashed", spec.run_id)
-            await transport.append_event(
-                spec.run_id,
-                "error",
-                {"code": "agent.run_failed", "message": str(exc)},
-            )
+            await transport.append_event(spec.run_id, "error", _crash_error_frame(exc))
         finally:
             # A ``break`` (user stop, backend error frame) leaves the generator
             # suspended; close it here so the backend and its bookkeeping in
@@ -3300,7 +3557,12 @@ async def execute_run(spec: RunSpec) -> None:
         logger.debug("agent.typing(active=False) broadcast failed", exc_info=True)
 
     if error is not None or backend_error_message is not None:
-        err_msg = str(error) if error is not None else (backend_error_message or "")
+        # The run doc keeps the provider's own words; the chat got the plain one.
+        err_msg = (
+            str(error)
+            if error is not None
+            else (getattr(ctx, "backend_error_detail", None) or backend_error_message or "")
+        )
         partial_id = await _persist_partial_reply(
             spec, ctx, full_text, "failed", **recorder.persist_kwargs()
         )
