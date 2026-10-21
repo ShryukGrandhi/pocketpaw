@@ -1185,6 +1185,14 @@ _VERIFY_RULE = (
     "plainly which errors remain. On `unverified`, say it could not be checked and "
     "why (on a ripple site `engine_not_verifiable` only means there is no authored "
     "code to check). "
+    "The verdict also carries `checks.warnings`: page checks over the built pages, "
+    "each `{id, page, detail}` with a `sites-check` rule id (`checks.omitted` counts "
+    "the ones past the cap). They never change the status. Fix each warning before "
+    "you show the draft, or say in one line why it stays (for example supplied "
+    "copy, or a placeholder the owner still has to fill, which you list). On a "
+    "project site the status stays `unverified` / "
+    "`engine_not_verifiable` because `run_site_build` is its build check: call "
+    "verify_site once after the last successful build, for the checks. "
 )
 
 # Added 2026-09-27 (feat/sites-lean-prompt). The design phase of every create, in
