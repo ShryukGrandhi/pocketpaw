@@ -8,7 +8,8 @@
 #     has a line for EVERY registered provider, naming each public action the
 #     provider really exposes, in client (paw.js) and server (``pawCall``) form;
 #   * the project tools gate on the same Sites plan the old create tools use, so the
-#     ``static`` starter is open to everyone who could create a site before.
+#     ``static`` starter is open to everyone who could create a site before, and the
+#     refusal tells the agent to stop rather than hand the site over another way.
 from __future__ import annotations
 
 import pytest
@@ -167,5 +168,45 @@ async def test_the_project_tools_use_the_same_sites_plan_gate(monkeypatch) -> No
 
     monkeypatch.setattr(service, "require_sites_plan", _denied)
     _ws, _user, err = await sites_project._begin("start_site_from_template")
-    assert err == await sites_create._require_sites_plan_or_error("ws1")
+    assert err == await sites_create._require_sites_plan_or_error(
+        "ws1", tool="start_site_from_template"
+    )
     assert "plan.feature_denied" in err["content"][0]["text"]
+    # Tool results can show in the activity feed, so the refusal is a plain sentence
+    # for the user, says what the call did NOT do for its kind of tool, and carries
+    # no agent instruction (that lives in the preamble's blocked rule).
+    assert err["content"][0]["text"].endswith("Nothing was created.")
+    for tool, outcome in (
+        ("create_html_site", "Nothing was created."),
+        ("edit_html_file", "Nothing was changed."),
+        ("patch_site_file", "Nothing was changed."),
+        ("read_site_source", None),
+        ("list_site_secrets", None),
+        ("verify_site", None),
+        ("preview_site", None),
+    ):
+        text = (await sites_create._require_sites_plan_or_error("ws1", tool=tool))["content"][0][
+            "text"
+        ]
+        assert "Sites requires the Go plan" in text, tool
+        if outcome:
+            assert text.endswith(outcome), (tool, text)
+        else:
+            assert "Nothing was" not in text, (tool, text)
+        assert "Tell the user" not in text and "stop" not in text, (tool, text)
+
+
+async def test_the_plan_refusal_names_the_real_upgrade_path(monkeypatch) -> None:
+    """The service message is what the user ends up reading, so it names the place
+    an upgrade actually happens."""
+    from pocketpaw_ee.cloud._core.errors import Forbidden
+    from pocketpaw_ee.cloud.workspace import service as workspace_service
+    from pocketpaw_ee.sites import service
+
+    async def _free(_workspace_id: str) -> str:
+        return "free"
+
+    monkeypatch.setattr(workspace_service, "get_workspace_plan", _free)
+    with pytest.raises(Forbidden) as exc:
+        await service.require_sites_plan("ws1")
+    assert "Settings → Billing" in exc.value.message
