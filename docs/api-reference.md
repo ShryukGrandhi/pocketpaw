@@ -3532,6 +3532,30 @@ One repo's committed C4 model, for the architecture viewer. RBAC `belt.read`
   live signals or starts a background read. A commit with no readable model is
   404 `belt.architecture_not_found`. Cached per repo and commit, with no
   expiry. An empty `at` is the normal read.
+- `diff=<sha>` adds `diff` to the body (the normal read, or the `at` read):
+  what changed in this read's model since that trunk commit (source:
+  `architecture_diff.py`). The sha is checked exactly as `at` is, with the same
+  404s. Elements are matched by `id` at every level; relationships by their
+  `(source, target)` pair.
+
+  ```json
+  "diff": {
+    "added": ["<id>"], "removed": ["<id>"],
+    "changed": [{ "id": "<id>", "fields": ["description", "technology"] }],
+    "removed_elements": [{ "parent": "<id or null>", "in": "components",
+                           "element": { "id": "<id>", "name": "…" } }],
+    "relationships": { "added": [{ "source": "…", "target": "…" }],
+                       "removed": [{ "source": "…", "target": "…" }] }
+  }
+  ```
+
+  `fields` names the element's own fields that differ (never its child lists),
+  plus `parent` when it moved. A relationship whose label changed is neither
+  added nor removed. `removed_elements` holds each topmost removed element with
+  its parent's id and the list it sat in, so a viewer can draw it; its subtree
+  leaves out anything that still exists elsewhere.
+- Git missing or timing out on an `at` or `diff` read is 503
+  `belt.architecture_unavailable`.
 - Error bodies carry `detail`, the sentence the UI shows.
 
 ### `GET /api/v1/belt/architecture/history?repo=<path>`
@@ -3541,14 +3565,21 @@ Source: `ee/pocketpaw_ee/cloud/belt/architecture_history.py`.
 
 ```json
 [ { "sha": "<full commit sha>", "date": "2026-10-21T09:00:00+00:00",
-    "subject": "docs(c4): add the flows file" } ]
+    "subject": "docs(c4): add the flows file",
+    "added": 2, "removed": 0, "changed": 1 } ]
 ```
 
 - The last 50 commits on the trunk (`origin/dev`, else `origin/main`, as the
   architecture read last fetched it) that touch `docs/c4/`, newest first.
   `date` is the committer date.
+- `added` / `removed` / `changed` compare the commit's model with its first
+  parent's, the same comparison as `diff=`. `added` and `removed` count
+  elements plus relationships; `changed` counts elements. A root commit (or a
+  parent with no model) counts everything as added; a commit with no readable
+  model has all three `null`. Counts are computed once per commit and cached.
 - 404 `belt.repo_not_found` outside the allowlist, `belt.architecture_not_found`
-  when the clone has no trunk. Not cached.
+  when the clone has no trunk; 503 `belt.architecture_unavailable` when git is
+  missing or times out. The list itself is not cached.
 
 ### `GET /api/v1/belt/architecture/code?repo=<path>&component=<id>[&at=<sha>][&file=<path>&line=<n>]`
 
