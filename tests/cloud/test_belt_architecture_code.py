@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -246,6 +247,19 @@ async def test_the_index_is_cached_per_mtime(loom, repo, monkeypatch):
     await ac.read_file("ws1", "repo", "ui", "src/ui/long.py")
     await ac.read_file("ws1", "repo", "ui", "src/ui/a.py")
     assert len(loads) == 1
+    st = loom.stat()
+    os.utime(loom, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # a regenerated model
+    await ac.read_file("ws1", "repo", "ui", "src/ui/a.py")
+    assert len(loads) == 2
+
+
+async def test_the_model_named_by_the_c4_scope_wins(loom, repo):
+    # MODEL's scope is "app", the clone's dir is "c": the scope's model is read first.
+    (loom.parent / "worldmodel-app.json").write_text(
+        json.dumps({"entities": [sym("src/ui/long.py", "scoped", 3)], "edges": []})
+    )
+    body = await ac.read_file("ws1", "repo", "ui", "src/ui/long.py")
+    assert [s["name"] for s in body["symbols"]] == ["scoped"]
 
 
 def test_route_serves_a_file_and_404s_one_outside_the_component(loom, repo):

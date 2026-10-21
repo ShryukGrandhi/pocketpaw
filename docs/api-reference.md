@@ -3593,9 +3593,9 @@ One file of that listing: its symbols and a code excerpt.
 
 - `file` must be exactly one of the component's listed paths, else 404
   `belt.file_not_found`. Nothing outside that listing is read.
-- `symbols` come from the repo's loom world-model,
-  `worldmodel-<repo dir name>.json` in `POCKETPAW_FACTORY_LOOM_DIR` (else the
-  nearest `.loom/` above the repo). They are sorted by `callers` (distinct
+- `symbols` come from the repo's loom world-model, `worldmodel-<C4 scope>.json`
+  (else `worldmodel-<repo dir name>.json`) in `POCKETPAW_FACTORY_LOOM_DIR`, or
+  the nearest `.loom/` above the repo. They are sorted by `callers` (distinct
   calling symbols), then by line. The model reflects the workspace checkout,
   not `sha`, so lines can drift on an old `at`. Loom reads Python and Go only.
 - `symbols_skipped` says why `symbols` is empty when no model could be used:

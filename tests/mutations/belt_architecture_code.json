@@ -61,5 +61,23 @@
     "tests": [
       "tests/cloud/test_belt_architecture_code.py::test_the_index_is_cached_per_mtime"
     ]
+  },
+  {
+    "label": "architecture symbols: a regenerated world-model is never re-read",
+    "file": "ee/pocketpaw_ee/cloud/belt/architecture_symbols.py",
+    "find": "        key = (str(model), st.st_mtime_ns, st.st_size)\n",
+    "replace": "        key = (str(model), 0, st.st_size)\n",
+    "tests": [
+      "tests/cloud/test_belt_architecture_code.py::test_the_index_is_cached_per_mtime"
+    ]
+  },
+  {
+    "label": "architecture symbols: the C4 scope's model is ignored",
+    "file": "ee/pocketpaw_ee/cloud/belt/architecture_symbols.py",
+    "find": "    if loom and isinstance(scope, str) and _SCOPE.fullmatch(scope):\n",
+    "replace": "    if False:\n",
+    "tests": [
+      "tests/cloud/test_belt_architecture_code.py::test_the_model_named_by_the_c4_scope_wins"
+    ]
   }
 ]

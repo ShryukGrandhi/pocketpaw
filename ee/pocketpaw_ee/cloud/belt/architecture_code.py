@@ -95,7 +95,8 @@ async def read_file(
     row = next((f for f in listing["files"] if f["path"] == file), None)  # exact: no traversal
     if row is None:
         raise BeltConsoleError(404, "No such file in this component.", "belt.file_not_found")
-    symbols, skipped = await architecture_symbols.symbols_for(Path(body["repo"]), file)
+    scope = (body.get("model") or {}).get("scope")
+    symbols, skipped = await architecture_symbols.symbols_for(Path(body["repo"]), file, scope)
     for s in symbols:
         s["url"] = f"{row['url']}#L{s['line']}" if row["url"] and s["line"] else row["url"]
     excerpt = None

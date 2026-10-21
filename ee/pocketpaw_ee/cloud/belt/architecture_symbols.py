@@ -2,8 +2,10 @@
 # from its loom world-model, for the Code tab's file view
 # (``architecture_code.read_file``).
 #
-# The model is ``orient.world_model_for(repo)``: ``worldmodel-<repo dir name>.json``
-# in ``POCKETPAW_FACTORY_LOOM_DIR``, else the nearest ``.loom/`` above the repo.
+# The model is ``worldmodel-<C4 scope>.json`` (the repo's own ``docs/c4`` scope,
+# a plain slug only), else ``orient.world_model_for(repo)``'s
+# ``worldmodel-<repo dir name>.json``, both in ``POCKETPAW_FACTORY_LOOM_DIR`` or
+# the nearest ``.loom/`` above the repo.
 # Only ``symbol`` entities are read, grouped by their own ``path`` (so the
 # direction of ``composes`` never matters); ``callers`` is the count of distinct
 # symbols with a ``calls`` edge to it (component-level ``calls`` never count). A
@@ -17,15 +19,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .orient import world_model_for
+from .orient import _loom_dir, world_model_for
 
 logger = logging.getLogger(__name__)
 MAX_WORLD_MODEL_BYTES = 25_000_000
 _CACHE_MAX = 8
+_SCOPE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 # ponytail: drop-all when full, like architecture_code's cache
 _CACHE: dict[tuple[str, int, int], dict[str, list[dict[str, Any]]]] = {}
 
@@ -68,10 +72,20 @@ def _load(path: Path) -> dict[str, list[dict[str, Any]]]:
         return _index(json.load(fh))
 
 
-async def symbols_for(repo: Path, file: str) -> tuple[list[dict[str, Any]], str | None]:
+def _model_path(repo: Path, scope: Any) -> Path | None:
+    loom = _loom_dir(repo)
+    if loom and isinstance(scope, str) and _SCOPE.fullmatch(scope):
+        if (by_scope := loom / f"worldmodel-{scope}.json").is_file():
+            return by_scope
+    return world_model_for(repo)
+
+
+async def symbols_for(
+    repo: Path, file: str, scope: Any = None
+) -> tuple[list[dict[str, Any]], str | None]:
     """``(symbols, skipped)`` for one repo file; ``skipped`` is ``"no model"``,
     ``"too large"`` or ``"unreadable"`` when no symbols could be read."""
-    model = world_model_for(repo)
+    model = _model_path(repo, scope)
     if model is None:
         return [], "no model"
     try:
