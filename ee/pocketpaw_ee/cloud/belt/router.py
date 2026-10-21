@@ -35,8 +35,9 @@
 #                                 (``architecture_history``)
 #   * GET  /belt/architecture/history?repo= — the trunk's model commits
 #                                 (``architecture_history``)
-#   * GET  /belt/architecture/code?repo=&component=[&at=] — one component's files
-#                                 at that read's sha (``architecture_code``)
+#   * GET  /belt/architecture/code?repo=&component=[&at=][&file=&line=] — one
+#                                 component's files at that read's sha, or one
+#                                 file's symbols and excerpt (``architecture_code``)
 #
 # Routes are THIN: they read identity (workspace + user) from the cloud deps,
 # delegate to ``ee.cloud.belt.service``, and return what the service built. RBAC
@@ -394,13 +395,20 @@ async def get_architecture_code(
     repo: str = Query(min_length=1),
     component: str = Query(min_length=1),
     at: str = "",
+    file: str = "",
+    line: int = Query(0, ge=0),
     _user: Any = Depends(require_action_any_workspace("belt.read")),
     workspace_id: str = Depends(current_workspace_id),
 ) -> dict[str, Any]:
     """One component's files at the architecture read's sha: ``{sha, files,
-    expired, no_paths}``, or at trunk commit ``at``. 404
-    ``belt.component_not_found`` for an unknown id."""
+    expired, no_paths}``, or at trunk commit ``at``. With ``file``, that file's
+    symbols and an excerpt from ``line``. 404 ``belt.component_not_found`` for
+    an unknown id, ``belt.file_not_found`` for a file outside the component."""
     try:
+        if file:
+            return await architecture_code.read_file(
+                workspace_id, repo, component, file, at=at, line=line
+            )
         return await architecture_code.read_code(workspace_id, repo, component, at=at)
     except belt_service.BeltConsoleError as exc:
         raise _to_cloud_error(exc) from exc

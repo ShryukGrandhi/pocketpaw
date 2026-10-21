@@ -5,11 +5,14 @@
 # also lists a child's ``src/ui/``), with lang, loc (0 empty, ``None`` binary) and
 # a GitHub url pinned to the sha. Also: ``expired``, ``no_paths``, the 404, the
 # open-PR join through a fake gh (a failed gh keeps the files, uncached) and the
-# route's RBAC.
+# route's RBAC. File mode (``&file=``): symbols from a fixture world-model in a
+# tmp loom dir (order, callers, url), the excerpt window, 404 off the listing,
+# and empty symbols for a missing or oversized model.
 
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -18,6 +21,7 @@ pytest.importorskip("pocketpaw_ee")
 from fastapi.testclient import TestClient  # noqa: E402
 from pocketpaw_ee.cloud.belt import architecture_code as ac  # noqa: E402
 from pocketpaw_ee.cloud.belt import architecture_read as ar  # noqa: E402
+from pocketpaw_ee.cloud.belt import architecture_symbols as asy  # noqa: E402
 from pocketpaw_ee.cloud.belt.service import BeltConsoleError  # noqa: E402
 
 from tests.cloud.test_belt_architecture_read import _no_run_store, origin  # noqa: E402, F401
@@ -44,6 +48,7 @@ def repo(origin, monkeypatch):  # noqa: F811
     monkeypatch.setattr(ac, "_CACHE", {})
     files = {
         "src/ui/a.py": "x = 1\ny = 2\nz = 3\n",
+        "src/ui/long.py": "".join(f"line {n}\n" for n in range(1, 101)),
         "src/ui/empty.ts": "",
         "src/ui/my file.md": "# hi\n",
         "src/api/b.go": "package b\n",
@@ -81,6 +86,7 @@ async def test_files_are_listed_at_the_reads_sha_with_lang_loc_and_url(repo, mon
         "src/ui/empty.ts": ("typescript", 0, []),
         "src/ui/my file.md": ("markdown", 1, []),
         "src/ui/logo.png": ("png", None, []),
+        "src/ui/long.py": ("python", 100, []),
     }
     urls = {f["path"]: f["url"] for f in body["files"]}
     assert urls["src/ui/my file.md"] == f"https://github.com/{SLUG}/blob/{repo}/src/ui/my%20file.md"
@@ -90,7 +96,7 @@ async def test_a_parent_glob_also_lists_a_childs_files(repo, monkeypatch):
     with_read(monkeypatch)
     paths = {f["path"] for f in (await ac.read_code("ws1", "repo", "core"))["files"]}
     assert paths == {"src/ui/a.py", "src/ui/empty.ts", "src/ui/my file.md", "src/ui/logo.png",
-                     "src/api/b.go"}  # fmt: skip
+                     "src/ui/long.py", "src/api/b.go"}  # fmt: skip
 
 
 async def test_no_slug_means_no_url(repo):
@@ -140,7 +146,7 @@ async def test_a_failed_gh_read_keeps_the_files_and_is_not_cached(repo, monkeypa
         return 1, "", "rate limited"
 
     body = await ac.read_code("ws1", "repo", "ui", gh=gh)
-    assert len(body["files"]) == 4 and all(f["prs"] == [] for f in body["files"])
+    assert len(body["files"]) == 5 and all(f["prs"] == [] for f in body["files"])
     await ac.read_code("ws1", "repo", "ui", gh=gh)
     assert len(calls) == 2
 
@@ -151,6 +157,119 @@ def test_route_serves_files_and_404s_an_unknown_component(repo):
         missing = client.get(
             "/api/v1/belt/architecture/code", params={"repo": "r", "component": "nope"}
         )
-    assert ok.status_code == 200 and ok.json()["sha"] == repo and len(ok.json()["files"]) == 4
+    assert ok.status_code == 200 and ok.json()["sha"] == repo and len(ok.json()["files"]) == 5
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "belt.component_not_found"
+
+
+def sym(path, name, line, kind="function"):
+    attrs = {"kind": kind, "line": str(line)}
+    return {"id": f"c:symbol:{path}#{name}", "kind": "symbol", "path": path, "symbol": name,
+            "attrs": attrs}  # fmt: skip
+
+
+def calls(src, dst, path="src/ui/long.py"):
+    return {"from": f"c:symbol:{path}#{src}", "to": f"c:symbol:{path}#{dst}", "type": "calls"}
+
+
+@pytest.fixture
+def loom(repo, tmp_path, monkeypatch):
+    """A world-model for the clone (dir ``c``): ``hot`` has two callers (one
+    edge duplicated), ``late`` and ``warm`` tie on one (line breaks it), and
+    ``cold``'s only caller is a component, which does not count."""
+    monkeypatch.setattr(asy, "_CACHE", {})
+    monkeypatch.setenv("POCKETPAW_FACTORY_LOOM_DIR", str(tmp_path / "loom"))
+    (tmp_path / "loom").mkdir()
+    long = "src/ui/long.py"
+    ents = [sym(long, "cold", 5), sym(long, "hot", 60), sym(long, "warm", 30, "class"),
+            sym(long, "late", 10), sym("src/ui/a.py", "x", 1),
+            {"id": "c:file:src/ui/long.py", "kind": "file", "path": long}]  # fmt: skip
+    edges = [calls("cold", "hot"), calls("warm", "hot"), calls("warm", "hot"),
+             calls("hot", "warm"), calls("hot", "late"),
+             {"from": "c:component:x", "to": f"c:symbol:{long}#cold", "type": "calls"},
+             {"from": f"c:symbol:{long}#hot", "to": "c:file:x", "type": "composes"}]  # fmt: skip
+    model = tmp_path / "loom" / "worldmodel-c.json"
+    model.write_text(json.dumps({"schema": "loom/worldmodel/v1", "entities": ents,
+                                 "edges": edges}))  # fmt: skip
+    return model
+
+
+async def test_a_files_symbols_sort_by_callers_with_a_line_url(loom, repo, monkeypatch):
+    with_read(monkeypatch)
+    body = await ac.read_file("ws1", "repo", "ui", "src/ui/long.py")
+    assert (body["sha"], body["path"], body["lang"]) == (repo, "src/ui/long.py", "python")
+    got = [(s["name"], s["kind"], s["line"], s["callers"]) for s in body["symbols"]]
+    assert got == [("hot", "function", 60, 2), ("late", "function", 10, 1),
+                   ("warm", "class", 30, 1), ("cold", "function", 5, 0)]  # fmt: skip
+    assert body["symbols_skipped"] is None
+    url = f"https://github.com/{SLUG}/blob/{repo}/src/ui/long.py#L60"
+    assert body["symbols"][0]["url"] == url
+
+
+async def test_the_excerpt_is_forty_lines_from_the_top_or_from_line(loom, repo):
+    top = (await ac.read_file("ws1", "repo", "ui", "src/ui/long.py"))["excerpt"]
+    assert (top["startLine"], top["language"], len(top["before"])) == (1, "python", 40)
+    assert top["before"][0] == "line 1" and top["before"][-1] == "line 40"
+    at = (await ac.read_file("ws1", "repo", "ui", "src/ui/long.py", line=70))["excerpt"]
+    assert at["startLine"] == 70 and at["before"] == [f"line {n}" for n in range(70, 101)]
+
+
+async def test_a_binary_or_empty_file_has_no_excerpt(loom, repo):
+    for path in ("src/ui/logo.png", "src/ui/empty.ts"):
+        assert (await ac.read_file("ws1", "repo", "ui", path))["excerpt"] is None
+
+
+async def test_a_file_outside_the_component_is_404(loom, repo):
+    for path in ("src/api/b.go", "README.md", "../c/src/ui/a.py", "/etc/passwd"):
+        with pytest.raises(BeltConsoleError) as err:
+            await ac.read_file("ws1", "repo", "ui", path)
+        assert (err.value.status_code, err.value.code) == (404, "belt.file_not_found")
+
+
+async def test_a_missing_model_gives_no_symbols(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("POCKETPAW_FACTORY_LOOM_DIR", str(tmp_path / "none"))
+    body = await ac.read_file("ws1", "repo", "ui", "src/ui/long.py")
+    assert (body["symbols"], body["symbols_skipped"]) == ([], "no model")
+    assert body["excerpt"]["startLine"] == 1
+
+
+async def test_an_oversized_model_is_skipped_unread(loom, repo, monkeypatch):
+    monkeypatch.setattr(asy, "MAX_WORLD_MODEL_BYTES", 10)
+    monkeypatch.setattr(asy, "_load", lambda p: pytest.fail("read an oversized model"))
+    body = await ac.read_file("ws1", "repo", "ui", "src/ui/long.py")
+    assert (body["symbols"], body["symbols_skipped"]) == ([], "too large")
+
+
+async def test_the_index_is_cached_per_mtime(loom, repo, monkeypatch):
+    loads = []
+    real = asy._load
+    monkeypatch.setattr(asy, "_load", lambda p: loads.append(p) or real(p))
+    await ac.read_file("ws1", "repo", "ui", "src/ui/long.py")
+    await ac.read_file("ws1", "repo", "ui", "src/ui/a.py")
+    assert len(loads) == 1
+    st = loom.stat()
+    os.utime(loom, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # a regenerated model
+    await ac.read_file("ws1", "repo", "ui", "src/ui/a.py")
+    assert len(loads) == 2
+
+
+async def test_the_model_named_by_the_c4_scope_wins(loom, repo):
+    # MODEL's scope is "app", the clone's dir is "c": the scope's model is read first.
+    (loom.parent / "worldmodel-app.json").write_text(
+        json.dumps({"entities": [sym("src/ui/long.py", "scoped", 3)], "edges": []})
+    )
+    body = await ac.read_file("ws1", "repo", "ui", "src/ui/long.py")
+    assert [s["name"] for s in body["symbols"]] == ["scoped"]
+
+
+def test_route_serves_a_file_and_404s_one_outside_the_component(loom, repo):
+    url, q = "/api/v1/belt/architecture/code", {"repo": "r", "component": "ui"}
+    with TestClient(_build_app(role="member")) as client:
+        ok = client.get(url, params={**q, "file": "src/ui/long.py", "line": 70})
+        missing = client.get(url, params={**q, "file": "README.md"})
+        bad = client.get(url, params={**q, "file": "src/ui/long.py", "line": -1})
+    assert ok.status_code == 200 and ok.json()["excerpt"]["startLine"] == 70
+    assert [s["name"] for s in ok.json()["symbols"]][0] == "hot"
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "belt.file_not_found"
+    assert bad.status_code == 422
