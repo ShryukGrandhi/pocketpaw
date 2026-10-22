@@ -136,7 +136,7 @@ async def _blob(git: abr.Run, sha: str, path: str) -> str | None:
 
 async def _read(workspace_id: str, repo: str, at: str) -> dict[str, Any]:
     if at:
-        return await architecture_history.read_at(workspace_id, repo, at)
+        return await architecture_history.read_at(repo, at)
     return await ar.read_architecture(workspace_id, repo)
 
 

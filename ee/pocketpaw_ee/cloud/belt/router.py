@@ -29,9 +29,10 @@
 #                                 status per component
 #   * GET  /belt/blueprints/suite-map?repo= — the suite feature map (layers, apps,
 #                                 features with adopters) with each row's live status
-#   * GET  /belt/architecture?repo=[&at=] — one repo's committed C4 model at its
-#                                 trunk for the architecture viewer
-#                                 (``architecture_read``), or as of trunk commit ``at``
+#   * GET  /belt/architecture?repo=[&at=][&diff=] — one repo's committed C4 model
+#                                 at its trunk for the architecture viewer
+#                                 (``architecture_read``), or as of trunk commit ``at``,
+#                                 plus what changed since trunk commit ``diff``
 #                                 (``architecture_history``)
 #   * GET  /belt/architecture/history?repo= — the trunk's model commits
 #                                 (``architecture_history``)
@@ -358,6 +359,7 @@ async def get_suite_map(
 async def get_architecture(
     repo: str = Query(min_length=1),
     at: str = "",
+    diff: str = "",
     _user: Any = Depends(require_action_any_workspace("belt.read")),
     workspace_id: str = Depends(current_workspace_id),
 ) -> dict[str, Any]:
@@ -368,11 +370,14 @@ async def get_architecture(
     ``belt.architecture_not_found`` without a readable model; a failed refresh
     serves the last body with ``stale: true``, 503 when there is none yet.
     ``at=<sha>``: the body as of that trunk commit, ``live: null``; 404
-    ``belt.commit_not_found`` for a sha not on the trunk."""
+    ``belt.commit_not_found`` for a sha not on the trunk. ``diff=<sha>``: the
+    same body plus ``diff`` (``architecture_diff``) against that trunk commit."""
     try:
         if at:
-            return await architecture_history.read_at(workspace_id, repo, at)
-        return await architecture_read.read_architecture(workspace_id, repo)
+            body = await architecture_history.read_at(repo, at)
+        else:
+            body = await architecture_read.read_architecture(workspace_id, repo)
+        return await architecture_history.read_diff(repo, diff, body) if diff else body
     except belt_service.BeltConsoleError as exc:
         raise _to_cloud_error(exc) from exc
 
@@ -382,10 +387,11 @@ async def get_architecture_history(
     repo: str = Query(min_length=1),
     _user: Any = Depends(require_action_any_workspace("belt.read")),
     workspace_id: str = Depends(current_workspace_id),
-) -> list[dict[str, str]]:
-    """The last 50 trunk commits touching ``docs/c4/``: ``[{sha, date, subject}]``."""
+) -> list[dict[str, Any]]:
+    """The last 50 trunk commits touching ``docs/c4/``: ``[{sha, date, subject,
+    added, removed, changed}]``, the counts against each commit's parent."""
     try:
-        return await architecture_history.read_history(workspace_id, repo)
+        return await architecture_history.read_history(repo)
     except belt_service.BeltConsoleError as exc:
         raise _to_cloud_error(exc) from exc
 
